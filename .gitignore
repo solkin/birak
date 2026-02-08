@@ -1,0 +1,29 @@
+# Binaries
+/birakd
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Go build cache
+*.out
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data / runtime
+*.db
+*.db-wal
+*.db-shm
