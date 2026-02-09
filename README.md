@@ -199,6 +199,66 @@ aws --endpoint-url http://localhost:9200 s3 ls s3://photos/
 aws --endpoint-url http://localhost:9200 s3 rm s3://photos/2024/image.jpg
 ```
 
+## WebDAV Gateway
+
+Birak может выступать WebDAV-сервером, предоставляя доступ к файлам в `sync_dir` через стандартный протокол WebDAV. Совместим с macOS Finder, Windows Explorer, Linux davfs2, Cyberduck, rclone и другими WebDAV-клиентами.
+
+### Принцип
+
+- WebDAV — это расширение HTTP. Корень WebDAV-сервера = `sync_dir`.
+- Файлы и директории доступны напрямую по путям (без концепции бакетов, как в S3).
+- Изменения через WebDAV подхватываются watcher-ом и синхронизируются на другие ноды.
+- Блокировки (LOCK/UNLOCK) — stub: возвращается fake token, достаточный для работы Finder и Windows Explorer.
+
+### Конфигурация
+
+```yaml
+gateways:
+  webdav:
+    enabled: true
+    listen_addr: ":9300"
+    username: "user"           # опционально
+    password: "secret123"      # опционально
+```
+
+Если `username` и `password` не указаны, авторизация отключена (доступ без пароля).
+
+### Поддерживаемые операции
+
+| Метод | Описание |
+|-------|----------|
+| `OPTIONS` | Список поддерживаемых методов, DAV compliance class 1, 2 |
+| `PROPFIND` | Листинг директории / свойства файла (Depth: 0, 1) |
+| `PROPPATCH` | Изменение свойств (stub — подтверждает без сохранения) |
+| `GET` | Скачивание файла |
+| `HEAD` | Метаданные файла |
+| `PUT` | Загрузка файла (атомарная запись через temp file) |
+| `DELETE` | Удаление файла или директории |
+| `MKCOL` | Создание директории |
+| `MOVE` | Перемещение / переименование |
+| `COPY` | Копирование файла или директории |
+| `LOCK` | Блокировка (stub — fake token) |
+| `UNLOCK` | Разблокировка (stub) |
+
+### Подключение
+
+**macOS Finder:**
+1. Finder → Go → Connect to Server (⌘K)
+2. Введите: `http://localhost:9300`
+3. При настроенной авторизации — введите логин и пароль
+
+**Linux (davfs2):**
+```bash
+sudo mount -t davfs http://localhost:9300 /mnt/birak
+```
+
+**Cyberduck / rclone:**
+```bash
+rclone config  # тип: webdav, url: http://localhost:9300
+rclone ls birak:/
+rclone copy localfile.txt birak:/path/to/file.txt
+```
+
 ## Структура проекта
 
 ```
@@ -216,6 +276,9 @@ birak/
     gateway/s3/s3.go              — S3 Gateway: роутинг, авторизация
     gateway/s3/handlers.go        — обработчики S3 операций
     gateway/s3/s3_test.go         — unit-тесты S3 Gateway
+    gateway/webdav/webdav.go      — WebDAV Gateway: роутинг, авторизация
+    gateway/webdav/handlers.go    — обработчики WebDAV операций
+    gateway/webdav/webdav_test.go — unit-тесты WebDAV Gateway
   integration_test.go             — интеграционные тесты (2-3 ноды)
 ```
 
@@ -230,6 +293,9 @@ go test -v ./internal/store/
 
 # Только S3 Gateway тесты
 go test -v ./internal/gateway/s3/
+
+# Только WebDAV Gateway тесты
+go test -v ./internal/gateway/webdav/
 
 # Только интеграционные
 go test -v -timeout 120s -run TestIntegration
@@ -255,6 +321,20 @@ S3 Gateway тесты покрывают:
 - Игнорируемые файлы, защиту от path traversal
 - Жизненный цикл сервера (Start/Stop)
 
+WebDAV Gateway тесты покрывают:
+- Авторизацию (Basic Auth: без авторизации, корректные/некорректные креды, отключённая авторизация)
+- PROPFIND (корень, файлы, Depth: 0/1, фильтрацию ignored файлов, валидность XML)
+- Операции с файлами (GET, HEAD, PUT новый/перезапись, автосоздание родительских директорий)
+- Удаление файлов и директорий, запрет удаления корня
+- MKCOL (создание директорий, дубли, отсутствие родителя)
+- MOVE (переименование, перезапись, запрет перезаписи с Overwrite: F)
+- COPY (файлы, рекурсивное копирование директорий)
+- LOCK/UNLOCK (fake tokens)
+- PROPPATCH (stub)
+- Корректную отдачу index.html без редиректа
+- Защиту от path traversal
+- URL-кодирование путей с пробелами и спецсимволами
+
 ## Параметры конфигурации
 
 | Параметр | По умолчанию | Описание |
@@ -275,3 +355,7 @@ S3 Gateway тесты покрывают:
 | `gateways.s3.listen_addr` | `:9200` | Адрес S3 Gateway |
 | `gateways.s3.access_key` | _(пусто)_ | Ключ доступа (опционально) |
 | `gateways.s3.secret_key` | _(пусто)_ | Секретный ключ (опционально) |
+| `gateways.webdav.enabled` | `false` | Включить WebDAV Gateway |
+| `gateways.webdav.listen_addr` | `:9300` | Адрес WebDAV Gateway |
+| `gateways.webdav.username` | _(пусто)_ | Имя пользователя (опционально) |
+| `gateways.webdav.password` | _(пусто)_ | Пароль (опционально) |

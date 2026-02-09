@@ -23,7 +23,16 @@ type Config struct {
 
 // GatewaysConfig holds configuration for all gateways.
 type GatewaysConfig struct {
-	S3 S3GatewayConfig `yaml:"s3"`
+	S3     S3GatewayConfig     `yaml:"s3"`
+	WebDAV WebDAVGatewayConfig `yaml:"webdav"`
+}
+
+// WebDAVGatewayConfig holds configuration for the WebDAV gateway.
+type WebDAVGatewayConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	ListenAddr string `yaml:"listen_addr"`
+	Username   string `yaml:"username"`
+	Password   string `yaml:"password"`
 }
 
 // S3GatewayConfig holds configuration for the S3 gateway.
@@ -61,6 +70,10 @@ func DefaultConfig() Config {
 			S3: S3GatewayConfig{
 				Enabled:    false,
 				ListenAddr: ":9200",
+			},
+			WebDAV: WebDAVGatewayConfig{
+				Enabled:    false,
+				ListenAddr: ":9300",
 			},
 		},
 		Sync: SyncConfig{
@@ -123,6 +136,9 @@ func (c *Config) validate() error {
 	}
 	if c.Gateways.S3.Enabled && c.Gateways.S3.ListenAddr == "" {
 		return fmt.Errorf("gateways.s3.listen_addr is required when S3 gateway is enabled")
+	}
+	if c.Gateways.WebDAV.Enabled && c.Gateways.WebDAV.ListenAddr == "" {
+		return fmt.Errorf("gateways.webdav.listen_addr is required when WebDAV gateway is enabled")
 	}
 	return nil
 }

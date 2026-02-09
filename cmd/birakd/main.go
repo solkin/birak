@@ -15,6 +15,7 @@ import (
 
 	"github.com/birak/birak/internal/config"
 	s3gw "github.com/birak/birak/internal/gateway/s3"
+	webdavgw "github.com/birak/birak/internal/gateway/webdav"
 	"github.com/birak/birak/internal/server"
 	"github.com/birak/birak/internal/store"
 	"github.com/birak/birak/internal/syncer"
@@ -192,6 +193,29 @@ func run(configPath string) error {
 		}()
 	}
 
+	// WebDAV Gateway (if enabled).
+	var webdavGateway *webdavgw.Gateway
+	if cfg.Gateways.WebDAV.Enabled {
+		webdavGateway = webdavgw.New(
+			cfg.SyncDir,
+			cfg.Ignore,
+			webdavgw.Config{
+				ListenAddr: cfg.Gateways.WebDAV.ListenAddr,
+				Username:   cfg.Gateways.WebDAV.Username,
+				Password:   cfg.Gateways.WebDAV.Password,
+			},
+			logger,
+		)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := webdavGateway.Start(ctx); err != nil {
+				logger.Error("WebDAV gateway error", "error", err)
+				cancel()
+			}
+		}()
+	}
+
 	// Wait for shutdown signal.
 	select {
 	case sig := <-sigCh:
@@ -212,6 +236,13 @@ func run(configPath string) error {
 	if s3Gateway != nil {
 		if err := s3Gateway.Stop(shutdownCtx); err != nil {
 			logger.Error("S3 gateway shutdown error", "error", err)
+		}
+	}
+
+	// Graceful WebDAV gateway shutdown.
+	if webdavGateway != nil {
+		if err := webdavGateway.Stop(shutdownCtx); err != nil {
+			logger.Error("WebDAV gateway shutdown error", "error", err)
 		}
 	}
 
