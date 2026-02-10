@@ -45,12 +45,25 @@ type Watcher struct {
 	recentlySynced   map[string]string // relPath -> expected hash
 	recentlySyncedMu sync.Mutex
 
+	// scanning prevents overlapping periodicScan runs. When a scan takes
+	// longer than scanInterval the ticker fires while a scan is still
+	// running; this flag causes the second invocation to be skipped.
+	scanning bool
+
 	// onChange is called for each debounced file event batch.
 	onChange func([]FileEvent)
 
 	// ready is closed after the initial scan completes.
 	// Other components (e.g. syncer) should wait on this before starting.
 	ready chan struct{}
+}
+
+// diskFile holds file metadata collected during a directory walk.
+type diskFile struct {
+	name    string
+	path    string
+	modTime int64
+	size    int64
 }
 
 // New creates a new Watcher.
@@ -148,8 +161,14 @@ func (w *Watcher) Run(ctx context.Context) error {
 	defer fsw.Close()
 
 	// Recursively add all directories to fsnotify.
-	if err := w.addDirsRecursive(fsw, w.dir); err != nil {
-		return fmt.Errorf("add dirs to watcher: %w", err)
+	failCount, walkErr := w.addDirsRecursive(fsw, w.dir)
+	if walkErr != nil {
+		return fmt.Errorf("add dirs to watcher: %w", walkErr)
+	}
+	if failCount > 0 {
+		w.logger.Warn("some directories could not be watched; changes in them may be missed until the next periodic scan",
+			"failed_watches", failCount,
+			"hint", "on Linux run: sysctl -w fs.inotify.max_user_watches=1048576")
 	}
 
 	w.logger.Info("watcher started", "dir", w.dir)
@@ -231,8 +250,8 @@ func (w *Watcher) Run(ctx context.Context) error {
 			// files that might have been created before we started watching.
 			if event.Has(fsnotify.Create) {
 				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					if err := w.addDirsRecursive(fsw, event.Name); err != nil {
-						w.logger.Error("failed to watch new directory", "path", relPath, "error", err)
+					if _, addErr := w.addDirsRecursive(fsw, event.Name); addErr != nil {
+						w.logger.Error("failed to watch new directory", "path", relPath, "error", addErr)
 					}
 					// Walk the new directory to find files created before we started watching.
 					_ = filepath.WalkDir(event.Name, func(path string, d fs.DirEntry, walkErr error) error {
@@ -288,14 +307,31 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 		case <-scanTicker.C:
 			w.periodicScan()
+			// Drain any ticks that accumulated while the scan was running.
+			// Without this, a slow scan would be immediately followed by
+			// another scan from the buffered tick.
+			drainTicker(scanTicker)
 		}
 	}
 }
 
-// addDirsRecursive adds a directory and all its subdirectories to the fsnotify watcher.
-func (w *Watcher) addDirsRecursive(fsw *fsnotify.Watcher, root string) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
+// drainTicker discards any pending ticks on a ticker channel.
+func drainTicker(t *time.Ticker) {
+	for {
+		select {
+		case <-t.C:
+		default:
+			return
+		}
+	}
+}
+
+// addDirsRecursive adds a directory and all its subdirectories to the fsnotify
+// watcher. It returns the number of directories that could not be watched
+// (e.g. because of inotify limits) and any walk-level error.
+func (w *Watcher) addDirsRecursive(fsw *fsnotify.Watcher, root string) (failCount int, err error) {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
 			return nil // skip inaccessible dirs
 		}
 		if !d.IsDir() {
@@ -311,11 +347,13 @@ func (w *Watcher) addDirsRecursive(fsw *fsnotify.Watcher, root string) error {
 				}
 			}
 		}
-		if err := fsw.Add(path); err != nil {
-			w.logger.Warn("failed to add dir to watcher", "path", path, "error", err)
+		if addErr := fsw.Add(path); addErr != nil {
+			w.logger.Warn("failed to add dir to watcher", "path", path, "error", addErr)
+			failCount++
 		}
 		return nil
 	})
+	return failCount, err
 }
 
 // processBatch handles a batch of relative file paths detected by fsnotify.
@@ -432,30 +470,54 @@ func (w *Watcher) inspectFile(name string) (*FileEvent, error) {
 }
 
 // periodicScan performs a recursive directory scan to detect changes missed by fsnotify.
+//
+// Memory-efficient implementation:
+//   - Files on disk are checked against the store in batches (not one-by-one).
+//   - Deletion detection iterates the store in pages instead of loading
+//     all entries into a single map.
+//   - An overlap guard prevents back-to-back scans when a scan takes longer
+//     than the scan interval.
 func (w *Watcher) periodicScan() {
+	// Overlap guard: skip if a previous scan is still running.
+	if w.scanning {
+		w.logger.Debug("periodic scan skipped, previous scan still running")
+		return
+	}
+	w.scanning = true
+	defer func() { w.scanning = false }()
+
 	w.logger.Debug("periodic scan started")
 
-	// IMPORTANT: snapshot the store BEFORE walking the disk.
-	// This prevents a race where the syncer adds a file to the store while
-	// the walk is in progress — such a file would appear in a post-walk
-	// AllFiles() result but not in the onDisk map, causing a false deletion.
-	known, err := w.store.AllFiles()
+	// Record the max version BEFORE walking the disk. Files added by the
+	// syncer during the walk will have version > maxVer and are excluded
+	// from deletion detection, preventing false deletions.
+	maxVer, err := w.store.MaxVersion()
 	if err != nil {
-		w.logger.Error("periodic scan: get all files failed", "error", err)
+		w.logger.Error("periodic scan: get max version failed", "error", err)
 		return
 	}
 
-	// Build set of files on disk by walking the directory tree.
+	// Walk disk: collect file info in batches and compare with the store.
+	const scanBatchSize = 500
 	onDisk := make(map[string]struct{})
 	var events []FileEvent
+	var batch []diskFile
 
-	err = filepath.WalkDir(w.dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			w.logger.Error("periodic scan: walk error", "path", path, "error", err)
+	processBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+		evts := w.compareScanBatch(batch)
+		events = append(events, evts...)
+		batch = batch[:0]
+	}
+
+	err = filepath.WalkDir(w.dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			w.logger.Error("periodic scan: walk error", "path", path, "error", walkErr)
 			return nil // continue walking
 		}
 		if d.IsDir() {
-			// Check if this directory should be ignored.
 			if path != w.dir {
 				relPath, relErr := filepath.Rel(w.dir, path)
 				if relErr == nil {
@@ -472,10 +534,8 @@ func (w *Watcher) periodicScan() {
 		if relErr != nil {
 			return nil
 		}
-		// Normalize to forward slashes.
 		name := filepath.ToSlash(relPath)
 
-		// Skip ignored files.
 		if w.shouldIgnore(name) {
 			return nil
 		}
@@ -488,80 +548,69 @@ func (w *Watcher) periodicScan() {
 			return nil
 		}
 
-		// Check against store (use live query, not snapshot, for per-file checks —
-		// we want the freshest data to avoid unnecessary hash computation).
-		existing, getErr := w.store.GetFile(name)
-		if getErr != nil {
-			w.logger.Error("periodic scan: get file from store failed", "name", name, "error", getErr)
-			return nil
-		}
-
-		// Quick check: if mod_time and size match, skip expensive hash.
-		if existing != nil && !existing.Deleted &&
-			existing.ModTime == info.ModTime().UnixNano() &&
-			existing.Size == info.Size() {
-			return nil
-		}
-
-		hash, hashErr := hashFile(path)
-		if hashErr != nil {
-			w.logger.Error("periodic scan: hash failed", "name", name, "error", hashErr)
-			return nil
-		}
-
-		// If hash matches, no real change.
-		if existing != nil && !existing.Deleted && existing.Hash == hash {
-			return nil
-		}
-
-		// Check synced (fast-path).
-		if w.isSynced(name, hash) {
-			return nil
-		}
-
-		w.logger.Info("periodic scan: change detected", "name", name, "size", info.Size())
-		events = append(events, FileEvent{
-			Name:    name,
-			ModTime: info.ModTime().UnixNano(),
-			Size:    info.Size(),
-			Hash:    hash,
-			Deleted: false,
+		batch = append(batch, diskFile{
+			name:    name,
+			path:    path,
+			modTime: info.ModTime().UnixNano(),
+			size:    info.Size(),
 		})
+		if len(batch) >= scanBatchSize {
+			processBatch()
+		}
 		return nil
 	})
 	if err != nil {
 		w.logger.Error("periodic scan: walk failed", "error", err)
 	}
+	processBatch() // flush remaining
 
-	// Detect deletions: files in the pre-walk store snapshot but not on disk.
-	// Using the snapshot taken BEFORE the walk ensures that files added by
-	// the syncer during the walk cannot trigger false deletions.
-	for name, meta := range known {
-		if _, ok := onDisk[name]; !ok {
-			// Double-check the live store — the syncer may have already marked
-			// this file as deleted while we were walking.
-			liveMeta, _ := w.store.GetFile(name)
+	// Detect deletions: iterate the store in pages instead of loading
+	// everything into memory. Only consider entries with version <= maxVer
+	// to avoid false deletions for files added by the syncer during the walk.
+	const pageSize = 5000
+	var afterName string
+	for {
+		page, pageErr := w.store.ListNonDeleted(afterName, pageSize)
+		if pageErr != nil {
+			w.logger.Error("periodic scan: list non-deleted failed", "error", pageErr)
+			break
+		}
+		if len(page) == 0 {
+			break
+		}
+
+		for i := range page {
+			meta := &page[i]
+			afterName = meta.Name
+
+			// Skip files added during the walk.
+			if meta.Version > maxVer {
+				continue
+			}
+
+			if _, ok := onDisk[meta.Name]; ok {
+				continue
+			}
+
+			// Double-check the live store — the syncer may have already
+			// marked this file as deleted while we were walking.
+			liveMeta, _ := w.store.GetFile(meta.Name)
 			if liveMeta == nil || liveMeta.Deleted {
 				continue
 			}
 
 			// Check synced (fast-path for syncer-originated deletions).
-			if w.isSynced(name, "") {
+			if w.isSynced(meta.Name, "") {
 				continue
 			}
 
-			w.logger.Info("periodic scan: deletion detected", "name", name)
+			w.logger.Info("periodic scan: deletion detected", "name", meta.Name)
 
-			// Clean up empty parent directories on the source node.
-			fullPath := filepath.Join(w.dir, filepath.FromSlash(name))
+			fullPath := filepath.Join(w.dir, filepath.FromSlash(meta.Name))
 			CleanEmptyParents(fullPath, w.dir, w.ignorePatterns, w.logger)
 
-			// Use the file's last known ModTime + 1ns. This ensures the
-			// deletion beats the exact version being deleted, but does NOT
-			// beat legitimately newer versions on other nodes (unlike
-			// time.Now() which always wins).
 			events = append(events, FileEvent{
-				Name:    name,
+				Name:    meta.Name,
 				ModTime: meta.ModTime + 1,
 				Deleted: true,
 			})
@@ -574,6 +623,59 @@ func (w *Watcher) periodicScan() {
 	} else {
 		w.logger.Debug("periodic scan completed, no changes")
 	}
+}
+
+// compareScanBatch queries the store for a batch of on-disk files and returns
+// FileEvents for files that are new or modified.
+func (w *Watcher) compareScanBatch(batch []diskFile) []FileEvent {
+	names := make([]string, len(batch))
+	for i, f := range batch {
+		names[i] = f.name
+	}
+
+	known, err := w.store.GetFilesBatch(names)
+	if err != nil {
+		w.logger.Error("periodic scan: batch query failed", "error", err)
+		return nil
+	}
+
+	var events []FileEvent
+	for _, f := range batch {
+		existing := known[f.name]
+
+		// Quick check: if mod_time and size match, skip expensive hash.
+		if existing != nil && !existing.Deleted &&
+			existing.ModTime == f.modTime &&
+			existing.Size == f.size {
+			continue
+		}
+
+		hash, hashErr := hashFile(f.path)
+		if hashErr != nil {
+			w.logger.Error("periodic scan: hash failed", "name", f.name, "error", hashErr)
+			continue
+		}
+
+		// If hash matches, no real change.
+		if existing != nil && !existing.Deleted && existing.Hash == hash {
+			continue
+		}
+
+		// Check synced (fast-path).
+		if w.isSynced(f.name, hash) {
+			continue
+		}
+
+		w.logger.Info("periodic scan: change detected", "name", f.name, "size", f.size)
+		events = append(events, FileEvent{
+			Name:    f.name,
+			ModTime: f.modTime,
+			Size:    f.size,
+			Hash:    hash,
+		})
+	}
+
+	return events
 }
 
 // hashFile computes the SHA256 hex digest of a file.

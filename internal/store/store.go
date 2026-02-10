@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,9 +23,10 @@ type FileMeta struct {
 
 // Store manages the SQLite database for file metadata and peer cursors.
 type Store struct {
-	db     *sql.DB
-	mu     sync.Mutex // serializes writes
-	logger *slog.Logger
+	db            *sql.DB
+	mu            sync.Mutex // serializes writes
+	logger        *slog.Logger
+	cachedNextVer int64 // next version to assign, protected by mu
 }
 
 // New creates a new Store, initializing the database schema.
@@ -59,6 +61,20 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
+	// Initialize the cached version counter from the current max version.
+	// This is the only time we scan MAX(version); afterwards the counter
+	// is maintained in-memory and incremented atomically with each PutFile.
+	var maxVer sql.NullInt64
+	if err := db.QueryRow("SELECT MAX(version) FROM files").Scan(&maxVer); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init version counter: %w", err)
+	}
+	if maxVer.Valid {
+		s.cachedNextVer = maxVer.Int64 + 1
+	} else {
+		s.cachedNextVer = 1
+	}
+
 	return s, nil
 }
 
@@ -73,6 +89,7 @@ func (s *Store) migrate() error {
 		version  INTEGER NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_files_version ON files(version);
+	CREATE INDEX IF NOT EXISTS idx_files_deleted_name ON files(deleted, name);
 
 	CREATE TABLE IF NOT EXISTS cursors (
 		peer_id  TEXT PRIMARY KEY,
@@ -88,37 +105,21 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// nextVersion returns the next version number (max + 1).
-// Must be called while holding s.mu.
-func (s *Store) nextVersion() (int64, error) {
-	var maxVer sql.NullInt64
-	err := s.db.QueryRow("SELECT MAX(version) FROM files").Scan(&maxVer)
-	if err != nil {
-		return 0, err
-	}
-	if !maxVer.Valid {
-		return 1, nil
-	}
-	return maxVer.Int64 + 1, nil
-}
-
 // PutFile inserts or updates a file entry with a new version.
 // Returns the assigned version number.
 func (s *Store) PutFile(name string, modTime int64, size int64, hash string, deleted bool) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ver, err := s.nextVersion()
-	if err != nil {
-		return 0, fmt.Errorf("next version: %w", err)
-	}
+	ver := s.cachedNextVer
+	s.cachedNextVer++
 
 	deletedInt := 0
 	if deleted {
 		deletedInt = 1
 	}
 
-	_, err = s.db.Exec(`
+	_, execErr := s.db.Exec(`
 		INSERT INTO files (name, mod_time, size, hash, deleted, version)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
@@ -128,8 +129,10 @@ func (s *Store) PutFile(name string, modTime int64, size int64, hash string, del
 			deleted  = excluded.deleted,
 			version  = excluded.version
 	`, name, modTime, size, hash, deletedInt, ver)
-	if err != nil {
-		return 0, fmt.Errorf("upsert file %q: %w", name, err)
+	if execErr != nil {
+		// Roll back the version counter on failure so versions stay gapless.
+		s.cachedNextVer = ver
+		return 0, fmt.Errorf("upsert file %q: %w", name, execErr)
 	}
 
 	s.logger.Debug("store: file updated", "name", name, "version", ver, "hash", hash[:min(12, len(hash))], "deleted", deleted)
@@ -178,16 +181,14 @@ func (s *Store) GetChanges(sinceVersion int64, limit int) ([]FileMeta, error) {
 }
 
 // MaxVersion returns the current maximum version number, or 0 if the table is empty.
+// Uses the in-memory counter — O(1) instead of scanning the index.
 func (s *Store) MaxVersion() (int64, error) {
-	var maxVer sql.NullInt64
-	err := s.db.QueryRow("SELECT MAX(version) FROM files").Scan(&maxVer)
-	if err != nil {
-		return 0, err
-	}
-	if !maxVer.Valid {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cachedNextVer <= 1 {
 		return 0, nil
 	}
-	return maxVer.Int64, nil
+	return s.cachedNextVer - 1, nil
 }
 
 // FileCount returns the number of non-deleted files.
@@ -229,7 +230,70 @@ func (s *Store) PurgeTombstones(ttl time.Duration) (int64, error) {
 	return result.RowsAffected()
 }
 
+// GetFilesBatch returns metadata for a batch of file names.
+// Missing files are simply absent from the result map.
+func (s *Store) GetFilesBatch(names []string) (map[string]*FileMeta, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(names))
+	args := make([]interface{}, len(names))
+	for i, n := range names {
+		placeholders[i] = "?"
+		args[i] = n
+	}
+
+	query := "SELECT name, mod_time, size, hash, deleted, version FROM files WHERE name IN (" +
+		strings.Join(placeholders, ",") + ")"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get files batch: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string]*FileMeta, len(names))
+	for rows.Next() {
+		var f FileMeta
+		var deleted int
+		if err := rows.Scan(&f.Name, &f.ModTime, &f.Size, &f.Hash, &deleted, &f.Version); err != nil {
+			return nil, fmt.Errorf("scan file row: %w", err)
+		}
+		f.Deleted = deleted != 0
+		result[f.Name] = &f
+	}
+	return result, rows.Err()
+}
+
+// ListNonDeleted returns non-deleted file entries in name order, starting
+// after afterName, limited to limit entries. Used for paginated iteration
+// without loading the entire table into memory.
+func (s *Store) ListNonDeleted(afterName string, limit int) ([]FileMeta, error) {
+	rows, err := s.db.Query(
+		"SELECT name, mod_time, size, hash, deleted, version FROM files WHERE deleted = 0 AND name > ? ORDER BY name ASC LIMIT ?",
+		afterName, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list non-deleted: %w", err)
+	}
+	defer rows.Close()
+
+	var result []FileMeta
+	for rows.Next() {
+		var f FileMeta
+		var deleted int
+		if err := rows.Scan(&f.Name, &f.ModTime, &f.Size, &f.Hash, &deleted, &f.Version); err != nil {
+			return nil, fmt.Errorf("scan file row: %w", err)
+		}
+		f.Deleted = deleted != 0
+		result = append(result, f)
+	}
+	return result, rows.Err()
+}
+
 // AllFiles returns all non-deleted file entries (for periodic scan diffing).
+// Deprecated: prefer ListNonDeleted for paginated access to avoid memory spikes.
 func (s *Store) AllFiles() (map[string]FileMeta, error) {
 	rows, err := s.db.Query("SELECT name, mod_time, size, hash, deleted, version FROM files WHERE deleted = 0")
 	if err != nil {

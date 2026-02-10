@@ -319,3 +319,114 @@ func TestAllFiles(t *testing.T) {
 		t.Fatal("expected b.txt")
 	}
 }
+
+func TestGetFilesBatch(t *testing.T) {
+	s := newTestStore(t)
+
+	s.PutFile("a.txt", 1000, 10, "h1", false)
+	s.PutFile("b.txt", 2000, 20, "h2", false)
+	s.PutFile("c.txt", 3000, 30, "h3", true) // deleted
+
+	// Query existing and non-existing names.
+	result, err := s.GetFilesBatch([]string{"a.txt", "c.txt", "missing.txt"})
+	if err != nil {
+		t.Fatalf("GetFilesBatch: %v", err)
+	}
+	if len(result) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(result))
+	}
+	if result["a.txt"] == nil || result["a.txt"].Hash != "h1" {
+		t.Fatal("expected a.txt with hash h1")
+	}
+	if result["c.txt"] == nil || !result["c.txt"].Deleted {
+		t.Fatal("expected c.txt as deleted")
+	}
+	if result["missing.txt"] != nil {
+		t.Fatal("expected missing.txt to be nil")
+	}
+
+	// Empty batch should return nil.
+	empty, err := s.GetFilesBatch(nil)
+	if err != nil {
+		t.Fatalf("GetFilesBatch empty: %v", err)
+	}
+	if empty != nil {
+		t.Fatalf("expected nil for empty batch, got %v", empty)
+	}
+}
+
+func TestListNonDeleted(t *testing.T) {
+	s := newTestStore(t)
+
+	s.PutFile("a.txt", 1000, 10, "h1", false)
+	s.PutFile("b.txt", 2000, 20, "h2", false)
+	s.PutFile("c.txt", 3000, 30, "h3", true) // deleted
+	s.PutFile("d.txt", 4000, 40, "h4", false)
+	s.PutFile("e.txt", 5000, 50, "h5", false)
+
+	// First page of 2.
+	page1, err := s.ListNonDeleted("", 2)
+	if err != nil {
+		t.Fatalf("ListNonDeleted page 1: %v", err)
+	}
+	if len(page1) != 2 {
+		t.Fatalf("expected 2 in page 1, got %d", len(page1))
+	}
+	if page1[0].Name != "a.txt" || page1[1].Name != "b.txt" {
+		t.Fatalf("unexpected page 1: %+v", page1)
+	}
+
+	// Second page starting after "b.txt" — should skip deleted "c.txt".
+	page2, err := s.ListNonDeleted("b.txt", 2)
+	if err != nil {
+		t.Fatalf("ListNonDeleted page 2: %v", err)
+	}
+	if len(page2) != 2 {
+		t.Fatalf("expected 2 in page 2, got %d", len(page2))
+	}
+	if page2[0].Name != "d.txt" || page2[1].Name != "e.txt" {
+		t.Fatalf("unexpected page 2: %+v", page2)
+	}
+
+	// Third page — empty.
+	page3, err := s.ListNonDeleted("e.txt", 2)
+	if err != nil {
+		t.Fatalf("ListNonDeleted page 3: %v", err)
+	}
+	if len(page3) != 0 {
+		t.Fatalf("expected 0 in page 3, got %d", len(page3))
+	}
+}
+
+func TestCachedVersionCounter(t *testing.T) {
+	s := newTestStore(t)
+
+	// Initial max version should be 0.
+	v, _ := s.MaxVersion()
+	if v != 0 {
+		t.Fatalf("expected 0, got %d", v)
+	}
+
+	s.PutFile("a.txt", 1000, 10, "h1", false) // v1
+	s.PutFile("b.txt", 2000, 20, "h2", false) // v2
+
+	v, _ = s.MaxVersion()
+	if v != 2 {
+		t.Fatalf("expected 2, got %d", v)
+	}
+
+	// Purge should not affect the version counter.
+	s.PutFile("del.txt", 1, 0, "", true) // v3
+	s.PurgeTombstones(0)
+
+	v, _ = s.MaxVersion()
+	if v != 3 {
+		t.Fatalf("expected 3 after purge, got %d", v)
+	}
+
+	// Next put should continue from 4.
+	v4, _ := s.PutFile("c.txt", 3000, 30, "h3", false)
+	if v4 != 4 {
+		t.Fatalf("expected version 4, got %d", v4)
+	}
+}
