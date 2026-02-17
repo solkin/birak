@@ -752,9 +752,15 @@ func isOutsideSyncDir(relPath string) bool {
 }
 
 // ShouldIgnore is exported for use by other packages (server, syncer).
+// Internal temp file pattern (.birak-tmp-*) is always ignored regardless of
+// user-provided patterns to prevent syncing temporary files created during
+// atomic writes.
 func ShouldIgnore(relPath string, patterns []string) bool {
 	// Check the basename of the file.
 	base := filepath.Base(relPath)
+	if matched, _ := filepath.Match(".birak-tmp-*", base); matched {
+		return true
+	}
 	for _, pattern := range patterns {
 		if matched, _ := filepath.Match(pattern, base); matched {
 			return true

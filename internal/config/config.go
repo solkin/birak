@@ -69,12 +69,7 @@ func DefaultConfig() Config {
 		SyncDir:    "./sync",
 		MetaDir:    "./meta",
 		ListenAddr: ":9100",
-		Ignore: []string{
-			".DS_Store",
-			"Thumbs.db",
-			"desktop.ini",
-			".birak-tmp-*",
-		},
+		Ignore: []string{},
 		Gateways: GatewaysConfig{
 			S3: S3GatewayConfig{
 				Enabled:    false,

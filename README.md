@@ -35,8 +35,6 @@ peers:
 ignore:
   - ".DS_Store"
   - "Thumbs.db"
-  - "desktop.ini"
-  - ".birak-tmp-*"
   - "*.swp"
 sync:
   poll_interval: 3s
@@ -58,7 +56,7 @@ peers:
   - "http://192.168.1.3:9100"
 ```
 
-The `ignore` and `sync` sections are optional — defaults will be used if omitted.
+The `ignore` and `sync` sections are optional — defaults will be used if omitted. Internal temp files (`.birak-tmp-*`) are always ignored regardless of configuration.
 
 ### Running
 
@@ -266,6 +264,7 @@ Birak includes a built-in web-based file manager with a Material 3 Expressive UI
 ### Features
 
 - Browse directories with breadcrumb navigation
+- Paginated file listing for large directories
 - Upload files (button or drag-and-drop)
 - Download, rename, delete files
 - Create and delete folders
@@ -344,7 +343,7 @@ Integration tests spin up 2-3 real nodes on localhost with HTTP servers and veri
 - Conflict resolution (newer wins)
 - Initial sync of non-empty directories
 - Bulk synchronization (20 files)
-- Ignoring system files (.DS_Store, etc.)
+- Ignoring files by custom patterns
 - File deletion in subdirectories with empty directory cleanup
 - Source-node directory cleanup on file deletion
 
@@ -374,7 +373,7 @@ WebDAV Gateway tests cover:
 HTTP file browser tests cover:
 - Authentication (Basic Auth: required, valid, invalid, disabled)
 - SPA page serving (root, any path, favicon)
-- Directory listing (root, subdirectory, empty, not found, ignored files filtering)
+- Directory listing (root, subdirectory, empty, not found, ignored files filtering, pagination, dirs-before-files ordering)
 - File download (simple, nested, not found, directory rejection, path traversal)
 - File upload (to root, to subdirectory, ignored file rejection)
 - Directory creation (simple, nested, empty path)
@@ -390,7 +389,7 @@ HTTP file browser tests cover:
 | `meta_dir` | `./meta` | Directory for SQLite database (metadata) |
 | `listen_addr` | `:9100` | HTTP server address |
 | `peers` | `[]` | List of peer URLs |
-| `ignore` | `.DS_Store`, `Thumbs.db`, `desktop.ini`, `.birak-tmp-*` | Glob patterns for ignored files |
+| `ignore` | `[]` _(empty)_ | Glob patterns for ignored files (`.birak-tmp-*` is always ignored internally) |
 | `sync.poll_interval` | `3s` | Peer polling interval |
 | `sync.batch_limit` | `1000` | Max entries per request |
 | `sync.max_concurrent_downloads` | `5` | Concurrent downloads per peer |
