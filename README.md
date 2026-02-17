@@ -68,6 +68,21 @@ The daemon will create `sync_dir` and `meta_dir` if they don't exist, open a SQL
 
 To stop — send `SIGINT` or `SIGTERM` (Ctrl+C). The daemon will gracefully finish all in-progress operations.
 
+### Docker
+
+Build and run a single node:
+
+```bash
+docker build -t birak .
+docker run -d \
+  -v ./sync:/data/sync \
+  -v ./meta:/data/meta \
+  -v ./config.yaml:/etc/birak/config.yaml:ro \
+  -p 9100:9100 \
+  -p 9400:9400 \
+  birak
+```
+
 ## HTTP API
 
 Three endpoints, easy to test with curl:
@@ -291,7 +306,8 @@ Open `http://localhost:9400` in any web browser. All changes made through the fi
 
 ```
 birak/
-  cmd/birakd/main.go              — entrypoint, CLI, graceful shutdown
+  Dockerfile                         — multi-stage Docker build
+  cmd/birakd/main.go                 — entrypoint, CLI, graceful shutdown
   internal/
     config/config.go              — YAML config parsing
     store/store.go                — SQLite: files + cursors tables

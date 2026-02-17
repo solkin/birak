@@ -1,0 +1,11 @@
+.git
+.gitignore
+.DS_Store
+.idea
+.vscode
+*.md
+*.db
+*.db-wal
+*.db-shm
+Dockerfile
+birakd
