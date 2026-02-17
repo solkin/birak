@@ -374,17 +374,59 @@ func TestUploadToSubdir(t *testing.T) {
 	}
 }
 
-func TestUploadIgnoredFile(t *testing.T) {
+func TestUploadWithRelativePath(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+
+	// Simulate folder upload: filename contains relative path segments.
+	body, ct := createMultipartUpload("", "photos/2024/vacation/img.jpg", "jpeg data")
+	req := httptest.NewRequest(http.MethodPost, "/_api/upload", body)
+	req.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "photos", "2024", "vacation", "img.jpg"))
+	if err != nil {
+		t.Fatalf("file not created with intermediate dirs: %v", err)
+	}
+	if string(data) != "jpeg data" {
+		t.Fatalf("unexpected content: %q", string(data))
+	}
+}
+
+func TestUploadTraversalInFilename(t *testing.T) {
 	g, _ := newTestGateway(t, "", "")
 
-	body, ct := createMultipartUpload("", ".DS_Store", "ignored")
+	body, ct := createMultipartUpload("", "../../../etc/evil.txt", "bad")
 	req := httptest.NewRequest(http.MethodPost, "/_api/upload", body)
 	req.Header.Set("Content-Type", ct)
 	w := httptest.NewRecorder()
 	g.server.Handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for ignored file, got %d", w.Code)
+		t.Fatalf("expected 400 for path traversal in filename, got %d", w.Code)
+	}
+}
+
+func TestUploadIgnoredFileSkipped(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+
+	// Ignored files should be silently skipped, not cause an error.
+	body, ct := createMultipartUpload("", ".birak-tmp-test", "ignored")
+	req := httptest.NewRequest(http.MethodPost, "/_api/upload", body)
+	req.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (skip ignored), got %d: %s", w.Code, w.Body.String())
+	}
+	// File should NOT be created on disk.
+	if _, err := os.Stat(filepath.Join(dir, ".birak-tmp-test")); err == nil {
+		t.Fatal("ignored file should not be created")
 	}
 }
 
@@ -554,6 +596,8 @@ func createMultipartUpload(path, filename, content string) (*bytes.Buffer, strin
 	writer.WriteField("path", path)
 	part, _ := writer.CreateFormFile("files", filename)
 	part.Write([]byte(content))
+	// Send relative path as separate field for folder uploads.
+	writer.WriteField("relpaths", filename)
 	writer.Close()
 	return &buf, writer.FormDataContentType()
 }

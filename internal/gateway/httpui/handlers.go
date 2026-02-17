@@ -220,18 +220,43 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Optional relative paths for folder uploads. Go's multipart parser
+	// applies filepath.Base() to filenames, so the frontend sends relative
+	// paths as separate "relpaths" form fields in the same order as "files".
+	relpaths := r.MultipartForm.Value["relpaths"]
+
 	absSync, _ := filepath.Abs(g.syncDir)
 
-	for _, fh := range files {
-		if watcher.ShouldIgnore(fh.Filename, g.ignorePatterns) {
-			jsonError(w, http.StatusBadRequest, fmt.Sprintf("file name %q is ignored", fh.Filename))
+	for i, fh := range files {
+		// Use relpath if provided, otherwise fall back to the base filename.
+		name := fh.Filename
+		if i < len(relpaths) && relpaths[i] != "" {
+			name = relpaths[i]
+		}
+
+		cleanName := filepath.ToSlash(filepath.Clean(name))
+		cleanName = strings.TrimPrefix(cleanName, "/")
+		if cleanName == "" || cleanName == "." || strings.HasPrefix(cleanName, "../") {
+			jsonError(w, http.StatusBadRequest, "invalid file name")
 			return
 		}
 
-		destPath := filepath.Join(dirFullPath, fh.Filename)
+		if watcher.ShouldIgnore(cleanName, g.ignorePatterns) {
+			g.logger.Debug("upload skipped ignored file", "name", cleanName)
+			continue
+		}
+
+		destPath := filepath.Join(dirFullPath, filepath.FromSlash(cleanName))
 		absDest, _ := filepath.Abs(destPath)
 		if !strings.HasPrefix(absDest, absSync+string(filepath.Separator)) {
 			jsonError(w, http.StatusBadRequest, "invalid file name")
+			return
+		}
+
+		// Create intermediate directories for folder uploads.
+		destDir := filepath.Dir(destPath)
+		if err := os.MkdirAll(destDir, 0o755); err != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to create directory")
 			return
 		}
 
@@ -241,8 +266,8 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Write atomically via temp file (matches ignore pattern .birak-tmp-*).
-		tmpPath := filepath.Join(filepath.Dir(destPath), ".birak-tmp-upload-"+filepath.Base(destPath))
+		// Write atomically via temp file.
+		tmpPath := filepath.Join(destDir, ".birak-tmp-upload-"+filepath.Base(destPath))
 		dst, err := os.Create(tmpPath)
 		if err != nil {
 			src.Close()
@@ -266,7 +291,7 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		g.logger.Info("file uploaded", "name", fh.Filename, "dir", targetDir)
+		g.logger.Info("file uploaded", "name", cleanName, "dir", targetDir)
 	}
 
 	jsonOK(w)

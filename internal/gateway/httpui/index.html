@@ -271,7 +271,7 @@ document.addEventListener('DOMContentLoaded',()=>{
 
   $('btn-upload').addEventListener('click',()=>$('file-input').click());
   $('file-input').addEventListener('change',e=>{
-    if(e.target.files.length){upload(e.target.files);e.target.value=''}
+    if(e.target.files.length){uploadFlat(e.target.files);e.target.value=''}
   });
 
   $('btn-mkdir').addEventListener('click',()=>{
@@ -302,9 +302,21 @@ document.addEventListener('DOMContentLoaded',()=>{
   document.body.addEventListener('dragenter',e=>{e.preventDefault();dragN++;$('drop-zone').classList.add('active')});
   document.body.addEventListener('dragleave',e=>{e.preventDefault();dragN--;if(!dragN)$('drop-zone').classList.remove('active')});
   document.body.addEventListener('dragover',e=>e.preventDefault());
-  document.body.addEventListener('drop',e=>{
+  document.body.addEventListener('drop',async e=>{
     e.preventDefault();dragN=0;$('drop-zone').classList.remove('active');
-    if(e.dataTransfer.files.length)upload(e.dataTransfer.files);
+    const items=e.dataTransfer.items;
+    if(!items||!items.length)return;
+    const entries=[];
+    for(let i=0;i<items.length;i++){
+      const en=items[i].webkitGetAsEntry&&items[i].webkitGetAsEntry();
+      if(en)entries.push(en);
+    }
+    if(entries.length){
+      const collected=await collectEntries(entries,'');
+      if(collected.length)uploadWithPaths(collected);
+    }else if(e.dataTransfer.files.length){
+      uploadFlat(e.dataTransfer.files);
+    }
   });
 });
 
@@ -398,7 +410,49 @@ function nextPage(){if(pageOffset+PAGE_SIZE<totalEntries){pageOffset+=PAGE_SIZE;
 /* --- Actions --- */
 function dl(p){location.href='/_api/dl/'+p.split('/').map(encodeURIComponent).join('/')}
 
-async function upload(files){
+/* --- Folder drag-and-drop helpers --- */
+function readEntries(reader){
+  return new Promise((ok,fail)=>{reader.readEntries(ok,fail)});
+}
+function fileFromEntry(entry){
+  return new Promise((ok,fail)=>{entry.file(ok,fail)});
+}
+async function collectEntries(entries,prefix){
+  const result=[];
+  for(const entry of entries){
+    if(entry.isFile){
+      const f=await fileFromEntry(entry);
+      result.push({file:f,path:prefix?prefix+'/'+entry.name:entry.name});
+    }else if(entry.isDirectory){
+      const reader=entry.createReader();
+      let batch;
+      const children=[];
+      do{batch=await readEntries(reader);for(const b of batch)children.push(b)}while(batch.length);
+      const sub=await collectEntries(children,prefix?prefix+'/'+entry.name:entry.name);
+      result.push(...sub);
+    }
+  }
+  return result;
+}
+
+async function uploadWithPaths(collected){
+  const BATCH=50;
+  toast('Uploading '+collected.length+' file'+(collected.length>1?'s':'')+'...');
+  try{
+    for(let i=0;i<collected.length;i+=BATCH){
+      const fd=new FormData();
+      fd.append('path',curPath);
+      const slice=collected.slice(i,i+BATCH);
+      for(const c of slice){fd.append('files',c.file,c.path);fd.append('relpaths',c.path)}
+      const r=await fetch('/_api/upload',{method:'POST',body:fd});
+      if(!r.ok){const e=await r.json();throw new Error(e.error||'Upload failed')}
+    }
+    toast('Upload complete');
+    load();
+  }catch(e){toast(e.message,true)}
+}
+
+async function uploadFlat(files){
   const fd=new FormData();
   fd.append('path',curPath);
   for(const f of files)fd.append('files',f);
