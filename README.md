@@ -1,27 +1,27 @@
-# Birak — File Sync Daemon
+# Birak — Distributed File Server
 
-Birak синхронизирует файлы между несколькими папками, каждая из которых обслуживается своим демоном. Демоны общаются по HTTP в full-mesh топологии.
+Birak is a distributed file server with built-in replication. Each node stores a full copy of the data and automatically keeps it in sync with other nodes over the network. Files are accessible via S3 API, WebDAV, or the local filesystem — use whichever protocol fits your workflow.
 
-## Принцип работы
+## Key Features
 
-- Каждый демон рекурсивно следит за своей папкой и всеми вложенными директориями (fsnotify + периодический скан).
-- При изменении файла вычисляется SHA256. Файлы сравниваются по хешу, конфликты разрешаются по `mod_time` (свежий побеждает).
-- Демоны поллят друг друга по HTTP, скачивая только отличающиеся файлы.
-- Удаления передаются через tombstones с настраиваемым TTL.
-- Синхронизация может стартовать с непустых папок — при первом запуске демон выполняет полный скан и обмен данными с пирами.
-- Поддерживается конфигурируемый список игнорируемых файлов (паттерны glob).
+- **Multi-protocol access** — S3 API (AWS CLI, SDKs), WebDAV (Finder, Explorer, rclone), or direct filesystem access.
+- **Automatic replication** — nodes discover changes in real time (fsnotify) and replicate them to all peers over HTTP.
+- **Conflict resolution** — newest version wins, verified by SHA256 hash.
+- **No single point of failure** — every node is equal; any node can accept reads and writes.
+- **Zero external dependencies** — single Go binary, embedded SQLite for metadata.
+- **Configurable ignore rules** — glob patterns to exclude files from replication.
 
-## Быстрый старт
+## Quick Start
 
-### Сборка
+### Build
 
 ```bash
 go build -o birakd ./cmd/birakd
 ```
 
-### Конфигурация
+### Configuration
 
-Создайте YAML-файл для каждой ноды:
+Create a YAML config file for each node:
 
 **node1.yaml**
 ```yaml
@@ -42,7 +42,7 @@ sync:
   poll_interval: 3s
   batch_limit: 1000
   max_concurrent_downloads: 5
-  tombstone_ttl: 168h       # 7 дней
+  tombstone_ttl: 168h       # 7 days
   scan_interval: 5m
   debounce_window: 300ms
 ```
@@ -58,25 +58,25 @@ peers:
   - "http://192.168.1.3:9100"
 ```
 
-Параметры секций `ignore` и `sync` можно не указывать — будут использованы значения по умолчанию.
+The `ignore` and `sync` sections are optional — defaults will be used if omitted.
 
-### Запуск
+### Running
 
 ```bash
 ./birakd -config node1.yaml
 ```
 
-Демон создаст `sync_dir` и `meta_dir` если их нет, откроет SQLite базу в `meta_dir/birak.db` и начнёт синхронизацию.
+The daemon will create `sync_dir` and `meta_dir` if they don't exist, open a SQLite database at `meta_dir/birak.db`, and start synchronizing.
 
-Остановка — `SIGINT` или `SIGTERM` (Ctrl+C). Демон корректно завершает все операции.
+To stop — send `SIGINT` or `SIGTERM` (Ctrl+C). The daemon will gracefully finish all in-progress operations.
 
 ## HTTP API
 
-Три эндпоинта, можно проверить curl-ом:
+Three endpoints, easy to test with curl:
 
 ### GET /changes?since=N&limit=1000
 
-Возвращает список файлов с `version > N`. Используется пирами для синхронизации.
+Returns files with `version > N`. Used by peers for synchronization.
 
 ```bash
 curl 'http://localhost:9100/changes?since=0&limit=100'
@@ -95,11 +95,11 @@ curl 'http://localhost:9100/changes?since=0&limit=100'
 ]
 ```
 
-Поле `name` содержит относительный путь от `sync_dir` (например `docs/report.txt` для файла в поддиректории).
+The `name` field contains a relative path from `sync_dir` (e.g. `docs/report.txt` for a file in a subdirectory).
 
 ### GET /files/{name...}
 
-Скачивает содержимое файла. Поддерживает вложенные пути.
+Downloads file contents. Supports nested paths.
 
 ```bash
 curl -O 'http://localhost:9100/files/report.txt'
@@ -108,7 +108,7 @@ curl -O 'http://localhost:9100/files/docs/drafts/spec.pdf'
 
 ### GET /status
 
-Состояние ноды.
+Node status.
 
 ```bash
 curl 'http://localhost:9100/status'
@@ -122,130 +122,130 @@ curl 'http://localhost:9100/status'
 }
 ```
 
-## Алгоритм синхронизации
+## Sync Algorithm
 
-1. Каждое изменение файла (создание, изменение, удаление) обновляет запись в SQLite-таблице `files` с новым монотонным `version`.
-2. Пир B поллит пир A: `GET /changes?since=<cursor>`.
-3. Для каждого файла в ответе: если SHA256 отличается от локального и `mod_time` входящего файла свежее — скачивает файл.
-4. Курсор обновляется — при следующем запросе придут только новые изменения.
-5. Initial sync (в том числе нового пира) — тот же запрос с `since=0`.
+1. Every file change (create, modify, delete) updates the record in the SQLite `files` table with a new monotonic `version`.
+2. Peer B polls peer A: `GET /changes?since=<cursor>`.
+3. For each file in the response: if the SHA256 differs from the local copy and the incoming `mod_time` is newer — the file is downloaded.
+4. The cursor is updated — the next request will only return new changes.
+5. Initial sync (including a new peer joining) — the same request with `since=0`.
 
-### Предотвращение циклов
+### Cycle Prevention
 
-Когда демон записывает файл, полученный от пира, он помечает его в in-memory set `recentlySynced`. Watcher видит событие fsnotify, но пропускает файл, если хеш совпадает с ожидаемым. Пометка автоматически удаляется через 5 секунд.
+When the daemon writes a file received from a peer, it marks it in the in-memory `recentlySynced` set. The watcher sees the fsnotify event but skips the file if the hash matches the expected value. The mark is automatically removed after 5 seconds.
 
-### Удаления
+### Deletions
 
-При удалении файла создаётся tombstone (`deleted=true`). Пиры получают его через `/changes` и удаляют файл локально. Tombstones очищаются после `tombstone_ttl` (по умолчанию 7 дней).
+When a file is deleted, a tombstone (`deleted=true`) is created. Peers receive it via `/changes` and delete the file locally. Tombstones are purged after `tombstone_ttl` (default 7 days).
 
 ## S3 Gateway
 
-Birak может выступать S3-совместимым шлюзом, предоставляя доступ к файлам в `sync_dir` через стандартный S3 API.
+Birak can act as an S3-compatible gateway, providing access to files in `sync_dir` via the standard S3 API.
 
-### Принцип
+### Concept
 
-- **Бакеты** — это папки первого уровня в `sync_dir`. Бакет `photos` = директория `sync_dir/photos/`.
-- **Объекты** — файлы внутри бакетов. Ключ `2024/img.jpg` в бакете `photos` = файл `sync_dir/photos/2024/img.jpg`.
-- Создание/удаление бакетов = создание/удаление директорий. Бакеты не задаются в конфиге.
-- Изменения через S3 API подхватываются watcher-ом и синхронизируются на другие ноды.
+- **Buckets** are top-level directories in `sync_dir`. Bucket `photos` = directory `sync_dir/photos/`.
+- **Objects** are files inside buckets. Key `2024/img.jpg` in bucket `photos` = file `sync_dir/photos/2024/img.jpg`.
+- Creating/deleting buckets = creating/deleting directories. Buckets are not defined in the config.
+- Changes made via the S3 API are picked up by the watcher and synchronized to other nodes.
 
-### Конфигурация
+### Configuration
 
 ```yaml
 gateways:
   s3:
     enabled: true
     listen_addr: ":9200"
-    access_key: "admin"       # опционально
-    secret_key: "secret123"   # опционально
+    access_key: "admin"       # optional
+    secret_key: "secret123"   # optional
 ```
 
-Если `access_key` и `secret_key` не указаны, авторизация отключена.
+If `access_key` and `secret_key` are not set, authentication is disabled.
 
-### Поддерживаемые операции
+### Supported Operations
 
-| Операция | Описание |
-|----------|----------|
-| `ListBuckets` | Список бакетов (GET /) |
-| `CreateBucket` | Создание бакета (PUT /{bucket}) |
-| `DeleteBucket` | Удаление пустого бакета (DELETE /{bucket}) |
-| `HeadBucket` | Проверка существования бакета (HEAD /{bucket}) |
-| `ListObjectsV2` | Листинг объектов с prefix/delimiter (GET /{bucket}) |
-| `PutObject` | Загрузка файла (PUT /{bucket}/{key}) |
-| `GetObject` | Скачивание файла (GET /{bucket}/{key}) |
-| `DeleteObject` | Удаление файла (DELETE /{bucket}/{key}) |
-| `HeadObject` | Метаданные файла (HEAD /{bucket}/{key}) |
+| Operation | Description |
+|-----------|-------------|
+| `ListBuckets` | List buckets (GET /) |
+| `CreateBucket` | Create bucket (PUT /{bucket}) |
+| `DeleteBucket` | Delete empty bucket (DELETE /{bucket}) |
+| `HeadBucket` | Check bucket existence (HEAD /{bucket}) |
+| `ListObjectsV2` | List objects with prefix/delimiter (GET /{bucket}) |
+| `PutObject` | Upload file (PUT /{bucket}/{key}) |
+| `GetObject` | Download file (GET /{bucket}/{key}) |
+| `DeleteObject` | Delete file (DELETE /{bucket}/{key}) |
+| `HeadObject` | File metadata (HEAD /{bucket}/{key}) |
 
-### Использование с AWS CLI
+### Usage with AWS CLI
 
 ```bash
-# Настройка
+# Configure
 aws configure set aws_access_key_id admin
 aws configure set aws_secret_access_key secret123
 
-# Создать бакет
+# Create bucket
 aws --endpoint-url http://localhost:9200 s3 mb s3://photos
 
-# Загрузить файл
+# Upload file
 aws --endpoint-url http://localhost:9200 s3 cp image.jpg s3://photos/2024/image.jpg
 
-# Скачать файл
+# Download file
 aws --endpoint-url http://localhost:9200 s3 cp s3://photos/2024/image.jpg ./local.jpg
 
-# Листинг
+# List
 aws --endpoint-url http://localhost:9200 s3 ls s3://photos/
 
-# Удалить
+# Delete
 aws --endpoint-url http://localhost:9200 s3 rm s3://photos/2024/image.jpg
 ```
 
 ## WebDAV Gateway
 
-Birak может выступать WebDAV-сервером, предоставляя доступ к файлам в `sync_dir` через стандартный протокол WebDAV. Совместим с macOS Finder, Windows Explorer, Linux davfs2, Cyberduck, rclone и другими WebDAV-клиентами.
+Birak can act as a WebDAV server, providing access to files in `sync_dir` via the standard WebDAV protocol. Compatible with macOS Finder, Windows Explorer, Linux davfs2, Cyberduck, rclone, and other WebDAV clients.
 
-### Принцип
+### Concept
 
-- WebDAV — это расширение HTTP. Корень WebDAV-сервера = `sync_dir`.
-- Файлы и директории доступны напрямую по путям (без концепции бакетов, как в S3).
-- Изменения через WebDAV подхватываются watcher-ом и синхронизируются на другие ноды.
-- Блокировки (LOCK/UNLOCK) — stub: возвращается fake token, достаточный для работы Finder и Windows Explorer.
+- WebDAV is an HTTP extension. The WebDAV server root = `sync_dir`.
+- Files and directories are accessible directly by path (no bucket concept like in S3).
+- Changes made via WebDAV are picked up by the watcher and synchronized to other nodes.
+- Locks (LOCK/UNLOCK) are stubs: a fake token is returned, sufficient for Finder and Windows Explorer.
 
-### Конфигурация
+### Configuration
 
 ```yaml
 gateways:
   webdav:
     enabled: true
     listen_addr: ":9300"
-    username: "user"           # опционально
-    password: "secret123"      # опционально
+    username: "user"           # optional
+    password: "secret123"      # optional
 ```
 
-Если `username` и `password` не указаны, авторизация отключена (доступ без пароля).
+If `username` and `password` are not set, authentication is disabled (open access).
 
-### Поддерживаемые операции
+### Supported Operations
 
-| Метод | Описание |
-|-------|----------|
-| `OPTIONS` | Список поддерживаемых методов, DAV compliance class 1, 2 |
-| `PROPFIND` | Листинг директории / свойства файла (Depth: 0, 1) |
-| `PROPPATCH` | Изменение свойств (stub — подтверждает без сохранения) |
-| `GET` | Скачивание файла |
-| `HEAD` | Метаданные файла |
-| `PUT` | Загрузка файла (атомарная запись через temp file) |
-| `DELETE` | Удаление файла или директории |
-| `MKCOL` | Создание директории |
-| `MOVE` | Перемещение / переименование |
-| `COPY` | Копирование файла или директории |
-| `LOCK` | Блокировка (stub — fake token) |
-| `UNLOCK` | Разблокировка (stub) |
+| Method | Description |
+|--------|-------------|
+| `OPTIONS` | List supported methods, DAV compliance class 1, 2 |
+| `PROPFIND` | Directory listing / file properties (Depth: 0, 1) |
+| `PROPPATCH` | Modify properties (stub — acknowledges without persisting) |
+| `GET` | Download file |
+| `HEAD` | File metadata |
+| `PUT` | Upload file (atomic write via temp file) |
+| `DELETE` | Delete file or directory |
+| `MKCOL` | Create directory |
+| `MOVE` | Move / rename |
+| `COPY` | Copy file or directory |
+| `LOCK` | Lock (stub — fake token) |
+| `UNLOCK` | Unlock (stub) |
 
-### Подключение
+### Connecting
 
 **macOS Finder:**
 1. Finder → Go → Connect to Server (⌘K)
-2. Введите: `http://localhost:9300`
-3. При настроенной авторизации — введите логин и пароль
+2. Enter: `http://localhost:9300`
+3. If authentication is configured — enter username and password
 
 **Linux (davfs2):**
 ```bash
@@ -254,108 +254,108 @@ sudo mount -t davfs http://localhost:9300 /mnt/birak
 
 **Cyberduck / rclone:**
 ```bash
-rclone config  # тип: webdav, url: http://localhost:9300
+rclone config  # type: webdav, url: http://localhost:9300
 rclone ls birak:/
 rclone copy localfile.txt birak:/path/to/file.txt
 ```
 
-## Структура проекта
+## Project Structure
 
 ```
 birak/
-  cmd/birakd/main.go              — точка входа, CLI, graceful shutdown
+  cmd/birakd/main.go              — entrypoint, CLI, graceful shutdown
   internal/
-    config/config.go              — парсинг YAML-конфигурации
-    store/store.go                — SQLite: таблица files + cursors
-    store/store_test.go           — unit-тесты store
+    config/config.go              — YAML config parsing
+    store/store.go                — SQLite: files + cursors tables
+    store/store_test.go           — store unit tests
     watcher/watcher.go            — fsnotify + debounce + periodic scan
-    watcher/cleanup_test.go       — unit-тесты очистки директорий
-    server/server.go              — HTTP API для peer-синхронизации
+    watcher/cleanup_test.go       — directory cleanup unit tests
+    server/server.go              — HTTP API for peer synchronization
     syncer/syncer.go              — polling, conflict resolution, downloads
-    gateway/gateway.go            — интерфейс Gateway
-    gateway/s3/s3.go              — S3 Gateway: роутинг, авторизация
-    gateway/s3/handlers.go        — обработчики S3 операций
-    gateway/s3/s3_test.go         — unit-тесты S3 Gateway
-    gateway/webdav/webdav.go      — WebDAV Gateway: роутинг, авторизация
-    gateway/webdav/handlers.go    — обработчики WebDAV операций
-    gateway/webdav/webdav_test.go — unit-тесты WebDAV Gateway
-  integration_test.go             — интеграционные тесты (2-3 ноды)
+    gateway/gateway.go            — Gateway interface
+    gateway/s3/s3.go              — S3 Gateway: routing, auth
+    gateway/s3/handlers.go        — S3 operation handlers
+    gateway/s3/s3_test.go         — S3 Gateway unit tests
+    gateway/webdav/webdav.go      — WebDAV Gateway: routing, auth
+    gateway/webdav/handlers.go    — WebDAV operation handlers
+    gateway/webdav/webdav_test.go — WebDAV Gateway unit tests
+  integration_test.go             — integration tests (2-3 nodes)
 ```
 
-## Тесты
+## Tests
 
 ```bash
-# Все тесты
+# All tests
 go test -v -timeout 120s ./...
 
-# Только unit-тесты store
+# Store unit tests only
 go test -v ./internal/store/
 
-# Только S3 Gateway тесты
+# S3 Gateway tests only
 go test -v ./internal/gateway/s3/
 
-# Только WebDAV Gateway тесты
+# WebDAV Gateway tests only
 go test -v ./internal/gateway/webdav/
 
-# Только интеграционные
+# Integration tests only
 go test -v -timeout 120s -run TestIntegration
 ```
 
-Интеграционные тесты поднимают 2-3 реальных ноды на localhost с HTTP-серверами и проверяют:
-- Создание, изменение, удаление файлов
-- Синхронизацию вложенных директорий (включая глубокую вложенность)
-- Синхронизацию в 3-нодном full-mesh
+Integration tests spin up 2-3 real nodes on localhost with HTTP servers and verify:
+- File creation, modification, deletion
+- Nested directory synchronization (including deep nesting)
+- 3-node full-mesh synchronization
 - Conflict resolution (newer wins)
-- Начальную синхронизацию непустых папок
-- Массовую синхронизацию (20 файлов)
-- Игнорирование системных файлов (.DS_Store и т.д.)
-- Удаление файлов в поддиректориях с очисткой пустых папок
-- Очистку директорий на исходной ноде при удалении файлов
+- Initial sync of non-empty directories
+- Bulk synchronization (20 files)
+- Ignoring system files (.DS_Store, etc.)
+- File deletion in subdirectories with empty directory cleanup
+- Source-node directory cleanup on file deletion
 
-S3 Gateway тесты покрывают:
-- Авторизацию (V2, V4, без авторизации, неверные ключи)
-- Операции с бакетами (создание, удаление, листинг, HeadBucket)
-- Операции с объектами (PutObject, GetObject, HeadObject, DeleteObject)
-- Листинг с prefix/delimiter (виртуальные директории)
-- Вложенные ключи, перезапись, пустые файлы, большие файлы
-- Игнорируемые файлы, защиту от path traversal
-- Жизненный цикл сервера (Start/Stop)
+S3 Gateway tests cover:
+- Authentication (V2, V4, no auth, invalid keys)
+- Bucket operations (create, delete, list, HeadBucket)
+- Object operations (PutObject, GetObject, HeadObject, DeleteObject)
+- Listing with prefix/delimiter (virtual directories)
+- Nested keys, overwrite, empty files, large files
+- Ignored files, path traversal protection
+- Server lifecycle (Start/Stop)
 
-WebDAV Gateway тесты покрывают:
-- Авторизацию (Basic Auth: без авторизации, корректные/некорректные креды, отключённая авторизация)
-- PROPFIND (корень, файлы, Depth: 0/1, фильтрацию ignored файлов, валидность XML)
-- Операции с файлами (GET, HEAD, PUT новый/перезапись, автосоздание родительских директорий)
-- Удаление файлов и директорий, запрет удаления корня
-- MKCOL (создание директорий, дубли, отсутствие родителя)
-- MOVE (переименование, перезапись, запрет перезаписи с Overwrite: F)
-- COPY (файлы, рекурсивное копирование директорий)
+WebDAV Gateway tests cover:
+- Authentication (Basic Auth: no auth, valid/invalid credentials, disabled auth)
+- PROPFIND (root, files, Depth: 0/1, ignored file filtering, XML validity)
+- File operations (GET, HEAD, PUT new/overwrite, auto-creation of parent directories)
+- File and directory deletion, root deletion prevention
+- MKCOL (directory creation, duplicates, missing parent)
+- MOVE (rename, overwrite, overwrite prevention with Overwrite: F)
+- COPY (files, recursive directory copy)
 - LOCK/UNLOCK (fake tokens)
 - PROPPATCH (stub)
-- Корректную отдачу index.html без редиректа
-- Защиту от path traversal
-- URL-кодирование путей с пробелами и спецсимволами
+- Correct serving of index.html without redirect
+- Path traversal protection
+- URL encoding of paths with spaces and special characters
 
-## Параметры конфигурации
+## Configuration Reference
 
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `node_id` | `node-1` | Уникальный ID ноды |
-| `sync_dir` | `./sync` | Папка для синхронизации |
-| `meta_dir` | `./meta` | Папка для SQLite базы (метаинформация) |
-| `listen_addr` | `:9100` | Адрес HTTP-сервера |
-| `peers` | `[]` | Список URL пиров |
-| `ignore` | `.DS_Store`, `Thumbs.db`, `desktop.ini`, `.birak-tmp-*` | Glob-паттерны игнорируемых файлов |
-| `sync.poll_interval` | `3s` | Интервал polling пиров |
-| `sync.batch_limit` | `1000` | Макс. записей за один запрос |
-| `sync.max_concurrent_downloads` | `5` | Параллельных скачиваний на пир |
-| `sync.tombstone_ttl` | `168h` | Время жизни tombstones (7 дней) |
-| `sync.scan_interval` | `5m` | Интервал периодического скана |
-| `sync.debounce_window` | `300ms` | Окно дедупликации событий fsnotify |
-| `gateways.s3.enabled` | `false` | Включить S3 Gateway |
-| `gateways.s3.listen_addr` | `:9200` | Адрес S3 Gateway |
-| `gateways.s3.access_key` | _(пусто)_ | Ключ доступа (опционально) |
-| `gateways.s3.secret_key` | _(пусто)_ | Секретный ключ (опционально) |
-| `gateways.webdav.enabled` | `false` | Включить WebDAV Gateway |
-| `gateways.webdav.listen_addr` | `:9300` | Адрес WebDAV Gateway |
-| `gateways.webdav.username` | _(пусто)_ | Имя пользователя (опционально) |
-| `gateways.webdav.password` | _(пусто)_ | Пароль (опционально) |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `node_id` | `node-1` | Unique node ID |
+| `sync_dir` | `./sync` | Directory to synchronize |
+| `meta_dir` | `./meta` | Directory for SQLite database (metadata) |
+| `listen_addr` | `:9100` | HTTP server address |
+| `peers` | `[]` | List of peer URLs |
+| `ignore` | `.DS_Store`, `Thumbs.db`, `desktop.ini`, `.birak-tmp-*` | Glob patterns for ignored files |
+| `sync.poll_interval` | `3s` | Peer polling interval |
+| `sync.batch_limit` | `1000` | Max entries per request |
+| `sync.max_concurrent_downloads` | `5` | Concurrent downloads per peer |
+| `sync.tombstone_ttl` | `168h` | Tombstone TTL (7 days) |
+| `sync.scan_interval` | `5m` | Periodic scan interval |
+| `sync.debounce_window` | `300ms` | fsnotify event debounce window |
+| `gateways.s3.enabled` | `false` | Enable S3 Gateway |
+| `gateways.s3.listen_addr` | `:9200` | S3 Gateway address |
+| `gateways.s3.access_key` | _(empty)_ | Access key (optional) |
+| `gateways.s3.secret_key` | _(empty)_ | Secret key (optional) |
+| `gateways.webdav.enabled` | `false` | Enable WebDAV Gateway |
+| `gateways.webdav.listen_addr` | `:9300` | WebDAV Gateway address |
+| `gateways.webdav.username` | _(empty)_ | Username (optional) |
+| `gateways.webdav.password` | _(empty)_ | Password (optional) |
