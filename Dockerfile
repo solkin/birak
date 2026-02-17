@@ -10,5 +10,6 @@ RUN apk add --no-cache ca-certificates tzdata
 COPY --from=build /birakd /usr/local/bin/birakd
 VOLUME ["/data/sync", "/data/meta"]
 EXPOSE 9100 9200 9300 9400
+ENV BIRAK_SYNC_DIR="/data/sync" \
+    BIRAK_META_DIR="/data/meta"
 ENTRYPOINT ["birakd"]
-CMD ["-config", "/etc/birak/config.yaml"]

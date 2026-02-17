@@ -25,27 +25,13 @@ It doesn't matter how files get into `sync_dir` — you can copy them with `cp`,
 
 ### Docker
 
-The fastest way to try Birak. Create a config file:
-
-**config.yaml**
-```yaml
-node_id: "node-1"
-sync_dir: "/data/sync"
-meta_dir: "/data/meta"
-listen_addr: ":9100"
-gateways:
-  http:
-    enabled: true
-    listen_addr: ":9400"
-```
-
-Run the container:
+The fastest way to try Birak — no config file needed:
 
 ```bash
 docker run -d \
+  -e BIRAK_HTTP_ENABLED=true \
   -v ./sync:/data/sync \
   -v ./meta:/data/meta \
-  -v ./config.yaml:/etc/birak/config.yaml:ro \
   -p 9100:9100 \
   -p 9400:9400 \
   solkin/birak:latest
@@ -55,55 +41,33 @@ Open `http://localhost:9400` — you'll see the file browser. Upload a file, and
 
 ### Docker Compose (2-node cluster)
 
-To see replication in action, run two nodes. Create two config files:
+To see replication in action, run two nodes:
 
-**node1.yaml**
 ```yaml
-node_id: "node-1"
-sync_dir: "/data/sync"
-meta_dir: "/data/meta"
-listen_addr: ":9100"
-peers:
-  - "http://node2:9100"
-gateways:
-  http:
-    enabled: true
-    listen_addr: ":9400"
-```
-
-**node2.yaml**
-```yaml
-node_id: "node-2"
-sync_dir: "/data/sync"
-meta_dir: "/data/meta"
-listen_addr: ":9100"
-peers:
-  - "http://node1:9100"
-gateways:
-  http:
-    enabled: true
-    listen_addr: ":9400"
-```
-
-**docker-compose.yaml**
-```yaml
+# docker-compose.yaml
 services:
   node1:
     image: solkin/birak:latest
+    environment:
+      BIRAK_NODE_ID: "node-1"
+      BIRAK_PEERS: "http://node2:9100"
+      BIRAK_HTTP_ENABLED: "true"
     volumes:
       - node1-sync:/data/sync
       - node1-meta:/data/meta
-      - ./node1.yaml:/etc/birak/config.yaml:ro
     ports:
       - "9101:9100"
       - "9401:9400"
 
   node2:
     image: solkin/birak:latest
+    environment:
+      BIRAK_NODE_ID: "node-2"
+      BIRAK_PEERS: "http://node1:9100"
+      BIRAK_HTTP_ENABLED: "true"
     volumes:
       - node2-sync:/data/sync
       - node2-meta:/data/meta
-      - ./node2.yaml:/etc/birak/config.yaml:ro
     ports:
       - "9102:9100"
       - "9402:9400"
@@ -134,19 +98,22 @@ To stop — send `SIGINT` or `SIGTERM` (Ctrl+C). The daemon will gracefully fini
 
 ## Configuration
 
-All settings are in a single YAML file. Only `node_id` and `peers` are essential for a multi-node setup — everything else has sensible defaults.
+Birak can be configured via a YAML file, environment variables, or both. Environment variables take precedence over the config file. The config file itself is optional — you can run Birak entirely with env vars.
 
-### Minimal config
+### YAML config file
 
+```bash
+./birakd -config config.yaml
+```
+
+**Minimal:**
 ```yaml
 node_id: "node-1"
-listen_addr: ":9100"
 peers:
   - "http://192.168.1.2:9100"
 ```
 
-### Full config example
-
+**Full example:**
 ```yaml
 node_id: "node-1"
 sync_dir: "/data/sync"
@@ -186,34 +153,45 @@ gateways:
 
 The `ignore` and `sync` sections are optional — defaults will be used if omitted. Internal temp files (`.birak-tmp-*`) are always ignored regardless of configuration.
 
+### Environment variables
+
+Every setting has a corresponding `BIRAK_*` environment variable. Useful for Docker and CI/CD. List values (peers, ignore) are comma-separated.
+
+```bash
+export BIRAK_NODE_ID="node-1"
+export BIRAK_PEERS="http://192.168.1.2:9100,http://192.168.1.3:9100"
+export BIRAK_HTTP_ENABLED=true
+./birakd
+```
+
 ### Reference
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `node_id` | `node-1` | Unique node ID |
-| `sync_dir` | `./sync` | Directory to synchronize |
-| `meta_dir` | `./meta` | Directory for SQLite database |
-| `listen_addr` | `:9100` | Peer-to-peer HTTP server address |
-| `peers` | `[]` | List of peer URLs |
-| `ignore` | `[]` | Glob patterns for ignored files |
-| `sync.poll_interval` | `3s` | Peer polling interval |
-| `sync.batch_limit` | `1000` | Max entries per sync request |
-| `sync.max_concurrent_downloads` | `5` | Concurrent downloads per peer |
-| `sync.tombstone_ttl` | `168h` | How long deleted file records are kept (7 days) |
-| `sync.scan_interval` | `5m` | Full filesystem scan interval |
-| `sync.debounce_window` | `300ms` | Delay before processing file events |
-| `gateways.s3.enabled` | `false` | Enable S3 Gateway |
-| `gateways.s3.listen_addr` | `:9200` | S3 Gateway address |
-| `gateways.s3.access_key` | _(empty)_ | S3 access key (disabled if empty) |
-| `gateways.s3.secret_key` | _(empty)_ | S3 secret key (disabled if empty) |
-| `gateways.webdav.enabled` | `false` | Enable WebDAV Gateway |
-| `gateways.webdav.listen_addr` | `:9300` | WebDAV Gateway address |
-| `gateways.webdav.username` | _(empty)_ | WebDAV username (disabled if empty) |
-| `gateways.webdav.password` | _(empty)_ | WebDAV password (disabled if empty) |
-| `gateways.http.enabled` | `false` | Enable HTTP file browser |
-| `gateways.http.listen_addr` | `:9400` | HTTP file browser address |
-| `gateways.http.username` | _(empty)_ | HTTP username (disabled if empty) |
-| `gateways.http.password` | _(empty)_ | HTTP password (disabled if empty) |
+| YAML | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `node_id` | `BIRAK_NODE_ID` | `node-1` | Unique node ID |
+| `sync_dir` | `BIRAK_SYNC_DIR` | `./sync` | Directory to synchronize |
+| `meta_dir` | `BIRAK_META_DIR` | `./meta` | Directory for SQLite database |
+| `listen_addr` | `BIRAK_LISTEN_ADDR` | `:9100` | Peer-to-peer HTTP server address |
+| `peers` | `BIRAK_PEERS` | `[]` | Peer URLs (comma-separated in env) |
+| `ignore` | `BIRAK_IGNORE` | `[]` | Ignore patterns (comma-separated in env) |
+| `sync.poll_interval` | `BIRAK_SYNC_POLL_INTERVAL` | `3s` | Peer polling interval |
+| `sync.batch_limit` | `BIRAK_SYNC_BATCH_LIMIT` | `1000` | Max entries per sync request |
+| `sync.max_concurrent_downloads` | `BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS` | `5` | Concurrent downloads per peer |
+| `sync.tombstone_ttl` | `BIRAK_SYNC_TOMBSTONE_TTL` | `168h` | Deleted file record TTL (7 days) |
+| `sync.scan_interval` | `BIRAK_SYNC_SCAN_INTERVAL` | `5m` | Full filesystem scan interval |
+| `sync.debounce_window` | `BIRAK_SYNC_DEBOUNCE_WINDOW` | `300ms` | Delay before processing file events |
+| `gateways.s3.enabled` | `BIRAK_S3_ENABLED` | `false` | Enable S3 Gateway |
+| `gateways.s3.listen_addr` | `BIRAK_S3_LISTEN_ADDR` | `:9200` | S3 Gateway address |
+| `gateways.s3.access_key` | `BIRAK_S3_ACCESS_KEY` | _(empty)_ | S3 access key |
+| `gateways.s3.secret_key` | `BIRAK_S3_SECRET_KEY` | _(empty)_ | S3 secret key |
+| `gateways.webdav.enabled` | `BIRAK_WEBDAV_ENABLED` | `false` | Enable WebDAV Gateway |
+| `gateways.webdav.listen_addr` | `BIRAK_WEBDAV_LISTEN_ADDR` | `:9300` | WebDAV Gateway address |
+| `gateways.webdav.username` | `BIRAK_WEBDAV_USERNAME` | _(empty)_ | WebDAV username |
+| `gateways.webdav.password` | `BIRAK_WEBDAV_PASSWORD` | _(empty)_ | WebDAV password |
+| `gateways.http.enabled` | `BIRAK_HTTP_ENABLED` | `false` | Enable HTTP file browser |
+| `gateways.http.listen_addr` | `BIRAK_HTTP_LISTEN_ADDR` | `:9400` | HTTP file browser address |
+| `gateways.http.username` | `BIRAK_HTTP_USERNAME` | _(empty)_ | HTTP username |
+| `gateways.http.password` | `BIRAK_HTTP_PASSWORD` | _(empty)_ | HTTP password |
 
 ## Access Protocols
 
