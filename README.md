@@ -1,10 +1,10 @@
 # Birak — Distributed File Server
 
-Birak is a distributed file server with built-in replication. Each node stores a full copy of the data and automatically keeps it in sync with other nodes over the network. Files are accessible via S3 API, WebDAV, or the local filesystem — use whichever protocol fits your workflow.
+Birak is a distributed file server with built-in replication. Each node stores a full copy of the data and automatically keeps it in sync with other nodes over the network. Files are accessible via S3 API, WebDAV, HTTP file browser, or the local filesystem — use whichever protocol fits your workflow.
 
 ## Key Features
 
-- **Multi-protocol access** — S3 API (AWS CLI, SDKs), WebDAV (Finder, Explorer, rclone), or direct filesystem access.
+- **Multi-protocol access** — S3 API (AWS CLI, SDKs), WebDAV (Finder, Explorer, rclone), HTTP file browser, or direct filesystem access.
 - **Automatic replication** — nodes discover changes in real time (fsnotify) and replicate them to all peers over HTTP.
 - **Conflict resolution** — newest version wins, verified by SHA256 hash.
 - **No single point of failure** — every node is equal; any node can accept reads and writes.
@@ -259,6 +259,35 @@ rclone ls birak:/
 rclone copy localfile.txt birak:/path/to/file.txt
 ```
 
+## HTTP File Browser
+
+Birak includes a built-in web-based file manager with a Material 3 Expressive UI. Access and manage files directly from any web browser — no client software needed.
+
+### Features
+
+- Browse directories with breadcrumb navigation
+- Upload files (button or drag-and-drop)
+- Download, rename, delete files
+- Create and delete folders
+- Responsive layout for mobile devices
+
+### Configuration
+
+```yaml
+gateways:
+  http:
+    enabled: true
+    listen_addr: ":9400"
+    username: "user"           # optional
+    password: "secret123"      # optional
+```
+
+If `username` and `password` are not set, authentication is disabled. When configured, the browser shows a native login prompt (HTTP Basic Auth).
+
+### Usage
+
+Open `http://localhost:9400` in any web browser. All changes made through the file browser are picked up by the watcher and synchronized to other nodes.
+
 ## Project Structure
 
 ```
@@ -279,6 +308,10 @@ birak/
     gateway/webdav/webdav.go      — WebDAV Gateway: routing, auth
     gateway/webdav/handlers.go    — WebDAV operation handlers
     gateway/webdav/webdav_test.go — WebDAV Gateway unit tests
+    gateway/httpui/httpui.go      — HTTP file browser: routing, auth
+    gateway/httpui/handlers.go    — HTTP file browser API handlers
+    gateway/httpui/index.html     — Material 3 Expressive SPA (embedded)
+    gateway/httpui/httpui_test.go — HTTP file browser unit tests
   integration_test.go             — integration tests (2-3 nodes)
 ```
 
@@ -296,6 +329,9 @@ go test -v ./internal/gateway/s3/
 
 # WebDAV Gateway tests only
 go test -v ./internal/gateway/webdav/
+
+# HTTP file browser tests only
+go test -v ./internal/gateway/httpui/
 
 # Integration tests only
 go test -v -timeout 120s -run TestIntegration
@@ -335,6 +371,16 @@ WebDAV Gateway tests cover:
 - Path traversal protection
 - URL encoding of paths with spaces and special characters
 
+HTTP file browser tests cover:
+- Authentication (Basic Auth: required, valid, invalid, disabled)
+- SPA page serving (root, any path, favicon)
+- Directory listing (root, subdirectory, empty, not found, ignored files filtering)
+- File download (simple, nested, not found, directory rejection, path traversal)
+- File upload (to root, to subdirectory, ignored file rejection)
+- Directory creation (simple, nested, empty path)
+- Rename (file, directory, not found)
+- Delete (file, directory recursive, root prevention, not found, path traversal)
+
 ## Configuration Reference
 
 | Parameter | Default | Description |
@@ -359,3 +405,7 @@ WebDAV Gateway tests cover:
 | `gateways.webdav.listen_addr` | `:9300` | WebDAV Gateway address |
 | `gateways.webdav.username` | _(empty)_ | Username (optional) |
 | `gateways.webdav.password` | _(empty)_ | Password (optional) |
+| `gateways.http.enabled` | `false` | Enable HTTP file browser |
+| `gateways.http.listen_addr` | `:9400` | HTTP file browser address |
+| `gateways.http.username` | _(empty)_ | Username (optional) |
+| `gateways.http.password` | _(empty)_ | Password (optional) |

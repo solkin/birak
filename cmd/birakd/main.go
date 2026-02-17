@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/birak/birak/internal/config"
+	httpuigw "github.com/birak/birak/internal/gateway/httpui"
 	s3gw "github.com/birak/birak/internal/gateway/s3"
 	webdavgw "github.com/birak/birak/internal/gateway/webdav"
 	"github.com/birak/birak/internal/server"
@@ -216,6 +217,29 @@ func run(configPath string) error {
 		}()
 	}
 
+	// HTTP file server Gateway (if enabled).
+	var httpGateway *httpuigw.Gateway
+	if cfg.Gateways.HTTP.Enabled {
+		httpGateway = httpuigw.New(
+			cfg.SyncDir,
+			cfg.Ignore,
+			httpuigw.Config{
+				ListenAddr: cfg.Gateways.HTTP.ListenAddr,
+				Username:   cfg.Gateways.HTTP.Username,
+				Password:   cfg.Gateways.HTTP.Password,
+			},
+			logger,
+		)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := httpGateway.Start(ctx); err != nil {
+				logger.Error("HTTP file server error", "error", err)
+				cancel()
+			}
+		}()
+	}
+
 	// Wait for shutdown signal.
 	select {
 	case sig := <-sigCh:
@@ -243,6 +267,13 @@ func run(configPath string) error {
 	if webdavGateway != nil {
 		if err := webdavGateway.Stop(shutdownCtx); err != nil {
 			logger.Error("WebDAV gateway shutdown error", "error", err)
+		}
+	}
+
+	// Graceful HTTP file server shutdown.
+	if httpGateway != nil {
+		if err := httpGateway.Stop(shutdownCtx); err != nil {
+			logger.Error("HTTP file server shutdown error", "error", err)
 		}
 	}
 
