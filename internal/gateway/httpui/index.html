@@ -119,6 +119,23 @@ body{font-family:var(--font);background:var(--background);color:var(--on-surface
 .empty{text-align:center;padding:64px 24px;color:var(--on-surface-muted);font-size:15px}
 .empty svg{width:48px;height:48px;fill:var(--outline);margin-bottom:16px}
 
+/* Pagination */
+.pager{
+  display:flex;align-items:center;justify-content:center;gap:12px;
+  padding:12px 16px;border-top:1px solid var(--outline-variant);
+  font-size:13px;color:var(--on-surface-variant);
+}
+.pager button{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:6px 16px;border-radius:var(--radius-xl);
+  font-size:13px;font-weight:500;cursor:pointer;
+  border:1px solid var(--outline);background:transparent;
+  color:var(--primary);font-family:var(--font);transition:all .15s;
+}
+.pager button:hover:not(:disabled){background:var(--primary-light)}
+.pager button:disabled{color:var(--on-surface-muted);border-color:var(--outline-variant);cursor:default}
+.pager .info{white-space:nowrap}
+
 /* Dialog */
 .overlay{
   display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);
@@ -224,16 +241,33 @@ const IC_EMPTY='<svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 
 
 /* --- State --- */
 let curPath='';
+let pageOffset=0;
+const PAGE_SIZE=100;
+let totalEntries=0;
 let dragN=0;
 let dlgCb=null;
 let dlgMode='input';
 
+/* --- URL helpers --- */
+function pageFromURL(){
+  const p=new URLSearchParams(location.search).get('page');
+  const n=parseInt(p,10);
+  return(n>1)?(n-1)*PAGE_SIZE:0;
+}
+function curPageNum(){return Math.floor(pageOffset/PAGE_SIZE)+1}
+function buildURL(path,page){
+  let u=path?'/'+path+'/':'/';
+  if(page>1)u+='?page='+page;
+  return u;
+}
+
 /* --- Init --- */
 document.addEventListener('DOMContentLoaded',()=>{
   curPath=norm(location.pathname);
+  pageOffset=pageFromURL();
   load();
 
-  window.addEventListener('popstate',()=>{curPath=norm(location.pathname);load()});
+  window.addEventListener('popstate',()=>{curPath=norm(location.pathname);pageOffset=pageFromURL();load()});
 
   $('btn-upload').addEventListener('click',()=>$('file-input').click());
   $('file-input').addEventListener('change',e=>{
@@ -279,9 +313,10 @@ async function load(){
   const el=$('file-list');
   el.innerHTML='<div class="empty">Loading...</div>';
   try{
-    const r=await fetch('/_api/list?path='+encodeURIComponent(curPath));
+    const r=await fetch('/_api/list?path='+encodeURIComponent(curPath)+'&offset='+pageOffset+'&limit='+PAGE_SIZE);
     if(!r.ok){const e=await r.json();throw new Error(e.error||'Failed')}
     const d=await r.json();
+    totalEntries=d.total||0;
     bread();
     render(d.entries||[]);
   }catch(e){
@@ -291,7 +326,8 @@ async function load(){
 
 function nav(p){
   curPath=p;
-  history.pushState(null,'',p?'/'+p+'/':'/');
+  pageOffset=0;
+  history.pushState(null,'',buildURL(p,1));
   load();
 }
 
@@ -341,8 +377,23 @@ function render(entries){
     h+='<div class="date">'+dt+'</div>';
     h+='</div>';
   });
+  if(totalEntries>PAGE_SIZE){
+    const from=pageOffset+1;
+    const to=Math.min(pageOffset+PAGE_SIZE,totalEntries);
+    const hasPrev=pageOffset>0;
+    const hasNext=pageOffset+PAGE_SIZE<totalEntries;
+    h+='<div class="pager">';
+    h+='<button onclick="prevPage()"'+(hasPrev?'':' disabled')+'>Previous</button>';
+    h+='<span class="info">'+from+' \u2013 '+to+' of '+totalEntries.toLocaleString()+'</span>';
+    h+='<button onclick="nextPage()"'+(hasNext?'':' disabled')+'>Next</button>';
+    h+='</div>';
+  }
   el.innerHTML=h;
 }
+
+/* --- Pagination --- */
+function prevPage(){if(pageOffset>0){pageOffset=Math.max(0,pageOffset-PAGE_SIZE);history.pushState(null,'',buildURL(curPath,curPageNum()));load()}}
+function nextPage(){if(pageOffset+PAGE_SIZE<totalEntries){pageOffset+=PAGE_SIZE;history.pushState(null,'',buildURL(curPath,curPageNum()));load()}}
 
 /* --- Actions --- */
 function dl(p){location.href='/_api/dl/'+p.split('/').map(encodeURIComponent).join('/')}

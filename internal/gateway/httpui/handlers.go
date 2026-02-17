@@ -7,11 +7,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/birak/birak/internal/watcher"
 )
+
+const defaultPageSize = 100
+const maxPageSize = 1000
 
 // fileEntry represents a single file or directory in a listing response.
 type fileEntry struct {
@@ -25,6 +29,7 @@ type fileEntry struct {
 type listResponse struct {
 	Path    string      `json:"path"`
 	Entries []fileEntry `json:"entries"`
+	Total   int         `json:"total"`
 }
 
 // resolvePath validates a relative path and returns the full filesystem path.
@@ -55,9 +60,20 @@ func (g *Gateway) resolvePath(relPath string) (string, error) {
 	return full, nil
 }
 
-// handleList returns a JSON listing of a directory.
+// handleList returns a paginated JSON listing of a directory.
+// Query parameters: path, offset (default 0), limit (default 100, max 1000).
+// Entries are sorted: directories first, then files, alphabetically within each group.
+// Info() (stat syscall) is only called for entries on the current page.
 func (g *Gateway) handleList(w http.ResponseWriter, r *http.Request) {
 	dirPath := r.URL.Query().Get("path")
+	offset := parseIntParam(r, "offset", 0)
+	limit := parseIntParam(r, "limit", defaultPageSize)
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 || limit > maxPageSize {
+		limit = defaultPageSize
+	}
 
 	fullPath, err := g.resolvePath(dirPath)
 	if err != nil {
@@ -75,24 +91,48 @@ func (g *Gateway) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := os.ReadDir(fullPath)
+	rawEntries, err := os.ReadDir(fullPath)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "failed to read directory")
 		return
 	}
 
-	var result []fileEntry
-	for _, e := range entries {
-		name := e.Name()
-		if watcher.ShouldIgnore(name, g.ignorePatterns) {
+	// Separate into dirs and files, filtering ignored entries.
+	// os.ReadDir returns entries sorted by name within each category.
+	var dirs, files []os.DirEntry
+	for _, e := range rawEntries {
+		if watcher.ShouldIgnore(e.Name(), g.ignorePatterns) {
 			continue
+		}
+		if e.IsDir() {
+			dirs = append(dirs, e)
+		} else {
+			files = append(files, e)
+		}
+	}
+
+	total := len(dirs) + len(files)
+
+	// Build the page slice from the logical concatenation dirs+files.
+	// Only call Info() for entries on the current page.
+	var result []fileEntry
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	for i := offset; i < end; i++ {
+		var e os.DirEntry
+		if i < len(dirs) {
+			e = dirs[i]
+		} else {
+			e = files[i-len(dirs)]
 		}
 		fi, err := e.Info()
 		if err != nil {
 			continue
 		}
 		result = append(result, fileEntry{
-			Name:    name,
+			Name:    e.Name(),
 			IsDir:   e.IsDir(),
 			Size:    fi.Size(),
 			ModTime: fi.ModTime().UTC().Format(time.RFC3339),
@@ -109,7 +149,20 @@ func (g *Gateway) handleList(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(listResponse{
 		Path:    cleanPath,
 		Entries: result,
+		Total:   total,
 	})
+}
+
+func parseIntParam(r *http.Request, name string, defaultVal int) int {
+	s := r.URL.Query().Get(name)
+	if s == "" {
+		return defaultVal
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return defaultVal
+	}
+	return v
 }
 
 // handleDownload serves a file for download.

@@ -3,6 +3,7 @@ package httpui
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -174,6 +175,78 @@ func TestListSubdir(t *testing.T) {
 	}
 	if len(resp.Entries) != 1 || resp.Entries[0].Name != "readme.md" {
 		t.Fatalf("unexpected entries: %+v", resp.Entries)
+	}
+}
+
+func TestListPagination(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	// Create 5 files.
+	for i := 0; i < 5; i++ {
+		os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%d.txt", i)), []byte("x"), 0o644)
+	}
+
+	// First page: limit=2.
+	w := serve(g, http.MethodGet, "/_api/list?path=&offset=0&limit=2", nil, noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp1 listResponse
+	json.Unmarshal(w.Body.Bytes(), &resp1)
+	if resp1.Total != 5 {
+		t.Fatalf("expected total 5, got %d", resp1.Total)
+	}
+	if len(resp1.Entries) != 2 {
+		t.Fatalf("expected 2 entries on page 1, got %d", len(resp1.Entries))
+	}
+
+	// Second page.
+	w = serve(g, http.MethodGet, "/_api/list?path=&offset=2&limit=2", nil, noAuth())
+	var resp2 listResponse
+	json.Unmarshal(w.Body.Bytes(), &resp2)
+	if len(resp2.Entries) != 2 {
+		t.Fatalf("expected 2 entries on page 2, got %d", len(resp2.Entries))
+	}
+	if resp2.Entries[0].Name == resp1.Entries[0].Name {
+		t.Fatal("page 2 should have different entries than page 1")
+	}
+
+	// Last page (partial).
+	w = serve(g, http.MethodGet, "/_api/list?path=&offset=4&limit=2", nil, noAuth())
+	var resp3 listResponse
+	json.Unmarshal(w.Body.Bytes(), &resp3)
+	if len(resp3.Entries) != 1 {
+		t.Fatalf("expected 1 entry on last page, got %d", len(resp3.Entries))
+	}
+
+	// Beyond end.
+	w = serve(g, http.MethodGet, "/_api/list?path=&offset=10&limit=2", nil, noAuth())
+	var resp4 listResponse
+	json.Unmarshal(w.Body.Bytes(), &resp4)
+	if len(resp4.Entries) != 0 {
+		t.Fatalf("expected 0 entries beyond end, got %d", len(resp4.Entries))
+	}
+	if resp4.Total != 5 {
+		t.Fatalf("total should still be 5, got %d", resp4.Total)
+	}
+}
+
+func TestListDirsThenFiles(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	os.WriteFile(filepath.Join(dir, "aaa.txt"), []byte("x"), 0o644)
+	os.Mkdir(filepath.Join(dir, "zzz-dir"), 0o755)
+
+	w := serve(g, http.MethodGet, "/_api/list?path=", nil, noAuth())
+	var resp listResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(resp.Entries))
+	}
+	// Directory should come first despite alphabetically later name.
+	if !resp.Entries[0].IsDir || resp.Entries[0].Name != "zzz-dir" {
+		t.Fatalf("expected directory first, got %+v", resp.Entries[0])
+	}
+	if resp.Entries[1].IsDir || resp.Entries[1].Name != "aaa.txt" {
+		t.Fatalf("expected file second, got %+v", resp.Entries[1])
 	}
 }
 
