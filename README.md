@@ -4,7 +4,7 @@ Birak is a distributed file server with built-in replication. Each node stores a
 
 ## Key Features
 
-- **Multi-protocol access** — S3 API, WebDAV, HTTP file browser, or direct filesystem.
+- **Multi-protocol access** — S3 API, WebDAV, SFTP, HTTP file browser, or direct filesystem.
 - **Automatic replication** — nodes discover changes in real time and replicate them to all peers.
 - **Conflict resolution** — newest version wins, verified by SHA256 hash.
 - **No single point of failure** — every node is equal; any node can accept reads and writes.
@@ -14,12 +14,12 @@ Birak is a distributed file server with built-in replication. Each node stores a
 
 A Birak cluster consists of one or more **nodes**. Each node has two directories:
 
-- **sync_dir** — the directory where your files live. Any file you put here (or upload via S3/WebDAV/browser) gets replicated to all other nodes.
+- **sync_dir** — the directory where your files live. Any file you put here (or upload via S3/WebDAV/SFTP/browser) gets replicated to all other nodes.
 - **meta_dir** — internal directory for the SQLite database that tracks file versions and sync state. You don't need to touch this.
 
 Nodes know about each other through a **peers** list in the config. Each node polls its peers for changes and downloads new or updated files automatically. There is no central server — every node is a full replica.
 
-It doesn't matter how files get into `sync_dir` — you can copy them with `cp`, sync with `rsync`, save from any application, or upload via S3/WebDAV/browser. Birak watches the directory for changes and replicates everything to other nodes. Once synced, files are accessible through any of the supported protocols.
+It doesn't matter how files get into `sync_dir` — you can copy them with `cp`, sync with `rsync`, save from any application, or upload via S3/WebDAV/SFTP/browser. Birak watches the directory for changes and replicates everything to other nodes. Once synced, files are accessible through any of the supported protocols.
 
 ## Quick Start
 
@@ -149,6 +149,11 @@ gateways:
     listen_addr: ":9400"
     username: "user"
     password: "secret123"
+  sftp:
+    enabled: true
+    listen_addr: ":9500"
+    username: "user"
+    password: "secret123"
 ```
 
 The `ignore` and `sync` sections are optional — defaults will be used if omitted. Internal temp files (`.birak-tmp-*`) are always ignored regardless of configuration.
@@ -192,6 +197,11 @@ export BIRAK_HTTP_ENABLED=true
 | `gateways.http.listen_addr` | `BIRAK_HTTP_LISTEN_ADDR` | `:9400` | HTTP file browser address |
 | `gateways.http.username` | `BIRAK_HTTP_USERNAME` | _(empty)_ | HTTP username |
 | `gateways.http.password` | `BIRAK_HTTP_PASSWORD` | _(empty)_ | HTTP password |
+| `gateways.sftp.enabled` | `BIRAK_SFTP_ENABLED` | `false` | Enable SFTP Gateway |
+| `gateways.sftp.listen_addr` | `BIRAK_SFTP_LISTEN_ADDR` | `:9500` | SFTP Gateway address |
+| `gateways.sftp.username` | `BIRAK_SFTP_USERNAME` | _(empty)_ | SFTP username |
+| `gateways.sftp.password` | `BIRAK_SFTP_PASSWORD` | _(empty)_ | SFTP password |
+| `gateways.sftp.host_key_path` | `BIRAK_SFTP_HOST_KEY_PATH` | _(auto)_ | Path to SSH host key (auto-generated if empty) |
 
 ## Access Protocols
 
@@ -262,6 +272,26 @@ Standard WebDAV protocol. Compatible with macOS Finder, Windows Explorer, Linux 
 - **macOS Finder:** Go → Connect to Server (Cmd+K) → `http://localhost:9300`
 - **Linux:** `sudo mount -t davfs http://localhost:9300 /mnt/birak`
 - **rclone:** `rclone config` (type: webdav, url: `http://localhost:9300`)
+
+### SFTP Gateway
+
+Standard SFTP protocol over SSH. Compatible with OpenSSH `sftp`, FileZilla, WinSCP, Cyberduck, and other SFTP clients.
+
+- Browse, upload, download, rename, delete files and directories
+- Password authentication (or open access if credentials are omitted)
+- SSH host key is auto-generated on first run and persisted in `meta_dir`
+- Supports `posix-rename@openssh.com` extension
+
+**Usage:**
+
+```bash
+sftp -P 9500 user@localhost
+sftp> ls
+sftp> put report.pdf
+sftp> get photo.jpg
+sftp> mkdir backups
+sftp> rm old-file.txt
+```
 
 ## How Sync Works
 
@@ -351,6 +381,7 @@ birak/
     gateway/s3/                   — S3 Gateway
     gateway/webdav/               — WebDAV Gateway
     gateway/httpui/               — HTTP file browser (embedded SPA)
+    gateway/sftp/                 — SFTP Gateway
   integration_test.go             — multi-node integration tests
 ```
 
@@ -365,6 +396,7 @@ go test -v ./internal/store/
 go test -v ./internal/gateway/s3/
 go test -v ./internal/gateway/webdav/
 go test -v ./internal/gateway/httpui/
+go test -v ./internal/gateway/sftp/
 
 # Integration tests only (spins up real nodes)
 go test -v -timeout 120s -run TestIntegration

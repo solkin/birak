@@ -16,6 +16,7 @@ import (
 	"github.com/birak/birak/internal/config"
 	httpuigw "github.com/birak/birak/internal/gateway/httpui"
 	s3gw "github.com/birak/birak/internal/gateway/s3"
+	sftpgw "github.com/birak/birak/internal/gateway/sftp"
 	webdavgw "github.com/birak/birak/internal/gateway/webdav"
 	"github.com/birak/birak/internal/server"
 	"github.com/birak/birak/internal/store"
@@ -240,6 +241,34 @@ func run(configPath string) error {
 		}()
 	}
 
+	// SFTP Gateway (if enabled).
+	var sftpGateway *sftpgw.Gateway
+	if cfg.Gateways.SFTP.Enabled {
+		sftpGateway, err = sftpgw.New(
+			cfg.SyncDir,
+			cfg.Ignore,
+			cfg.MetaDir,
+			sftpgw.Config{
+				ListenAddr:  cfg.Gateways.SFTP.ListenAddr,
+				Username:    cfg.Gateways.SFTP.Username,
+				Password:    cfg.Gateways.SFTP.Password,
+				HostKeyPath: cfg.Gateways.SFTP.HostKeyPath,
+			},
+			logger,
+		)
+		if err != nil {
+			return fmt.Errorf("sftp gateway init: %w", err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := sftpGateway.Start(ctx); err != nil {
+				logger.Error("SFTP gateway error", "error", err)
+				cancel()
+			}
+		}()
+	}
+
 	// Wait for shutdown signal.
 	select {
 	case sig := <-sigCh:
@@ -274,6 +303,13 @@ func run(configPath string) error {
 	if httpGateway != nil {
 		if err := httpGateway.Stop(shutdownCtx); err != nil {
 			logger.Error("HTTP file server shutdown error", "error", err)
+		}
+	}
+
+	// Graceful SFTP gateway shutdown.
+	if sftpGateway != nil {
+		if err := sftpGateway.Stop(shutdownCtx); err != nil {
+			logger.Error("SFTP gateway shutdown error", "error", err)
 		}
 	}
 

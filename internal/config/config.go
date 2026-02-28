@@ -28,6 +28,16 @@ type GatewaysConfig struct {
 	S3     S3GatewayConfig     `yaml:"s3"`
 	WebDAV WebDAVGatewayConfig `yaml:"webdav"`
 	HTTP   HTTPGatewayConfig   `yaml:"http"`
+	SFTP   SFTPGatewayConfig   `yaml:"sftp"`
+}
+
+// SFTPGatewayConfig holds configuration for the SFTP gateway.
+type SFTPGatewayConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	ListenAddr string `yaml:"listen_addr"`
+	Username   string `yaml:"username"`
+	Password   string `yaml:"password"`
+	HostKeyPath string `yaml:"host_key_path"`
 }
 
 // HTTPGatewayConfig holds configuration for the HTTP file server gateway.
@@ -84,6 +94,10 @@ func DefaultConfig() Config {
 			HTTP: HTTPGatewayConfig{
 				Enabled:    false,
 				ListenAddr: ":9400",
+			},
+			SFTP: SFTPGatewayConfig{
+				Enabled:    false,
+				ListenAddr: ":9500",
 			},
 		},
 		Sync: SyncConfig{
@@ -221,6 +235,23 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("BIRAK_HTTP_PASSWORD"); v != "" {
 		c.Gateways.HTTP.Password = v
 	}
+
+	// SFTP gateway.
+	if v := os.Getenv("BIRAK_SFTP_ENABLED"); v != "" {
+		c.Gateways.SFTP.Enabled = parseBool(v)
+	}
+	if v := os.Getenv("BIRAK_SFTP_LISTEN_ADDR"); v != "" {
+		c.Gateways.SFTP.ListenAddr = v
+	}
+	if v := os.Getenv("BIRAK_SFTP_USERNAME"); v != "" {
+		c.Gateways.SFTP.Username = v
+	}
+	if v := os.Getenv("BIRAK_SFTP_PASSWORD"); v != "" {
+		c.Gateways.SFTP.Password = v
+	}
+	if v := os.Getenv("BIRAK_SFTP_HOST_KEY_PATH"); v != "" {
+		c.Gateways.SFTP.HostKeyPath = v
+	}
 }
 
 func parseBool(s string) bool {
@@ -263,6 +294,9 @@ func (c *Config) validate() error {
 	}
 	if c.Gateways.HTTP.Enabled && c.Gateways.HTTP.ListenAddr == "" {
 		return fmt.Errorf("gateways.http.listen_addr is required when HTTP gateway is enabled")
+	}
+	if c.Gateways.SFTP.Enabled && c.Gateways.SFTP.ListenAddr == "" {
+		return fmt.Errorf("gateways.sftp.listen_addr is required when SFTP gateway is enabled")
 	}
 	return nil
 }
