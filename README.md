@@ -2,6 +2,10 @@
 
 Birak is a distributed file server with built-in replication. Each node stores a full copy of the data and automatically keeps it in sync with other nodes over the network. Files are accessible via S3 API, WebDAV, SFTP, HTTP file browser, or the local filesystem — use whichever protocol fits your workflow.
 
+<p align="center">
+  <img src="docs/screenshot-http-browser.png" alt="Birak HTTP File Browser" width="800">
+</p>
+
 ## Key Features
 
 - **Multi-protocol access** — S3 API, WebDAV, SFTP, HTTP file browser, or direct filesystem.
