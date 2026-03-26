@@ -62,6 +62,7 @@ type S3GatewayConfig struct {
 	ListenAddr string `yaml:"listen_addr"`
 	AccessKey  string `yaml:"access_key"`
 	SecretKey  string `yaml:"secret_key"`
+	Domain     string `yaml:"domain"`
 }
 
 // SyncConfig holds sync-specific tuning parameters.
@@ -206,6 +207,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("BIRAK_S3_SECRET_KEY"); v != "" {
 		c.Gateways.S3.SecretKey = v
+	}
+	if v := os.Getenv("BIRAK_S3_DOMAIN"); v != "" {
+		c.Gateways.S3.Domain = v
 	}
 
 	// WebDAV gateway.

@@ -182,6 +182,7 @@ func run(configPath string) error {
 				ListenAddr: cfg.Gateways.S3.ListenAddr,
 				AccessKey:  cfg.Gateways.S3.AccessKey,
 				SecretKey:  cfg.Gateways.S3.SecretKey,
+				Domain:     cfg.Gateways.S3.Domain,
 			},
 			logger,
 		)

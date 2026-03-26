@@ -970,7 +970,7 @@ func vhostHeaders(bucket, baseHost string) map[string]string {
 }
 
 func TestVirtualHosted_ListObjects(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
+	g, syncDir := testGateway(t, Config{Domain: "localhost"})
 	bp := filepath.Join(syncDir, "mybucket")
 	os.Mkdir(bp, 0o755)
 	os.WriteFile(filepath.Join(bp, "a.txt"), []byte("aaa"), 0o644)
@@ -995,7 +995,7 @@ func TestVirtualHosted_ListObjects(t *testing.T) {
 }
 
 func TestVirtualHosted_ListObjectsWithDelimiter(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
+	g, syncDir := testGateway(t, Config{Domain: "localhost"})
 	bp := filepath.Join(syncDir, "mybucket")
 	os.MkdirAll(filepath.Join(bp, "photos"), 0o755)
 	os.WriteFile(filepath.Join(bp, "root.txt"), []byte("root"), 0o644)
@@ -1024,7 +1024,7 @@ func TestVirtualHosted_ListObjectsWithDelimiter(t *testing.T) {
 }
 
 func TestVirtualHosted_GetBucketVersioning(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
+	g, syncDir := testGateway(t, Config{Domain: "localhost"})
 	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
 
 	w := serveRequest(g, http.MethodGet, "/?versioning", nil, vhostHeaders("mybucket", "localhost:9200"))
@@ -1039,7 +1039,7 @@ func TestVirtualHosted_GetBucketVersioning(t *testing.T) {
 }
 
 func TestVirtualHosted_GetBucketLocation(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
+	g, syncDir := testGateway(t, Config{Domain: "localhost"})
 	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
 
 	w := serveRequest(g, http.MethodGet, "/?location=", nil, vhostHeaders("mybucket", "localhost"))
@@ -1054,7 +1054,7 @@ func TestVirtualHosted_GetBucketLocation(t *testing.T) {
 }
 
 func TestVirtualHosted_HeadBucket(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
+	g, syncDir := testGateway(t, Config{Domain: "localhost"})
 	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
 
 	w := serveRequest(g, http.MethodHead, "/", nil, vhostHeaders("mybucket", "localhost:9200"))
@@ -1064,7 +1064,7 @@ func TestVirtualHosted_HeadBucket(t *testing.T) {
 }
 
 func TestVirtualHosted_PutAndGetObject(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
+	g, syncDir := testGateway(t, Config{Domain: "localhost"})
 	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
 
 	// PUT via virtual-hosted-style.
@@ -1087,7 +1087,7 @@ func TestVirtualHosted_PutAndGetObject(t *testing.T) {
 }
 
 func TestVirtualHosted_DeleteObject(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
+	g, syncDir := testGateway(t, Config{Domain: "localhost"})
 	bp := filepath.Join(syncDir, "mybucket")
 	os.Mkdir(bp, 0o755)
 	os.WriteFile(filepath.Join(bp, "del.txt"), []byte("bye"), 0o644)
@@ -1104,7 +1104,7 @@ func TestVirtualHosted_DeleteObject(t *testing.T) {
 }
 
 func TestVirtualHosted_HeadObject(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
+	g, syncDir := testGateway(t, Config{Domain: "localhost"})
 	bp := filepath.Join(syncDir, "mybucket")
 	os.Mkdir(bp, 0o755)
 	os.WriteFile(filepath.Join(bp, "test.txt"), []byte("data"), 0o644)
@@ -1120,18 +1120,17 @@ func TestVirtualHosted_HeadObject(t *testing.T) {
 }
 
 func TestVirtualHosted_NonExistentBucket(t *testing.T) {
-	g, _ := testGateway(t, Config{})
+	g, _ := testGateway(t, Config{Domain: "localhost"})
 
-	// Bucket doesn't exist — extractBucketFromHost returns "" → falls through to path-style.
-	// Path "/" → ListBuckets (no error).
+	// Bucket name is recognized from Host but directory doesn't exist.
 	w := serveRequest(g, http.MethodGet, "/", nil, vhostHeaders("nonexistent", "localhost:9200"))
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 (list buckets fallback), got %d", w.Code)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 (NoSuchBucket), got %d", w.Code)
 	}
 }
 
 func TestVirtualHosted_GetBucketACL(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
+	g, syncDir := testGateway(t, Config{Domain: "localhost"})
 	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
 
 	w := serveRequest(g, http.MethodGet, "/?acl", nil, vhostHeaders("mybucket", "localhost:9200"))
@@ -1144,7 +1143,7 @@ func TestVirtualHosted_GetBucketACL(t *testing.T) {
 }
 
 func TestVirtualHosted_ListObjectsV2(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
+	g, syncDir := testGateway(t, Config{Domain: "localhost"})
 	bp := filepath.Join(syncDir, "mybucket")
 	os.Mkdir(bp, 0o755)
 	os.WriteFile(filepath.Join(bp, "a.txt"), []byte("a"), 0o644)
@@ -1285,7 +1284,7 @@ func TestListObjects_UnicodeKeys(t *testing.T) {
 // --- Edge Case: Presigned URL + Virtual-Hosted-Style ---
 
 func TestVirtualHosted_PresignedURL(t *testing.T) {
-	g, syncDir := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
+	g, syncDir := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret", Domain: "localhost"})
 	bp := filepath.Join(syncDir, "mybucket")
 	os.Mkdir(bp, 0o755)
 

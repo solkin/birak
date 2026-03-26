@@ -11,8 +11,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/birak/birak/internal/watcher"
@@ -23,6 +21,7 @@ type Config struct {
 	ListenAddr string `yaml:"listen_addr"`
 	AccessKey  string `yaml:"access_key"`
 	SecretKey  string `yaml:"secret_key"`
+	Domain     string `yaml:"domain"`
 }
 
 // Gateway implements the S3-compatible API.
@@ -116,34 +115,32 @@ func (g *Gateway) logMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// extractBucketFromHost detects virtual-hosted-style requests by checking
-// if the Host header contains a subdomain that corresponds to an existing
-// bucket (first-level subdirectory) in syncDir.
-// Example: Host "mybucket.localhost:9200" → returns "mybucket".
-// Returns "" if not virtual-hosted-style.
+// extractBucketFromHost detects virtual-hosted-style requests when a domain
+// is configured. It strips the port, then checks if the hostname ends with
+// ".{domain}" and extracts the prefix as the bucket name.
+// Example: domain="localhost", Host="mybucket.localhost:9200" → "mybucket".
+// Returns "" if domain is not configured or the host doesn't match.
 func (g *Gateway) extractBucketFromHost(host string) string {
-	// Strip port.
+	if g.config.Domain == "" {
+		return ""
+	}
+
 	h := host
 	if idx := strings.LastIndex(h, ":"); idx != -1 {
 		h = h[:idx]
 	}
 
-	// Look for a dot — indicates a potential subdomain.
-	dot := strings.Index(h, ".")
-	if dot <= 0 {
+	suffix := "." + g.config.Domain
+	if !strings.HasSuffix(h, suffix) {
 		return ""
 	}
 
-	candidate := h[:dot]
-
-	// Verify the candidate is an existing bucket directory.
-	bp := filepath.Join(g.syncDir, candidate)
-	fi, err := os.Stat(bp)
-	if err != nil || !fi.IsDir() {
+	bucket := strings.TrimSuffix(h, suffix)
+	if bucket == "" {
 		return ""
 	}
 
-	return candidate
+	return bucket
 }
 
 // route dispatches S3 requests based on the URL path structure.
