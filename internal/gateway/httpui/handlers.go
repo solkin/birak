@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/watcher"
 )
 
@@ -33,31 +34,9 @@ type listResponse struct {
 }
 
 // resolvePath validates a relative path and returns the full filesystem path.
-// Returns an error for paths that escape syncDir or match ignore patterns.
 func (g *Gateway) resolvePath(relPath string) (string, error) {
-	cleaned := filepath.ToSlash(filepath.Clean(relPath))
-	cleaned = strings.TrimPrefix(cleaned, "/")
-	if cleaned == "." {
-		cleaned = ""
-	}
-
-	if strings.HasPrefix(cleaned, "../") || cleaned == ".." {
-		return "", fmt.Errorf("path traversal")
-	}
-
-	if cleaned != "" && watcher.ShouldIgnore(cleaned, g.ignorePatterns) {
-		return "", fmt.Errorf("ignored path")
-	}
-
-	full := filepath.Join(g.syncDir, filepath.FromSlash(cleaned))
-
-	absSync, _ := filepath.Abs(g.syncDir)
-	absFull, _ := filepath.Abs(full)
-	if cleaned != "" && !strings.HasPrefix(absFull, absSync+string(filepath.Separator)) {
-		return "", fmt.Errorf("path traversal")
-	}
-
-	return full, nil
+	_, fullPath, err := gateway.SafePath(g.syncDir, relPath, g.ignorePatterns)
+	return fullPath, err
 }
 
 // handleList returns a paginated JSON listing of a directory.

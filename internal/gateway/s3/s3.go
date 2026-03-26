@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/watcher"
 )
 
@@ -46,7 +47,7 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 	mux.HandleFunc("/", g.route)
 
 	g.server = &http.Server{
-		Handler: g.logMiddleware(mux),
+		Handler: gateway.LogMiddleware(g.logger, mux),
 	}
 
 	return g
@@ -79,40 +80,6 @@ func (g *Gateway) Start(ctx context.Context) error {
 // Stop gracefully shuts down the gateway.
 func (g *Gateway) Stop(ctx context.Context) error {
 	return g.server.Shutdown(ctx)
-}
-
-// responseLogger wraps http.ResponseWriter to capture the status code and body size.
-type responseLogger struct {
-	http.ResponseWriter
-	status int
-	size   int
-}
-
-func (r *responseLogger) WriteHeader(status int) {
-	r.status = status
-	r.ResponseWriter.WriteHeader(status)
-}
-
-func (r *responseLogger) Write(b []byte) (int, error) {
-	n, err := r.ResponseWriter.Write(b)
-	r.size += n
-	return n, err
-}
-
-// logMiddleware logs every incoming request with method, URL, host, and response status.
-func (g *Gateway) logMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rl := &responseLogger{ResponseWriter: w, status: 200}
-		next.ServeHTTP(rl, r)
-		g.logger.Info("request",
-			"method", r.Method,
-			"url", r.URL.String(),
-			"host", r.Host,
-			"status", rl.status,
-			"size", rl.size,
-			"user_agent", r.UserAgent(),
-		)
-	})
 }
 
 // extractBucketFromHost detects virtual-hosted-style requests when a domain

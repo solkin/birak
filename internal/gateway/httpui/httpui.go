@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/birak/birak/internal/gateway"
 )
 
 //go:embed index.html
@@ -45,7 +47,7 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 	mux.HandleFunc("/", g.route)
 
 	g.server = &http.Server{
-		Handler: g.logMiddleware(mux),
+		Handler: gateway.LogMiddleware(g.logger, mux),
 	}
 
 	return g
@@ -78,41 +80,9 @@ func (g *Gateway) Stop(ctx context.Context) error {
 	return g.server.Shutdown(ctx)
 }
 
-// responseLogger wraps http.ResponseWriter to capture status code and body size.
-type responseLogger struct {
-	http.ResponseWriter
-	status int
-	size   int
-}
-
-func (r *responseLogger) WriteHeader(status int) {
-	r.status = status
-	r.ResponseWriter.WriteHeader(status)
-}
-
-func (r *responseLogger) Write(b []byte) (int, error) {
-	n, err := r.ResponseWriter.Write(b)
-	r.size += n
-	return n, err
-}
-
-// logMiddleware logs every incoming request.
-func (g *Gateway) logMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rl := &responseLogger{ResponseWriter: w, status: 200}
-		next.ServeHTTP(rl, r)
-		g.logger.Info("request",
-			"method", r.Method,
-			"url", r.URL.String(),
-			"status", rl.status,
-			"size", rl.size,
-		)
-	})
-}
-
 // route dispatches requests between the SPA page and API endpoints.
 func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
-	if !g.authenticate(r) {
+	if !gateway.CheckBasicAuth(r, g.config.Username, g.config.Password) {
 		w.Header().Set("WWW-Authenticate", `Basic realm="birak"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
@@ -159,15 +129,3 @@ func (g *Gateway) routeAPI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// authenticate checks HTTP Basic Auth credentials.
-// If no username/password configured, all requests are allowed.
-func (g *Gateway) authenticate(r *http.Request) bool {
-	if g.config.Username == "" && g.config.Password == "" {
-		return true
-	}
-	user, pass, ok := r.BasicAuth()
-	if !ok {
-		return false
-	}
-	return user == g.config.Username && pass == g.config.Password
-}

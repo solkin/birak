@@ -13,14 +13,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"crypto/x509"
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/birak/birak/internal/watcher"
+	"github.com/birak/birak/internal/gateway"
 )
 
 // Config holds SFTP gateway configuration.
@@ -185,29 +184,8 @@ func (g *Gateway) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 
 // resolvePath validates a relative path and returns the full filesystem path.
 func (g *Gateway) resolvePath(reqPath string) (string, error) {
-	cleaned := filepath.ToSlash(filepath.Clean(reqPath))
-	if cleaned == "." || cleaned == "/" {
-		cleaned = ""
-	}
-	cleaned = strings.TrimPrefix(cleaned, "/")
-
-	if strings.HasPrefix(cleaned, "../") || cleaned == ".." {
-		return "", fmt.Errorf("path traversal")
-	}
-
-	if cleaned != "" && watcher.ShouldIgnore(cleaned, g.ignorePatterns) {
-		return "", fmt.Errorf("ignored path")
-	}
-
-	full := filepath.Join(g.syncDir, filepath.FromSlash(cleaned))
-
-	absSync, _ := filepath.Abs(g.syncDir)
-	absFull, _ := filepath.Abs(full)
-	if cleaned != "" && !strings.HasPrefix(absFull, absSync+string(filepath.Separator)) {
-		return "", fmt.Errorf("path traversal")
-	}
-
-	return full, nil
+	_, fullPath, err := gateway.SafePath(g.syncDir, reqPath, g.ignorePatterns)
+	return fullPath, err
 }
 
 func loadOrGenerateHostKey(path string) (ssh.Signer, error) {
