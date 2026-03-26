@@ -15,9 +15,10 @@ import (
 )
 
 type handleEntry struct {
-	path  string
-	file  *os.File
-	isDir bool
+	path    string
+	file    *os.File
+	isDir   bool
+	dirRead bool
 }
 
 type session struct {
@@ -248,11 +249,18 @@ func (s *session) handleReaddir(payload []byte) {
 		return
 	}
 
+	if entry.dirRead {
+		s.sendStatus(id, sshFxEOF, "")
+		return
+	}
+
 	entries, err := os.ReadDir(entry.path)
 	if err != nil {
 		s.sendStatus(id, sshFxFailure, "read failed")
 		return
 	}
+
+	entry.dirRead = true
 
 	// Filter ignored files.
 	var filtered []os.DirEntry
@@ -264,10 +272,6 @@ func (s *session) handleReaddir(payload []byte) {
 
 	if len(filtered) == 0 {
 		s.sendStatus(id, sshFxEOF, "")
-		// Remove handle so next READDIR also returns EOF.
-		s.mu.Lock()
-		delete(s.handles, handle)
-		s.mu.Unlock()
 		return
 	}
 
@@ -282,11 +286,6 @@ func (s *session) handleReaddir(payload []byte) {
 		resp = marshalFileInfo(resp, e.Name(), fi)
 	}
 	writePacket(s.ch, sshFxpName, resp)
-
-	// Remove handle so next READDIR returns EOF.
-	s.mu.Lock()
-	delete(s.handles, handle)
-	s.mu.Unlock()
 }
 
 func (s *session) handleOpen(payload []byte) {
