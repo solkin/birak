@@ -526,13 +526,61 @@ func TestLock(t *testing.T) {
 func TestUnlock(t *testing.T) {
 	_, ts := newTestGateway(t, nil, "", "")
 
+	// Acquire a real lock, then release it with the issued token.
+	lockResp := doReq(t, "LOCK", ts.URL+"/file.txt", "", nil)
+	lockResp.Body.Close()
+	token := lockResp.Header.Get("Lock-Token")
+	if token == "" {
+		t.Fatal("expected Lock-Token header from LOCK")
+	}
+
 	resp := doReq(t, "UNLOCK", ts.URL+"/file.txt", "", map[string]string{
-		"Lock-Token": "<opaquelocktoken:test>",
+		"Lock-Token": token,
 	})
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+}
+
+func TestUnlock_UnknownToken(t *testing.T) {
+	_, ts := newTestGateway(t, nil, "", "")
+
+	resp := doReq(t, "UNLOCK", ts.URL+"/file.txt", "", map[string]string{
+		"Lock-Token": "<opaquelocktoken:never-issued>",
+	})
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 for unknown lock token, got %d", resp.StatusCode)
+	}
+}
+
+func TestLockEnforcement(t *testing.T) {
+	_, ts := newTestGateway(t, nil, "", "")
+
+	lockResp := doReq(t, "LOCK", ts.URL+"/file.txt", "", nil)
+	lockResp.Body.Close()
+	token := lockResp.Header.Get("Lock-Token") // "<opaquelocktoken:...>"
+	if token == "" {
+		t.Fatal("expected Lock-Token header")
+	}
+
+	// A write to the locked path without the token is refused.
+	resp := doReq(t, http.MethodPut, ts.URL+"/file.txt", "data", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusLocked {
+		t.Fatalf("expected 423 for write to locked path, got %d", resp.StatusCode)
+	}
+
+	// A write carrying the lock token in the If header succeeds.
+	resp = doReq(t, http.MethodPut, ts.URL+"/file.txt", "data", map[string]string{
+		"If": "(" + token + ")",
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 201/204 for tokened write, got %d", resp.StatusCode)
 	}
 }
 
@@ -700,5 +748,196 @@ func TestHrefEncoding(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("hrefFromPath(%q, %v) = %q, want %q", tt.name, tt.isDir, got, tt.want)
 		}
+	}
+}
+
+func TestMove_InvalidOverwrite(t *testing.T) {
+	g, ts := newTestGateway(t, nil, "", "")
+	os.WriteFile(filepath.Join(g.syncDir, "src.txt"), []byte("data"), 0o644)
+
+	resp := doReq(t, "MOVE", ts.URL+"/src.txt", "", map[string]string{
+		"Destination": ts.URL + "/dst.txt",
+		"Overwrite":   "yes", // not T/F
+	})
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed Overwrite, got %d", resp.StatusCode)
+	}
+}
+
+func TestCopy_MissingDestination(t *testing.T) {
+	g, ts := newTestGateway(t, nil, "", "")
+	os.WriteFile(filepath.Join(g.syncDir, "src.txt"), []byte("data"), 0o644)
+
+	resp := doReq(t, "COPY", ts.URL+"/src.txt", "", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing Destination, got %d", resp.StatusCode)
+	}
+}
+
+func TestCopy_DirectoryIntoOwnSubtree(t *testing.T) {
+	g, ts := newTestGateway(t, nil, "", "")
+	os.MkdirAll(filepath.Join(g.syncDir, "dir"), 0o755)
+	os.WriteFile(filepath.Join(g.syncDir, "dir", "file.txt"), []byte("data"), 0o644)
+
+	// Copying a collection into its own subtree must be rejected, not recurse forever.
+	resp := doReq(t, "COPY", ts.URL+"/dir", "", map[string]string{
+		"Destination": ts.URL + "/dir/sub",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for copy into own subtree, got %d", resp.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(g.syncDir, "dir", "sub")); !os.IsNotExist(err) {
+		t.Fatal("destination must not be created when copy is rejected")
+	}
+}
+
+func TestMove_DirectoryIntoOwnSubtree(t *testing.T) {
+	g, ts := newTestGateway(t, nil, "", "")
+	os.MkdirAll(filepath.Join(g.syncDir, "dir"), 0o755)
+	os.WriteFile(filepath.Join(g.syncDir, "dir", "file.txt"), []byte("data"), 0o644)
+
+	resp := doReq(t, "MOVE", ts.URL+"/dir", "", map[string]string{
+		"Destination": ts.URL + "/dir/sub",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for move into own subtree, got %d", resp.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(g.syncDir, "dir", "file.txt")); err != nil {
+		t.Fatal("source must remain intact when move is rejected")
+	}
+}
+
+func TestMkcol_WithBody(t *testing.T) {
+	_, ts := newTestGateway(t, nil, "", "")
+
+	req, _ := http.NewRequest("MKCOL", ts.URL+"/newdir", strings.NewReader("some body"))
+	req.Header.Set("Content-Length", "9")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415 for MKCOL with body, got %d", resp.StatusCode)
+	}
+}
+
+func TestPut_MaxUploadBytesPreservesExisting(t *testing.T) {
+	syncDir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := New(syncDir, nil, Config{ListenAddr: ":0", MaxUploadBytes: 4}, logger)
+	ts := httptest.NewServer(g.server.Handler)
+	t.Cleanup(ts.Close)
+
+	path := filepath.Join(g.syncDir, "f.txt")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doReq(t, http.MethodPut, ts.URL+"/f.txt", "too large", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for over-limit PUT, got %d", resp.StatusCode)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("existing file should be preserved, got %q", data)
+	}
+	entries, err := os.ReadDir(g.syncDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".birak-tmp-") {
+			t.Fatalf("temporary file was not cleaned up: %s", entry.Name())
+		}
+	}
+}
+
+func TestCopy_MaxUploadBytesTree(t *testing.T) {
+	syncDir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := New(syncDir, nil, Config{ListenAddr: ":0", MaxUploadBytes: 4}, logger)
+	ts := httptest.NewServer(g.server.Handler)
+	t.Cleanup(ts.Close)
+
+	src := filepath.Join(g.syncDir, "srcdir")
+	os.MkdirAll(src, 0o755)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("aaa"), 0o644)
+	os.WriteFile(filepath.Join(src, "b.txt"), []byte("bbb"), 0o644)
+
+	// Cumulative size (6 bytes) exceeds the 4-byte budget, so the copy is refused.
+	resp := doReq(t, "COPY", ts.URL+"/srcdir", "", map[string]string{
+		"Destination": ts.URL + "/dstdir",
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for over-budget COPY, got %d", resp.StatusCode)
+	}
+}
+
+func TestStageReplace_RestoresOriginalOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "target.txt")
+	if err := os.WriteFile(dst, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := stageReplace(dst, func() error {
+		if err := os.WriteFile(dst, []byte("partial"), 0o644); err != nil {
+			return err
+		}
+		return fmt.Errorf("boom")
+	})
+	if err == nil {
+		t.Fatal("expected stageReplace to return the operation error")
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("expected original content restored, got %q", data)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "target.txt" {
+		t.Fatalf("expected only restored target, got %v", entries)
+	}
+}
+
+func TestCopy_OverwritePreservesOnConflict(t *testing.T) {
+	// Non-destructive overwrite: copying a directory over an existing file
+	// succeeds and replaces it (exercises stageReplace's happy path).
+	g, ts := newTestGateway(t, nil, "", "")
+	src := filepath.Join(g.syncDir, "srcdir")
+	os.MkdirAll(src, 0o755)
+	os.WriteFile(filepath.Join(src, "inner.txt"), []byte("deep"), 0o644)
+	os.WriteFile(filepath.Join(g.syncDir, "dst"), []byte("existing"), 0o644)
+
+	resp := doReq(t, "COPY", ts.URL+"/srcdir", "", map[string]string{
+		"Destination": ts.URL + "/dst",
+		"Overwrite":   "T",
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 for overwrite copy, got %d", resp.StatusCode)
+	}
+	data, err := os.ReadFile(filepath.Join(g.syncDir, "dst", "inner.txt"))
+	if err != nil {
+		t.Fatalf("read copied file: %v", err)
+	}
+	if string(data) != "deep" {
+		t.Fatalf("expected 'deep', got %q", data)
 	}
 }

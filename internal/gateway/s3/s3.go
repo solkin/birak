@@ -4,14 +4,12 @@ package s3
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/watcher"
@@ -19,10 +17,11 @@ import (
 
 // Config holds S3 gateway configuration.
 type Config struct {
-	ListenAddr string `yaml:"listen_addr"`
-	AccessKey  string `yaml:"access_key"`
-	SecretKey  string `yaml:"secret_key"`
-	Domain     string `yaml:"domain"`
+	ListenAddr     string `yaml:"listen_addr"`
+	AccessKey      string `yaml:"access_key"`
+	SecretKey      string `yaml:"secret_key"`
+	Domain         string `yaml:"domain"`
+	MaxUploadBytes int64  // max object size for PutObject; 0 = unlimited
 }
 
 // Gateway implements the S3-compatible API.
@@ -48,6 +47,11 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 
 	g.server = &http.Server{
 		Handler: gateway.LogMiddleware(g.logger, mux),
+		// Bound the time spent reading request headers and idle keep-alive
+		// connections to blunt Slowloris-style attacks. Read/Write timeouts are
+		// intentionally left unset so large object transfers are not cut off.
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	return g
@@ -228,86 +232,25 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 }
 
 // authenticate checks the request for valid credentials.
-// If no access_key/secret_key configured, all requests are allowed.
-// Supports: Authorization header (V2, V4) and presigned URL (query string auth).
+// If no access_key/secret_key are configured, all requests are allowed.
+// Otherwise the request must carry a valid AWS Signature V4 signature, either in
+// the Authorization header or as presigned query-string parameters. Legacy SigV2
+// ("AWS key:signature") is not supported and is rejected.
 func (g *Gateway) authenticate(r *http.Request) bool {
 	if g.config.AccessKey == "" && g.config.SecretKey == "" {
 		return true // no auth configured
 	}
 
-	authHeader := r.Header.Get("Authorization")
-
-	// Check Authorization header first.
-	if authHeader != "" {
-		// Support AWS Signature V4 format: extract the access key.
-		// Format: AWS4-HMAC-SHA256 Credential=ACCESS_KEY/date/region/s3/aws4_request, ...
-		if strings.HasPrefix(authHeader, "AWS4-HMAC-SHA256") {
-			return g.authenticateSigV4(r, authHeader)
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		if strings.HasPrefix(authHeader, sigV4Algorithm) {
+			return verifyHeaderV4(r, g.config.AccessKey, g.config.SecretKey)
 		}
-
-		// Support AWS Signature V2 format: AWS ACCESS_KEY:signature
-		if strings.HasPrefix(authHeader, "AWS ") {
-			parts := strings.SplitN(authHeader[4:], ":", 2)
-			if len(parts) == 2 && parts[0] == g.config.AccessKey {
-				return true // simplified V2 check — access key matches
-			}
-		}
-
 		return false
 	}
 
-	// Check presigned URL (query string authentication).
-	// Format: ?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ACCESS_KEY/date/region/s3/aws4_request&...
-	query := r.URL.Query()
-	if query.Get("X-Amz-Algorithm") != "" {
-		credential := query.Get("X-Amz-Credential")
-		if credential == "" {
-			return false
-		}
-		// Credential format: ACCESS_KEY/date/region/service/aws4_request
-		parts := strings.SplitN(credential, "/", 2)
-		if len(parts) >= 1 && parts[0] == g.config.AccessKey {
-			return true // simplified presigned URL check — access key matches
-		}
-		return false
+	if r.URL.Query().Get("X-Amz-Algorithm") == sigV4Algorithm {
+		return verifyPresignedV4(r, g.config.AccessKey, g.config.SecretKey)
 	}
 
 	return false
-}
-
-// authenticateSigV4 performs a simplified AWS Signature V4 check.
-// We verify the access key matches. Full signature verification is not implemented
-// as it requires complex canonicalization; this is sufficient for trusted environments.
-func (g *Gateway) authenticateSigV4(r *http.Request, authHeader string) bool {
-	// Extract Credential from the header.
-	credIdx := strings.Index(authHeader, "Credential=")
-	if credIdx == -1 {
-		return false
-	}
-	credStr := authHeader[credIdx+len("Credential="):]
-	credEnd := strings.Index(credStr, ",")
-	if credEnd != -1 {
-		credStr = credStr[:credEnd]
-	}
-
-	// Credential format: ACCESS_KEY/date/region/service/aws4_request
-	parts := strings.SplitN(credStr, "/", 2)
-	if len(parts) < 1 {
-		return false
-	}
-
-	return parts[0] == g.config.AccessKey
-}
-
-// computeETag returns the hex-encoded SHA256 of data, formatted as an S3 ETag.
-func computeETag(data []byte) string {
-	h := sha256.Sum256(data)
-	return fmt.Sprintf("\"%s\"", hex.EncodeToString(h[:]))
-}
-
-// hmacSHA256 computes HMAC-SHA256.
-func hmacSHA256(key, data []byte) []byte {
-	h := hmac.New(sha256.New, key)
-	h.Write(data)
-	return h.Sum(nil)
 }

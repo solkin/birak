@@ -130,6 +130,7 @@ ignore:
   - ".DS_Store"
   - "Thumbs.db"
   - "*.swp"
+max_upload_bytes: 1073741824   # 1 GiB cap per upload; 0 = unlimited
 sync:
   poll_interval: 3s
   batch_limit: 1000
@@ -183,6 +184,7 @@ export BIRAK_HTTP_ENABLED=true
 | `listen_addr` | `BIRAK_LISTEN_ADDR` | `:9100` | Peer-to-peer HTTP server address |
 | `peers` | `BIRAK_PEERS` | `[]` | Peer URLs (comma-separated in env) |
 | `ignore` | `BIRAK_IGNORE` | `[]` | Ignore patterns (comma-separated in env) |
+| `max_upload_bytes` | `BIRAK_MAX_UPLOAD_BYTES` | `0` | Max single-upload size in bytes across all gateways (0 = unlimited) |
 | `sync.poll_interval` | `BIRAK_SYNC_POLL_INTERVAL` | `3s` | Peer polling interval |
 | `sync.batch_limit` | `BIRAK_SYNC_BATCH_LIMIT` | `1000` | Max entries per sync request |
 | `sync.max_concurrent_downloads` | `BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS` | `5` | Concurrent downloads per peer |

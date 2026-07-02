@@ -3,6 +3,8 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -43,18 +45,19 @@ func serveRequest(g *Gateway, method, path string, body io.Reader, headers map[s
 	return w
 }
 
-// authHeaders returns headers for authenticated requests (simplified V2 auth).
-func authHeaders(accessKey string) map[string]string {
-	return map[string]string{
-		"Authorization": fmt.Sprintf("AWS %s:signature", accessKey),
+// serveSignedHeaderRequest builds a request, signs it in place with a real SigV4
+// Authorization header (over its own Host), and serves it against the gateway.
+// signKey/signSecret are the credentials used to sign, allowing tests to sign
+// with a wrong key to exercise rejection.
+func serveSignedHeaderRequest(g *Gateway, method, path string, body io.Reader, host, signKey, signSecret string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, body)
+	if host != "" {
+		req.Host = host
 	}
-}
-
-// sigV4Headers returns headers for authenticated requests using V4 format.
-func sigV4Headers(accessKey string) map[string]string {
-	return map[string]string{
-		"Authorization": fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/20260206/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123", accessKey),
-	}
+	signV4Header(req, signKey, signSecret)
+	w := httptest.NewRecorder()
+	g.route(w, req)
+	return w
 }
 
 // noAuth returns nil headers for requests without auth.
@@ -76,28 +79,43 @@ func TestAuth_NoAuthConfigured(t *testing.T) {
 	}
 }
 
-func TestAuth_ValidV2(t *testing.T) {
+func TestAuth_ValidV4Header(t *testing.T) {
 	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
 
-	w := serveRequest(g, http.MethodGet, "/", nil, authHeaders("admin"))
+	// A request carrying a correctly computed SigV4 Authorization header succeeds.
+	w := serveSignedHeaderRequest(g, http.MethodGet, "/", nil, "example.com", "admin", "secret")
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-func TestAuth_ValidV4(t *testing.T) {
+func TestAuth_WrongSecret(t *testing.T) {
 	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
 
-	w := serveRequest(g, http.MethodGet, "/", nil, sigV4Headers("admin"))
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+	// Correct access key, wrong secret → signature will not match → 403.
+	w := serveSignedHeaderRequest(g, http.MethodGet, "/", nil, "example.com", "admin", "wrong-secret")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestAuth_LegacyV2Rejected(t *testing.T) {
+	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
+
+	// Legacy SigV2 ("AWS key:sig") is no longer accepted even on a key match.
+	w := serveRequest(g, http.MethodGet, "/", nil, map[string]string{
+		"Authorization": "AWS admin:signature",
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for legacy V2, got %d", w.Code)
 	}
 }
 
 func TestAuth_InvalidAccessKey(t *testing.T) {
 	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
 
-	w := serveRequest(g, http.MethodGet, "/", nil, authHeaders("wrong"))
+	// Signed with a credential whose access key does not match config → 403.
+	w := serveSignedHeaderRequest(g, http.MethodGet, "/", nil, "example.com", "wrong", "secret")
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", w.Code)
 	}
@@ -116,9 +134,10 @@ func TestAuth_PresignedURL_Valid(t *testing.T) {
 	g, syncDir := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
 	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
 
-	// Presigned URL with valid access key in X-Amz-Credential query param.
-	url := "/mybucket/file.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=admin%2F20260206%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260206T163218Z&X-Amz-Expires=2999&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=abcdef1234567890"
-	w := serveRequest(g, http.MethodPut, url, strings.NewReader("presigned data"), noAuth())
+	// Presigned URL with a correctly computed SigV4 query signature over host.
+	signedPath := presignV4(http.MethodPut, "/mybucket/file.txt", "example.com", "admin", "secret", 900)
+	w := serveRequest(g, http.MethodPut, signedPath, strings.NewReader("presigned data"),
+		map[string]string{"Host": "example.com"})
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -130,6 +149,23 @@ func TestAuth_PresignedURL_Valid(t *testing.T) {
 	}
 	if string(data) != "presigned data" {
 		t.Fatalf("expected 'presigned data', got %q", string(data))
+	}
+}
+
+func TestAuth_PresignedURL_Expired(t *testing.T) {
+	g, syncDir := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
+	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
+
+	// A validly signed presigned URL whose expiry window has already elapsed is
+	// rejected (replay bounding).
+	restore := nowUTC
+	nowUTC = func() time.Time { return time.Now().UTC().Add(1 * time.Hour) }
+	defer func() { nowUTC = restore }()
+
+	signedPath := presignV4(http.MethodGet, "/mybucket/file.txt", "example.com", "admin", "secret", 60)
+	w := serveRequest(g, http.MethodGet, signedPath, nil, map[string]string{"Host": "example.com"})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for expired presigned URL, got %d", w.Code)
 	}
 }
 
@@ -1288,12 +1324,14 @@ func TestVirtualHosted_PresignedURL(t *testing.T) {
 	bp := filepath.Join(syncDir, "mybucket")
 	os.Mkdir(bp, 0o755)
 
-	// PUT via presigned URL + virtual-hosted-style (Commander One pattern).
-	url := "/upload.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=admin%2F20260206%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260206T163218Z&X-Amz-Expires=2999&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=abc123"
+	// PUT via presigned URL + virtual-hosted-style (Commander One pattern). The
+	// signature must be computed over the virtual-hosted Host header.
+	const vhost = "mybucket.localhost:9200"
+	signedPath := presignV4(http.MethodPut, "/upload.txt", vhost, "admin", "secret", 900)
 	headers := map[string]string{
-		"Host": "mybucket.localhost:9200",
+		"Host": vhost,
 	}
-	w := serveRequest(g, http.MethodPut, url, strings.NewReader("presigned vhost"), headers)
+	w := serveRequest(g, http.MethodPut, signedPath, strings.NewReader("presigned vhost"), headers)
 	if w.Code != http.StatusOK {
 		t.Fatalf("put: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -1756,5 +1794,181 @@ func TestGateway_StartStop(t *testing.T) {
 	cancel()
 	if err := <-errCh; err != nil {
 		t.Fatalf("gateway error: %v", err)
+	}
+}
+
+// --- Hardening: payload SHA-256 integrity check ---
+
+func TestPutObject_ContentSHA256_Match(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
+
+	body := "integrity checked"
+	sum := sha256.Sum256([]byte(body))
+	w := serveRequest(g, http.MethodPut, "/mybucket/ok.txt", strings.NewReader(body), map[string]string{
+		"X-Amz-Content-Sha256": hex.EncodeToString(sum[:]),
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for matching digest, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPutObject_ContentSHA256_Mismatch(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
+
+	// A concrete but wrong digest must be rejected and the file must not appear.
+	wrong := hex.EncodeToString(make([]byte, 32)) // 64 hex zeros
+	w := serveRequest(g, http.MethodPut, "/mybucket/bad.txt", strings.NewReader("real body"), map[string]string{
+		"X-Amz-Content-Sha256": wrong,
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for digest mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "XAmzContentSHA256Mismatch") {
+		t.Fatalf("expected XAmzContentSHA256Mismatch, got %s", w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(syncDir, "mybucket", "bad.txt")); !os.IsNotExist(err) {
+		t.Fatal("object must not be created on digest mismatch")
+	}
+}
+
+func TestPutObject_UnsignedPayload_NotChecked(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
+
+	// UNSIGNED-PAYLOAD is not a concrete digest, so no integrity check applies.
+	w := serveRequest(g, http.MethodPut, "/mybucket/u.txt", strings.NewReader("whatever"), map[string]string{
+		"X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for UNSIGNED-PAYLOAD, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// --- Hardening: MaxUploadBytes enforcement ---
+
+func TestPutObject_MaxUploadBytes_Exceeded(t *testing.T) {
+	g, syncDir := testGateway(t, Config{MaxUploadBytes: 8})
+	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
+
+	w := serveRequest(g, http.MethodPut, "/mybucket/big.bin", strings.NewReader("way too many bytes"), noAuth())
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(syncDir, "mybucket", "big.bin")); !os.IsNotExist(err) {
+		t.Fatal("oversized object must not be created")
+	}
+}
+
+func TestPutObject_MaxUploadBytes_WithinLimit(t *testing.T) {
+	g, syncDir := testGateway(t, Config{MaxUploadBytes: 1024})
+	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
+
+	w := serveRequest(g, http.MethodPut, "/mybucket/small.txt", strings.NewReader("tiny"), noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 within limit, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// --- Hardening: parseMaxKeys rejects non-numeric input ---
+
+func TestListObjects_MaxKeysNonNumeric(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
+
+	w := serveRequest(g, http.MethodGet, "/mybucket?max-keys=abc", nil, noAuth())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-numeric max-keys, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "InvalidArgument") {
+		t.Fatalf("expected InvalidArgument, got %s", w.Body.String())
+	}
+}
+
+// --- Hardening: validateKey rejects any ".." segment ---
+
+func TestPutObject_EmbeddedDotDotSegment(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
+
+	// "a/../b" contains a ".." segment; it must be refused rather than collapsed.
+	w := serveRequest(g, http.MethodPut, "/mybucket/a/..%2Fb.txt", strings.NewReader("x"), noAuth())
+	if w.Code == http.StatusOK {
+		t.Fatalf("expected key with .. segment to be rejected, got 200")
+	}
+}
+
+// --- Hardening: DeleteObject on a directory key is a no-op 204 ---
+
+func TestDeleteObject_DirectoryKeyNoOp(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	bp := filepath.Join(syncDir, "mybucket")
+	os.MkdirAll(filepath.Join(bp, "subdir"), 0o755)
+	os.WriteFile(filepath.Join(bp, "subdir", "keep.txt"), []byte("data"), 0o644)
+
+	// DELETE of a key that resolves to a directory returns 204 and must not remove
+	// the directory or its contents.
+	w := serveRequest(g, http.MethodDelete, "/mybucket/subdir", nil, noAuth())
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(bp, "subdir", "keep.txt")); err != nil {
+		t.Fatalf("directory contents must be preserved: %v", err)
+	}
+}
+
+// --- Hardening: header-form signature bounded by clock skew ---
+
+func TestAuth_HeaderSignature_StaleRejected(t *testing.T) {
+	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
+
+	// Sign now, then advance the verifier's clock beyond the skew window: a captured
+	// Authorization header must not replay indefinitely.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "example.com"
+	signV4Header(req, "admin", "secret")
+
+	restore := nowUTC
+	nowUTC = func() time.Time { return time.Now().UTC().Add(1 * time.Hour) }
+	defer func() { nowUTC = restore }()
+
+	w := httptest.NewRecorder()
+	g.route(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for stale header signature, got %d", w.Code)
+	}
+}
+
+// --- Hardening: signature that does not sign host is rejected ---
+
+func TestAuth_HeaderSignature_HostNotSigned(t *testing.T) {
+	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
+
+	// Build a syntactically valid, correctly computed signature that signs only
+	// x-amz-date (not host). It must be rejected because host binding is required.
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	date := now.Format("20060102")
+	scope := date + "/us-east-1/s3/aws4_request"
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "example.com"
+	req.Header.Set("X-Amz-Date", amzDate)
+	req.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
+
+	signed := []string{"x-amz-date"}
+	cred := credential{accessKey: "admin", date: date, region: "us-east-1", service: "s3", scope: scope}
+	sig := computeSignature(req, "secret", cred, amzDate, signed,
+		canonicalQueryString(req.URL.Query(), ""), unsignedPayload)
+	req.Header.Set("Authorization", sigV4Algorithm+
+		" Credential=admin/"+scope+
+		", SignedHeaders="+strings.Join(signed, ";")+
+		", Signature="+sig)
+
+	w := httptest.NewRecorder()
+	g.route(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when host is not signed, got %d", w.Code)
 	}
 }

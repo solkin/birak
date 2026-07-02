@@ -2,8 +2,8 @@ package httpui
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -167,18 +167,45 @@ func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filepath.Base(fullPath)))
-	http.ServeContent(w, r, filepath.Base(fullPath), info.ModTime(), f)
+	// Build the header via mime.FormatMediaType so a filename containing quotes,
+	// control characters, or non-ASCII cannot break out of the header value
+	// (header injection) — it is properly quoted/encoded, with a safe fallback.
+	name := filepath.Base(fullPath)
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": name})
+	if disposition == "" {
+		disposition = "attachment"
+	}
+	w.Header().Set("Content-Disposition", disposition)
+	http.ServeContent(w, r, name, info.ModTime(), f)
 }
 
 // handleUpload accepts multipart file uploads.
 func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<30) // 1 GB limit
+	// Bound concurrent uploads; wait for a slot unless the client goes away.
+	select {
+	case g.uploadSem <- struct{}{}:
+		defer func() { <-g.uploadSem }()
+	case <-r.Context().Done():
+		return
+	}
 
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	limit := int64(defaultMaxUploadBytes)
+	if g.config.MaxUploadBytes > 0 {
+		limit = g.config.MaxUploadBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+
+	// Keep only a small part in memory; larger parts spill to temp files, which
+	// RemoveAll cleans up. This bounds RAM per upload regardless of body size.
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		jsonError(w, http.StatusBadRequest, "failed to parse upload")
 		return
 	}
+	defer func() {
+		if r.MultipartForm != nil {
+			r.MultipartForm.RemoveAll()
+		}
+	}()
 
 	targetDir := r.FormValue("path")
 	dirFullPath, err := g.resolvePath(targetDir)
@@ -245,14 +272,15 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Write atomically via temp file.
-		tmpPath := filepath.Join(destDir, ".birak-tmp-upload-"+filepath.Base(destPath))
-		dst, err := os.Create(tmpPath)
+		// Write atomically via a temp file with an unpredictable name; the
+		// .birak-tmp- prefix keeps it within the ignore patterns.
+		dst, err := os.CreateTemp(destDir, ".birak-tmp-upload-*")
 		if err != nil {
 			src.Close()
 			jsonError(w, http.StatusInternalServerError, "failed to create file")
 			return
 		}
+		tmpPath := dst.Name()
 
 		_, copyErr := io.Copy(dst, src)
 		src.Close()

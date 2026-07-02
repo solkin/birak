@@ -4,16 +4,36 @@
 package httpui
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	_ "embed"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/birak/birak/internal/gateway"
 )
+
+// noncePlaceholder is replaced in the served page with a per-request CSP nonce.
+const noncePlaceholder = "__CSP_NONCE__"
+
+type contextKey string
+
+const nonceContextKey contextKey = "csp-nonce"
+
+// defaultMaxUploadBytes is the per-request upload cap used when the configured
+// MaxUploadBytes is 0 (unset).
+const defaultMaxUploadBytes = 1 << 30 // 1 GiB
+
+// maxConcurrentUploads bounds simultaneous multipart uploads so a burst cannot
+// exhaust memory/disk with parallel spooled bodies.
+const maxConcurrentUploads = 16
 
 //go:embed index.html
 var indexHTML []byte
@@ -23,6 +43,9 @@ type Config struct {
 	ListenAddr string `yaml:"listen_addr"`
 	Username   string `yaml:"username"`
 	Password   string `yaml:"password"`
+	// MaxUploadBytes caps a single upload request body. 0 falls back to the
+	// built-in default (defaultMaxUploadBytes).
+	MaxUploadBytes int64
 }
 
 // Gateway implements the HTTP file server with web UI.
@@ -32,6 +55,7 @@ type Gateway struct {
 	config         Config
 	logger         *slog.Logger
 	server         *http.Server
+	uploadSem      chan struct{}
 }
 
 // New creates a new HTTP file server Gateway.
@@ -41,16 +65,62 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 		ignorePatterns: ignorePatterns,
 		config:         cfg,
 		logger:         logger.With("gateway", "http"),
+		uploadSem:      make(chan struct{}, maxConcurrentUploads),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", g.route)
 
 	g.server = &http.Server{
-		Handler: gateway.LogMiddleware(g.logger, mux),
+		Handler: gateway.LogMiddleware(g.logger, securityHeaders(mux)),
+		// Bound header-read and idle-connection time to blunt Slowloris-style
+		// attacks. Read/Write timeouts are left unset so large up/downloads are
+		// not cut off mid-stream.
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	return g
+}
+
+// securityHeaders sets defensive response headers on every response and threads
+// a per-request CSP nonce through the context for the page handler to inject.
+// The CSP locks scripts to the nonce (the XSS-relevant directive) and blocks
+// framing, plugins, and base-URI hijacking; inline styles remain allowed.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nonce, ok := newNonce()
+		if !ok {
+			// Fail closed: serving a page without a fresh nonce would weaken the
+			// script-src CSP to a predictable value.
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy",
+			"default-src 'none'; "+
+				"script-src 'nonce-"+nonce+"'; "+
+				"style-src 'unsafe-inline'; "+
+				"img-src 'self' data:; "+
+				"connect-src 'self'; "+
+				"base-uri 'none'; "+
+				"form-action 'self'; "+
+				"frame-ancestors 'none'")
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), nonceContextKey, nonce)))
+	})
+}
+
+// newNonce returns a fresh base64 CSP nonce. ok is false if the system CSPRNG
+// is unavailable, in which case the caller must not serve the page.
+func newNonce() (nonce string, ok bool) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", false
+	}
+	return base64.StdEncoding.EncodeToString(b), true
 }
 
 // Name returns the protocol name.
@@ -66,7 +136,9 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		g.server.Close()
+		// Drain in-flight requests rather than cutting connections abruptly; Stop
+		// bounds the overall drain time.
+		g.server.Shutdown(context.Background())
 	}()
 
 	if err := g.server.Serve(ln); err != http.ErrServerClosed {
@@ -102,14 +174,24 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Everything else: serve the SPA page.
+	// Everything else: serve the SPA page with the per-request CSP nonce injected.
+	nonce, _ := r.Context().Value(nonceContextKey).(string)
+	page := bytes.ReplaceAll(indexHTML, []byte(noncePlaceholder), []byte(nonce))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(indexHTML)
+	w.Write(page)
 }
 
 // routeAPI dispatches API requests.
 func (g *Gateway) routeAPI(w http.ResponseWriter, r *http.Request) {
 	apiPath := strings.TrimPrefix(r.URL.Path, "/_api")
+
+	// CSRF: state-changing requests must come from the same origin. Browsers send
+	// Origin on cross-site POSTs, so a forged request from another site is rejected
+	// while same-origin UI requests and non-browser API clients are allowed.
+	if r.Method == http.MethodPost && !sameOrigin(r) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
 
 	switch {
 	case apiPath == "/list" && r.Method == http.MethodGet:
@@ -129,3 +211,26 @@ func (g *Gateway) routeAPI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// sameOrigin reports whether a state-changing request originates from the same
+// host it targets. It compares the Origin (or Referer) host against the request
+// Host, ignoring scheme so it keeps working behind a TLS-terminating reverse
+// proxy. Requests carrying neither header (e.g. curl/API clients, which do not
+// send ambient browser credentials) are allowed.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		if ref := r.Header.Get("Referer"); ref != "" {
+			if u, err := url.Parse(ref); err == nil {
+				origin = u.Scheme + "://" + u.Host
+			}
+		}
+	}
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return u.Host == r.Host
+}

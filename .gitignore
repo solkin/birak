@@ -27,3 +27,6 @@ Thumbs.db
 *.db
 *.db-wal
 *.db-shm
+
+# Local env
+.env

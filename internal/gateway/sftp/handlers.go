@@ -5,20 +5,27 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/birak/birak/internal/watcher"
 
 	"golang.org/x/crypto/ssh"
 )
 
+// maxHandlesPerSession caps the number of simultaneously open file/dir handles a
+// single session may hold, bounding memory and file-descriptor use against a
+// client that opens handles without closing them.
+const maxHandlesPerSession = 1024
+
 type handleEntry struct {
-	path    string
-	file    *os.File
-	isDir   bool
-	dirRead bool
+	path  string
+	file  *os.File // regular-file handle (SSH_FXP_OPEN)
+	dir   *os.File // directory handle (SSH_FXP_OPENDIR), read incrementally
+	isDir bool
 }
 
 type session struct {
@@ -28,7 +35,7 @@ type session struct {
 	mu      sync.Mutex
 }
 
-func (g *Gateway) serveSFTP(ch ssh.Channel) {
+func (g *Gateway) serveSFTP(conn net.Conn, ch ssh.Channel) {
 	s := &session{
 		g:       g,
 		ch:      ch,
@@ -36,7 +43,9 @@ func (g *Gateway) serveSFTP(ch ssh.Channel) {
 	}
 	defer s.closeAllHandles()
 
-	// Read SSH_FXP_INIT.
+	// Refresh an idle deadline before each packet read so a connection that goes
+	// silent is reclaimed instead of held open forever.
+	conn.SetReadDeadline(time.Now().Add(sftpIdleTimeout))
 	pktType, payload, err := readPacket(ch)
 	if err != nil {
 		g.logger.Error("sftp read init failed", "error", err)
@@ -56,6 +65,7 @@ func (g *Gateway) serveSFTP(ch ssh.Channel) {
 	}
 
 	for {
+		conn.SetReadDeadline(time.Now().Add(sftpIdleTimeout))
 		pktType, payload, err := readPacket(ch)
 		if err != nil {
 			if err != io.EOF {
@@ -72,9 +82,9 @@ func (s *session) handlePacket(pktType byte, payload []byte) {
 	case sshFxpRealpath:
 		s.handleRealpath(payload)
 	case sshFxpStat:
-		s.handleStat(payload)
+		s.handleStat(payload, os.Stat)
 	case sshFxpLstat:
-		s.handleStat(payload) // No symlink support, same as stat.
+		s.handleStat(payload, os.Lstat)
 	case sshFxpFstat:
 		s.handleFstat(payload)
 	case sshFxpOpendir:
@@ -97,8 +107,10 @@ func (s *session) handlePacket(pktType byte, payload []byte) {
 		s.handleRmdir(payload)
 	case sshFxpRename:
 		s.handleRename(payload)
-	case sshFxpSetstat, sshFxpFsetstat:
+	case sshFxpSetstat:
 		s.handleSetstat(payload)
+	case sshFxpFsetstat:
+		s.handleFsetstat(payload)
 	case sshFxpReadlink:
 		s.handleReadlink(payload)
 	case sshFxpSymlink:
@@ -139,7 +151,9 @@ func (s *session) handleRealpath(payload []byte) {
 	writePacket(s.ch, sshFxpName, resp)
 }
 
-func (s *session) handleStat(payload []byte) {
+// handleStat serves SSH_FXP_STAT (statFn=os.Stat, follows symlinks) and
+// SSH_FXP_LSTAT (statFn=os.Lstat, reports the link itself).
+func (s *session) handleStat(payload []byte, statFn func(string) (os.FileInfo, error)) {
 	id, rest, err := unmarshalUint32(payload)
 	if err != nil {
 		return
@@ -156,7 +170,7 @@ func (s *session) handleStat(payload []byte) {
 		return
 	}
 
-	fi, err := os.Stat(fullPath)
+	fi, err := statFn(fullPath)
 	if err != nil {
 		s.sendStatus(id, sshFxNoSuchFile, "no such file")
 		return
@@ -187,7 +201,15 @@ func (s *session) handleFstat(payload []byte) {
 		return
 	}
 
-	fi, err := os.Stat(entry.path)
+	// Stat the open descriptor when we have one, so FSTAT reflects exactly the
+	// file the handle refers to (no TOCTOU re-resolution of the path). Directory
+	// handles carry no *os.File, so fall back to the path for those.
+	var fi os.FileInfo
+	if entry.file != nil {
+		fi, err = entry.file.Stat()
+	} else {
+		fi, err = os.Stat(entry.path)
+	}
 	if err != nil {
 		s.sendStatus(id, sshFxNoSuchFile, "no such file")
 		return
@@ -222,13 +244,29 @@ func (s *session) handleOpendir(payload []byte) {
 		return
 	}
 
-	handle := s.newHandle(fullPath, nil, true)
+	dir, err := os.Open(fullPath)
+	if err != nil {
+		s.sendStatus(id, sshFxFailure, "open failed")
+		return
+	}
+
+	handle, ok := s.addHandle(&handleEntry{path: fullPath, dir: dir, isDir: true})
+	if !ok {
+		dir.Close()
+		s.sendStatus(id, sshFxFailure, "too many open handles")
+		return
+	}
 
 	var resp []byte
 	resp = marshalUint32(resp, id)
 	resp = marshalString(resp, handle)
 	writePacket(s.ch, sshFxpHandle, resp)
 }
+
+// readdirBatchSize bounds how many entries a single SSH_FXP_READDIR reads from
+// the directory, so large directories are paged across replies instead of
+// buffered whole in memory.
+const readdirBatchSize = 256
 
 func (s *session) handleReaddir(payload []byte) {
 	id, rest, err := unmarshalUint32(payload)
@@ -241,50 +279,60 @@ func (s *session) handleReaddir(payload []byte) {
 		return
 	}
 
+	// Read the next bounded batch directly from the open directory handle, which
+	// tracks its own read position. This streams large directories incrementally
+	// instead of buffering the entire listing in memory.
 	s.mu.Lock()
 	entry, ok := s.handles[handle]
-	s.mu.Unlock()
-	if !ok || !entry.isDir {
+	if !ok || !entry.isDir || entry.dir == nil {
+		s.mu.Unlock()
 		s.sendStatus(id, sshFxFailure, "invalid handle")
 		return
 	}
-
-	if entry.dirRead {
-		s.sendStatus(id, sshFxEOF, "")
-		return
-	}
-
-	entries, err := os.ReadDir(entry.path)
-	if err != nil {
+	batch, rerr := entry.dir.ReadDir(readdirBatchSize)
+	s.mu.Unlock()
+	if rerr != nil && rerr != io.EOF {
 		s.sendStatus(id, sshFxFailure, "read failed")
 		return
 	}
 
-	entry.dirRead = true
-
-	// Filter ignored files.
-	var filtered []os.DirEntry
-	for _, e := range entries {
-		if !watcher.ShouldIgnore(e.Name(), s.g.ignorePatterns) {
-			filtered = append(filtered, e)
+	// Marshal into a temporary buffer first so the entry count reflects only the
+	// entries we actually emit. Ignored (node-sync-hidden) files are filtered per
+	// batch, and an entry may vanish between ReadDir and Info.
+	var body []byte
+	count := 0
+	for _, e := range batch {
+		if watcher.ShouldIgnore(e.Name(), s.g.ignorePatterns) {
+			continue
 		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		body = marshalFileInfo(body, e.Name(), fi)
+		count++
 	}
 
-	if len(filtered) == 0 {
-		s.sendStatus(id, sshFxEOF, "")
+	// A batch that was entirely ignored still leaves more real entries to read on
+	// the next call, so only report EOF when the directory handle is exhausted.
+	if count == 0 {
+		if rerr == io.EOF {
+			s.sendStatus(id, sshFxEOF, "")
+			return
+		}
+		// This batch yielded nothing visible but the directory isn't exhausted;
+		// return an empty NAME reply so the client issues another READDIR.
+		var resp []byte
+		resp = marshalUint32(resp, id)
+		resp = marshalUint32(resp, 0)
+		writePacket(s.ch, sshFxpName, resp)
 		return
 	}
 
 	var resp []byte
 	resp = marshalUint32(resp, id)
-	resp = marshalUint32(resp, uint32(len(filtered)))
-	for _, e := range filtered {
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		resp = marshalFileInfo(resp, e.Name(), fi)
-	}
+	resp = marshalUint32(resp, uint32(count))
+	resp = append(resp, body...)
 	writePacket(s.ch, sshFxpName, resp)
 }
 
@@ -303,8 +351,10 @@ func (s *session) handleOpen(payload []byte) {
 		s.sendStatus(id, sshFxBadMessage, "bad message")
 		return
 	}
-	// Skip attrs.
-	_, _ = unmarshalAttrs(rest)
+	if _, err := unmarshalAttrs(rest); err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
 
 	fullPath, err := s.g.resolvePath(path)
 	if err != nil {
@@ -355,7 +405,12 @@ func (s *session) handleOpen(payload []byte) {
 		return
 	}
 
-	handle := s.newHandle(fullPath, f, false)
+	handle, ok := s.addHandle(&handleEntry{path: fullPath, file: f})
+	if !ok {
+		f.Close()
+		s.sendStatus(id, sshFxFailure, "too many open handles")
+		return
+	}
 	s.g.logger.Debug("file opened", "path", path, "flags", pflags)
 
 	var resp []byte
@@ -395,6 +450,17 @@ func (s *session) handleRead(payload []byte) {
 
 	if length > 1<<18 {
 		length = 1 << 18 // 256KB max per read
+	}
+
+	// A zero-length read is valid and must return empty data, not an error: with
+	// an empty buffer ReadAt returns (0, nil), which would otherwise fall into the
+	// "read error" branch below.
+	if length == 0 {
+		var resp []byte
+		resp = marshalUint32(resp, id)
+		resp = marshalBytes(resp, nil)
+		writePacket(s.ch, sshFxpData, resp)
+		return
 	}
 
 	buf := make([]byte, length)
@@ -443,6 +509,13 @@ func (s *session) handleWrite(payload []byte) {
 		return
 	}
 
+	// Enforce the configured per-file upload cap: reject any write whose end offset
+	// would push the file past the limit (the same bound the other gateways apply).
+	if max := s.g.config.MaxUploadBytes; max > 0 && int64(offset)+int64(len(data)) > max {
+		s.sendStatus(id, sshFxFailure, "upload exceeds maximum size")
+		return
+	}
+
 	_, err = entry.file.WriteAt([]byte(data), int64(offset))
 	if err != nil {
 		s.sendStatus(id, sshFxFailure, "write error")
@@ -475,8 +548,16 @@ func (s *session) handleClose(payload []byte) {
 		return
 	}
 
+	if entry.dir != nil {
+		entry.dir.Close()
+	}
 	if entry.file != nil {
-		entry.file.Close()
+		// Report a Close error (e.g. a deferred write/flush failure) instead of
+		// claiming success — otherwise a truncated upload looks like it succeeded.
+		if err := entry.file.Close(); err != nil {
+			s.sendStatus(id, sshFxFailure, err.Error())
+			return
+		}
 	}
 	s.sendStatus(id, sshFxOk, "")
 }
@@ -618,9 +699,100 @@ func (s *session) handleRename(payload []byte) {
 	s.sendStatus(id, sshFxOk, "")
 }
 
+// handleSetstat applies attributes to a path (SSH_FXP_SETSTAT). Only size
+// (truncate), permissions (chmod) and access/mod times (chtimes) are applied;
+// ownership is ignored. Previously this silently returned success without doing
+// anything, so a client's chmod/truncate was reported as done but lost.
 func (s *session) handleSetstat(payload []byte) {
-	id, _, _ := unmarshalUint32(payload)
+	id, rest, err := unmarshalUint32(payload)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+	path, rest, err := unmarshalString(rest)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+	attrs, _, err := parseAttrs(rest)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+
+	full, err := s.g.resolvePath(path)
+	if err != nil {
+		s.sendStatus(id, sshFxPermissionDenied, "access denied")
+		return
+	}
+	if err := applyAttrs(attrs, full, nil); err != nil {
+		s.sendStatus(id, sshFxFailure, err.Error())
+		return
+	}
 	s.sendStatus(id, sshFxOk, "")
+}
+
+// handleFsetstat applies attributes to an open handle (SSH_FXP_FSETSTAT).
+func (s *session) handleFsetstat(payload []byte) {
+	id, rest, err := unmarshalUint32(payload)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+	handle, rest, err := unmarshalString(rest)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+	attrs, _, err := parseAttrs(rest)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+
+	s.mu.Lock()
+	entry := s.handles[handle]
+	s.mu.Unlock()
+	if entry == nil || entry.file == nil {
+		s.sendStatus(id, sshFxFailure, "invalid handle")
+		return
+	}
+	if err := applyAttrs(attrs, entry.path, entry.file); err != nil {
+		s.sendStatus(id, sshFxFailure, err.Error())
+		return
+	}
+	s.sendStatus(id, sshFxOk, "")
+}
+
+// applyAttrs applies the supported attribute changes to a file, identified
+// either by an open *os.File (f, preferred when set) or by path.
+func applyAttrs(a fileAttrs, path string, f *os.File) error {
+	if a.hasSize {
+		if f != nil {
+			if err := f.Truncate(int64(a.size)); err != nil {
+				return err
+			}
+		} else if err := os.Truncate(path, int64(a.size)); err != nil {
+			return err
+		}
+	}
+	if a.hasPerm {
+		mode := os.FileMode(a.perm & 0o777)
+		if f != nil {
+			if err := f.Chmod(mode); err != nil {
+				return err
+			}
+		} else if err := os.Chmod(path, mode); err != nil {
+			return err
+		}
+	}
+	if a.hasTimes {
+		// *os.File has no Chtimes; times are always applied by path.
+		if err := os.Chtimes(path, time.Unix(int64(a.atime), 0), time.Unix(int64(a.mtime), 0)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *session) handleReadlink(payload []byte) {
@@ -694,14 +866,22 @@ func (s *session) sendStatus(id uint32, code uint32, msg string) {
 	writePacket(s.ch, sshFxpStatus, resp)
 }
 
-func (s *session) newHandle(path string, f *os.File, isDir bool) string {
-	buf := make([]byte, 8)
-	rand.Read(buf)
-	handle := hex.EncodeToString(buf)
+// addHandle registers an open handle and returns its opaque id. It returns
+// ok=false when the session is already at maxHandlesPerSession (so the caller
+// closes the underlying file) or if randomness is unavailable.
+func (s *session) addHandle(e *handleEntry) (string, bool) {
 	s.mu.Lock()
-	s.handles[handle] = &handleEntry{path: path, file: f, isDir: isDir}
-	s.mu.Unlock()
-	return handle
+	defer s.mu.Unlock()
+	if len(s.handles) >= maxHandlesPerSession {
+		return "", false
+	}
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", false
+	}
+	handle := hex.EncodeToString(buf)
+	s.handles[handle] = e
+	return handle, true
 }
 
 func (s *session) closeAllHandles() {
@@ -710,6 +890,9 @@ func (s *session) closeAllHandles() {
 	for _, entry := range s.handles {
 		if entry.file != nil {
 			entry.file.Close()
+		}
+		if entry.dir != nil {
+			entry.dir.Close()
 		}
 	}
 	s.handles = nil

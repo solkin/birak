@@ -8,4 +8,7 @@
 *.db-wal
 *.db-shm
 Dockerfile
+docker-compose.yml
+.env
+.env.example
 birakd

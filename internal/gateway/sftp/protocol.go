@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 )
@@ -70,6 +71,12 @@ const (
 
 const sftpProtocolVersion = 3
 
+// maxPacketSize bounds a single inbound SFTP packet. It must hold the largest
+// legitimate WRITE (file chunk plus handle/offset overhead); 512 KiB comfortably
+// fits the 256 KiB chunks used by aggressive clients while capping per-packet
+// allocation far below the previous 16 MiB.
+const maxPacketSize = 512 * 1024
+
 // readPacket reads a single SFTP packet: 4-byte length + payload.
 func readPacket(r io.Reader) (byte, []byte, error) {
 	var lenBuf [4]byte
@@ -77,7 +84,7 @@ func readPacket(r io.Reader) (byte, []byte, error) {
 		return 0, nil, err
 	}
 	length := binary.BigEndian.Uint32(lenBuf[:])
-	if length == 0 || length > 1<<24 {
+	if length == 0 || length > maxPacketSize {
 		return 0, nil, fmt.Errorf("invalid packet length: %d", length)
 	}
 
@@ -168,10 +175,77 @@ func marshalAttrs(b []byte, fi os.FileInfo) []byte {
 	b = marshalUint32(b, flags)
 	b = marshalUint64(b, uint64(fi.Size()))
 	b = marshalUint32(b, fileModeToSFTP(fi.Mode()))
-	mtime := fi.ModTime().Unix()
-	b = marshalUint32(b, uint32(mtime)) // atime
-	b = marshalUint32(b, uint32(mtime)) // mtime
+	mtime := sftpTime(fi.ModTime().Unix())
+	b = marshalUint32(b, mtime) // atime
+	b = marshalUint32(b, mtime) // mtime
 	return b
+}
+
+// sftpTime clamps a Unix timestamp to the uint32 range used by SFTP v3's time
+// fields, so a far-future (post-2106) or pre-epoch time is pinned to the range
+// boundary instead of silently wrapping to a misleading value.
+func sftpTime(sec int64) uint32 {
+	if sec < 0 {
+		return 0
+	}
+	if sec > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(sec)
+}
+
+// fileAttrs holds the subset of SFTP file attributes that we can apply to the
+// local filesystem. Ownership (uid/gid) is intentionally not represented.
+type fileAttrs struct {
+	hasSize  bool
+	size     uint64
+	hasPerm  bool
+	perm     uint32
+	hasTimes bool
+	atime    uint32
+	mtime    uint32
+}
+
+// parseAttrs decodes an SFTP attribute block, returning the values we support
+// and the remaining bytes. Unknown/uid-gid fields are skipped.
+func parseAttrs(b []byte) (fileAttrs, []byte, error) {
+	var a fileAttrs
+	flags, rest, err := unmarshalUint32(b)
+	if err != nil {
+		return a, nil, err
+	}
+	if flags&sshFileXferAttrSize != 0 {
+		a.size, rest, err = unmarshalUint64(rest)
+		if err != nil {
+			return a, nil, err
+		}
+		a.hasSize = true
+	}
+	if flags&sshFileXferAttrUIDGID != 0 {
+		if len(rest) < 8 {
+			return a, nil, fmt.Errorf("short attrs")
+		}
+		rest = rest[8:] // ownership is not applied
+	}
+	if flags&sshFileXferAttrPermissions != 0 {
+		a.perm, rest, err = unmarshalUint32(rest)
+		if err != nil {
+			return a, nil, err
+		}
+		a.hasPerm = true
+	}
+	if flags&sshFileXferAttrACModTime != 0 {
+		a.atime, rest, err = unmarshalUint32(rest)
+		if err != nil {
+			return a, nil, err
+		}
+		a.mtime, rest, err = unmarshalUint32(rest)
+		if err != nil {
+			return a, nil, err
+		}
+		a.hasTimes = true
+	}
+	return a, rest, nil
 }
 
 // unmarshalAttrs skips over attributes in a packet (we don't use most of them).

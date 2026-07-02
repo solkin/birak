@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/birak/birak/internal/config"
+	"github.com/birak/birak/internal/gateway"
 	httpuigw "github.com/birak/birak/internal/gateway/httpui"
 	s3gw "github.com/birak/birak/internal/gateway/s3"
 	sftpgw "github.com/birak/birak/internal/gateway/sftp"
@@ -60,6 +61,14 @@ func run(configPath string) error {
 	// Ensure sync directory exists.
 	if err := os.MkdirAll(cfg.SyncDir, 0o755); err != nil {
 		return fmt.Errorf("create sync dir: %w", err)
+	}
+
+	// Clear scratch files left by a previous crash before serving any requests.
+	gateway.SweepTempFiles(cfg.SyncDir, logger)
+
+	// Warn about enabled gateways running without credentials.
+	for _, warning := range config.SecurityWarnings(cfg) {
+		logger.Warn("insecure configuration", "detail", warning)
 	}
 
 	// Open store.
@@ -179,10 +188,11 @@ func run(configPath string) error {
 			cfg.SyncDir,
 			cfg.Ignore,
 			s3gw.Config{
-				ListenAddr: cfg.Gateways.S3.ListenAddr,
-				AccessKey:  cfg.Gateways.S3.AccessKey,
-				SecretKey:  cfg.Gateways.S3.SecretKey,
-				Domain:     cfg.Gateways.S3.Domain,
+				ListenAddr:     cfg.Gateways.S3.ListenAddr,
+				AccessKey:      cfg.Gateways.S3.AccessKey,
+				SecretKey:      cfg.Gateways.S3.SecretKey,
+				Domain:         cfg.Gateways.S3.Domain,
+				MaxUploadBytes: cfg.MaxUploadBytes,
 			},
 			logger,
 		)
@@ -203,9 +213,10 @@ func run(configPath string) error {
 			cfg.SyncDir,
 			cfg.Ignore,
 			webdavgw.Config{
-				ListenAddr: cfg.Gateways.WebDAV.ListenAddr,
-				Username:   cfg.Gateways.WebDAV.Username,
-				Password:   cfg.Gateways.WebDAV.Password,
+				ListenAddr:     cfg.Gateways.WebDAV.ListenAddr,
+				Username:       cfg.Gateways.WebDAV.Username,
+				Password:       cfg.Gateways.WebDAV.Password,
+				MaxUploadBytes: cfg.MaxUploadBytes,
 			},
 			logger,
 		)
@@ -226,9 +237,10 @@ func run(configPath string) error {
 			cfg.SyncDir,
 			cfg.Ignore,
 			httpuigw.Config{
-				ListenAddr: cfg.Gateways.HTTP.ListenAddr,
-				Username:   cfg.Gateways.HTTP.Username,
-				Password:   cfg.Gateways.HTTP.Password,
+				ListenAddr:     cfg.Gateways.HTTP.ListenAddr,
+				Username:       cfg.Gateways.HTTP.Username,
+				Password:       cfg.Gateways.HTTP.Password,
+				MaxUploadBytes: cfg.MaxUploadBytes,
 			},
 			logger,
 		)
@@ -250,10 +262,11 @@ func run(configPath string) error {
 			cfg.Ignore,
 			cfg.MetaDir,
 			sftpgw.Config{
-				ListenAddr:  cfg.Gateways.SFTP.ListenAddr,
-				Username:    cfg.Gateways.SFTP.Username,
-				Password:    cfg.Gateways.SFTP.Password,
-				HostKeyPath: cfg.Gateways.SFTP.HostKeyPath,
+				ListenAddr:     cfg.Gateways.SFTP.ListenAddr,
+				Username:       cfg.Gateways.SFTP.Username,
+				Password:       cfg.Gateways.SFTP.Password,
+				HostKeyPath:    cfg.Gateways.SFTP.HostKeyPath,
+				MaxUploadBytes: cfg.MaxUploadBytes,
 			},
 			logger,
 		)

@@ -54,8 +54,13 @@ func testGateway(t *testing.T, syncDir string, ignorePatterns []string, user, pa
 			if err != nil {
 				return
 			}
-			g.wg.Add(1)
-			go g.handleConnection(conn)
+			select {
+			case g.connSem <- struct{}{}:
+				g.wg.Add(1)
+				go g.handleConnection(conn)
+			default:
+				conn.Close()
+			}
 		}
 	}()
 
@@ -111,10 +116,10 @@ type sshPipe struct {
 	r io.Reader
 }
 
-func (p *sshPipe) Read(data []byte) (int, error)         { return p.r.Read(data) }
-func (p *sshPipe) Write(data []byte) (int, error)        { return p.w.Write(data) }
-func (p *sshPipe) Close() error                          { return p.w.Close() }
-func (p *sshPipe) CloseWrite() error                     { return p.w.Close() }
+func (p *sshPipe) Read(data []byte) (int, error)  { return p.r.Read(data) }
+func (p *sshPipe) Write(data []byte) (int, error) { return p.w.Write(data) }
+func (p *sshPipe) Close() error                   { return p.w.Close() }
+func (p *sshPipe) CloseWrite() error              { return p.w.Close() }
 func (p *sshPipe) SendRequest(string, bool, []byte) (bool, error) {
 	return false, fmt.Errorf("not supported")
 }
@@ -1070,14 +1075,20 @@ func TestHostKeyPersistence(t *testing.T) {
 	metaDir := t.TempDir()
 	keyPath := filepath.Join(metaDir, "test_host_key")
 
-	key1, err := loadOrGenerateHostKey(keyPath)
+	key1, generated1, err := loadOrGenerateHostKey(keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !generated1 {
+		t.Error("expected first call to generate a new key")
+	}
 
-	key2, err := loadOrGenerateHostKey(keyPath)
+	key2, generated2, err := loadOrGenerateHostKey(keyPath)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if generated2 {
+		t.Error("expected second call to load the persisted key, not generate")
 	}
 
 	if key1.PublicKey().Marshal() == nil || key2.PublicKey().Marshal() == nil {
@@ -1086,5 +1097,310 @@ func TestHostKeyPersistence(t *testing.T) {
 
 	if string(key1.PublicKey().Marshal()) != string(key2.PublicKey().Marshal()) {
 		t.Error("host keys differ on reload")
+	}
+}
+
+// startGateway starts a gateway with a caller-supplied Config on a random port
+// and returns its address. Used by tests that need to set fields (e.g.
+// MaxUploadBytes) beyond the user/pass that testGateway exposes.
+func startGateway(t *testing.T, syncDir string, ignorePatterns []string, cfg Config) string {
+	t.Helper()
+	metaDir := t.TempDir()
+	cfg.ListenAddr = "127.0.0.1:0"
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g, err := New(syncDir, ignorePatterns, metaDir, cfg, logger)
+	if err != nil {
+		t.Fatalf("new gateway: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	g.listener = ln
+	addr := ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		g.Stop(context.Background())
+	})
+
+	go func() {
+		go func() {
+			<-ctx.Done()
+			ln.Close()
+		}()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case g.connSem <- struct{}{}:
+				g.wg.Add(1)
+				go g.handleConnection(conn)
+			default:
+				conn.Close()
+			}
+		}
+	}()
+
+	return addr
+}
+
+// sftpSetstat sends SSH_FXP_SETSTAT with the given attribute block and returns
+// the status code.
+func sftpSetstat(t *testing.T, ch io.ReadWriter, id uint32, path string, attrs []byte) uint32 {
+	t.Helper()
+	var req []byte
+	req = marshalUint32(req, id)
+	req = marshalString(req, path)
+	req = append(req, attrs...)
+	if err := writePacket(ch, sshFxpSetstat, req); err != nil {
+		t.Fatalf("write setstat: %v", err)
+	}
+	pktType, payload, err := readPacket(ch)
+	if err != nil {
+		t.Fatalf("read setstat resp: %v", err)
+	}
+	if pktType != sshFxpStatus {
+		t.Fatalf("expected STATUS, got %d", pktType)
+	}
+	_, rest, _ := unmarshalUint32(payload)
+	code, _, _ := unmarshalUint32(rest)
+	return code
+}
+
+// TestAuthFailClosedUsernameOnly verifies that a config with only a username set
+// (no password) still requires authentication. The old "&&" logic would flip to
+// NoClientAuth and accept everyone.
+func TestAuthFailClosedUsernameOnly(t *testing.T) {
+	syncDir := t.TempDir()
+	addr := testGateway(t, syncDir, nil, "user", "")
+
+	// Wrong password must be rejected (auth is enabled, not bypassed).
+	bad := &ssh.ClientConfig{
+		User:            "user",
+		Auth:            []ssh.AuthMethod{ssh.Password("not-empty")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         2 * time.Second,
+	}
+	if _, err := ssh.Dial("tcp", addr, bad); err == nil {
+		t.Fatal("expected auth failure for wrong password when only username configured")
+	}
+
+	// Correct credential (username + empty password) is accepted.
+	good := &ssh.ClientConfig{
+		User:            "user",
+		Auth:            []ssh.AuthMethod{ssh.Password("")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         2 * time.Second,
+	}
+	conn, err := ssh.Dial("tcp", addr, good)
+	if err != nil {
+		t.Fatalf("expected success for correct credential: %v", err)
+	}
+	conn.Close()
+}
+
+// TestSetstatChmod verifies SSH_FXP_SETSTAT actually applies a permission change
+// instead of being a silent no-op.
+func TestSetstatChmod(t *testing.T) {
+	syncDir := t.TempDir()
+	fp := filepath.Join(syncDir, "perm.txt")
+	os.WriteFile(fp, []byte("x"), 0o644)
+
+	addr := testGateway(t, syncDir, nil, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	var attrs []byte
+	attrs = marshalUint32(attrs, sshFileXferAttrPermissions)
+	attrs = marshalUint32(attrs, 0o600)
+	if code := sftpSetstat(t, ch, 1, "/perm.txt", attrs); code != sshFxOk {
+		t.Fatalf("setstat failed: %d", code)
+	}
+
+	fi, err := os.Stat(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("expected mode 0600, got %o", fi.Mode().Perm())
+	}
+}
+
+// TestSetstatTruncate verifies SSH_FXP_SETSTAT with a size attribute truncates.
+func TestSetstatTruncate(t *testing.T) {
+	syncDir := t.TempDir()
+	fp := filepath.Join(syncDir, "trunc.txt")
+	os.WriteFile(fp, []byte("hello world"), 0o644)
+
+	addr := testGateway(t, syncDir, nil, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	var attrs []byte
+	attrs = marshalUint32(attrs, sshFileXferAttrSize)
+	attrs = marshalUint64(attrs, 5)
+	if code := sftpSetstat(t, ch, 1, "/trunc.txt", attrs); code != sshFxOk {
+		t.Fatalf("setstat failed: %d", code)
+	}
+
+	data, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("expected truncated to \"hello\", got %q", data)
+	}
+}
+
+// TestFsetstatTruncate verifies SSH_FXP_FSETSTAT applies to an open handle.
+func TestFsetstatTruncate(t *testing.T) {
+	syncDir := t.TempDir()
+	addr := testGateway(t, syncDir, nil, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	handle := sftpOpenFile(t, ch, 1, "/f.txt", sshFxfWrite|sshFxfCreat|sshFxfTrunc)
+	sftpWriteFile(t, ch, 2, handle, 0, []byte("abcdefgh"))
+
+	var req []byte
+	req = marshalUint32(req, 3)
+	req = marshalString(req, handle)
+	req = marshalUint32(req, sshFileXferAttrSize)
+	req = marshalUint64(req, 3)
+	writePacket(ch, sshFxpFsetstat, req)
+
+	pktType, payload, _ := readPacket(ch)
+	if pktType != sshFxpStatus {
+		t.Fatalf("expected STATUS, got %d", pktType)
+	}
+	_, rest, _ := unmarshalUint32(payload)
+	code, _, _ := unmarshalUint32(rest)
+	if code != sshFxOk {
+		t.Fatalf("fsetstat failed: %d", code)
+	}
+	sftpClose(t, ch, 4, handle)
+
+	data, _ := os.ReadFile(filepath.Join(syncDir, "f.txt"))
+	if string(data) != "abc" {
+		t.Errorf("expected \"abc\", got %q", data)
+	}
+}
+
+// TestZeroLengthRead verifies a zero-length READ returns empty DATA, not an error.
+func TestZeroLengthRead(t *testing.T) {
+	syncDir := t.TempDir()
+	os.WriteFile(filepath.Join(syncDir, "z.txt"), []byte("data"), 0o644)
+
+	addr := testGateway(t, syncDir, nil, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	handle := sftpOpenFile(t, ch, 1, "/z.txt", sshFxfRead)
+	data, eof := sftpReadFile(t, ch, 2, handle, 0, 0)
+	if eof {
+		t.Fatal("zero-length read should not report EOF")
+	}
+	if len(data) != 0 {
+		t.Errorf("expected empty data, got %q", data)
+	}
+	sftpClose(t, ch, 3, handle)
+}
+
+// TestLstat verifies SSH_FXP_LSTAT is served (distinct dispatch from STAT).
+func TestLstat(t *testing.T) {
+	syncDir := t.TempDir()
+	os.WriteFile(filepath.Join(syncDir, "l.txt"), []byte("12345"), 0o644)
+
+	addr := testGateway(t, syncDir, nil, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	var req []byte
+	req = marshalUint32(req, 1)
+	req = marshalString(req, "/l.txt")
+	writePacket(ch, sshFxpLstat, req)
+
+	pktType, payload, err := readPacket(ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pktType != sshFxpAttrs {
+		t.Fatalf("expected ATTRS, got %d", pktType)
+	}
+	_, rest, _ := unmarshalUint32(payload)
+	_, rest, _ = unmarshalUint32(rest) // flags
+	size, _, _ := unmarshalUint64(rest)
+	if size != 5 {
+		t.Errorf("expected size 5, got %d", size)
+	}
+}
+
+// TestMaxUploadBytesEnforced verifies a WRITE past MaxUploadBytes is rejected
+// while a write within the cap succeeds.
+func TestMaxUploadBytesEnforced(t *testing.T) {
+	syncDir := t.TempDir()
+	addr := startGateway(t, syncDir, nil, Config{
+		Username:       "user",
+		Password:       "pass",
+		MaxUploadBytes: 8,
+	})
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	handle := sftpOpenFile(t, ch, 1, "/cap.txt", sshFxfWrite|sshFxfCreat|sshFxfTrunc)
+
+	// Within cap: 8 bytes at offset 0 is allowed.
+	sftpWriteFile(t, ch, 2, handle, 0, []byte("12345678"))
+
+	// Over cap: writing one more byte at offset 8 pushes end to 9 > 8.
+	var req []byte
+	req = marshalUint32(req, 3)
+	req = marshalString(req, handle)
+	req = marshalUint64(req, 8)
+	req = marshalBytes(req, []byte("9"))
+	writePacket(ch, sshFxpWrite, req)
+
+	pktType, payload, _ := readPacket(ch)
+	if pktType != sshFxpStatus {
+		t.Fatalf("expected STATUS, got %d", pktType)
+	}
+	_, rest, _ := unmarshalUint32(payload)
+	code, _, _ := unmarshalUint32(rest)
+	if code != sshFxFailure {
+		t.Errorf("expected FAILURE for oversized write, got %d", code)
+	}
+	sftpClose(t, ch, 4, handle)
+}
+
+// TestReaddirLargeDirectoryPaged verifies a directory with more entries than one
+// READDIR batch is returned fully across multiple paged replies.
+func TestReaddirLargeDirectoryPaged(t *testing.T) {
+	syncDir := t.TempDir()
+	const n = readdirBatchSize*2 + 7
+	for i := 0; i < n; i++ {
+		os.WriteFile(filepath.Join(syncDir, fmt.Sprintf("f%04d.txt", i)), []byte("x"), 0o644)
+	}
+
+	addr := testGateway(t, syncDir, nil, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	handle := sftpOpendir(t, ch, 1, "/")
+	total := 0
+	for id := uint32(2); ; id++ {
+		names := sftpReaddir(t, ch, id, handle)
+		if names == nil {
+			break // EOF
+		}
+		total += len(names)
+	}
+	if total != n {
+		t.Errorf("expected %d entries across paged readdir, got %d", n, total)
 	}
 }

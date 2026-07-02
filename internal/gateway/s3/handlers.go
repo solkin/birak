@@ -4,16 +4,27 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/watcher"
 )
+
+// maxListWalkEntries bounds how many objects/prefixes a single ListObjects walk
+// will materialize, so a bucket with a pathological number of files cannot
+// exhaust memory or stall the server. A truncated walk is logged.
+const maxListWalkEntries = 100000
+
+// errWalkLimit aborts the bucket walk once maxListWalkEntries is reached.
+var errWalkLimit = errors.New("list walk limit reached")
 
 // --- S3 XML response types ---
 
@@ -51,15 +62,15 @@ type BucketInfo struct {
 
 // ListBucketResultV1 is the response for ListObjects (V1).
 type ListBucketResultV1 struct {
-	XMLName    xml.Name       `xml:"ListBucketResult"`
-	Xmlns      string         `xml:"xmlns,attr"`
-	Name       string         `xml:"Name"`
-	Prefix     string         `xml:"Prefix"`
-	Marker     string         `xml:"Marker"`
-	NextMarker string         `xml:"NextMarker,omitempty"`
-	Delimiter  string         `xml:"Delimiter,omitempty"`
-	MaxKeys    int            `xml:"MaxKeys"`
-	IsTruncated bool          `xml:"IsTruncated"`
+	XMLName        xml.Name       `xml:"ListBucketResult"`
+	Xmlns          string         `xml:"xmlns,attr"`
+	Name           string         `xml:"Name"`
+	Prefix         string         `xml:"Prefix"`
+	Marker         string         `xml:"Marker"`
+	NextMarker     string         `xml:"NextMarker,omitempty"`
+	Delimiter      string         `xml:"Delimiter,omitempty"`
+	MaxKeys        int            `xml:"MaxKeys"`
+	IsTruncated    bool           `xml:"IsTruncated"`
 	Contents       []ObjectInfo   `xml:"Contents"`
 	CommonPrefixes []CommonPrefix `xml:"CommonPrefixes,omitempty"`
 }
@@ -133,13 +144,30 @@ func writeXML(w http.ResponseWriter, statusCode int, v interface{}) {
 }
 
 // bucketPath returns the absolute path for a bucket (first-level dir in syncDir).
-func (g *Gateway) bucketPath(bucket string) string {
-	return filepath.Join(g.syncDir, bucket)
+// It routes through gateway.SafePath so a bucket directory that is a symlink
+// escaping syncDir is rejected (ok=false), matching the other gateways. The
+// gateway's ignorePatterns are passed through, but ignore filtering on bucket
+// names is already applied upstream in route.
+func (g *Gateway) bucketPath(bucket string) (string, bool) {
+	_, full, err := gateway.SafePath(g.syncDir, bucket, g.ignorePatterns)
+	if err != nil {
+		return "", false
+	}
+	return full, true
 }
 
-// objectPath returns the absolute path for an object within a bucket.
-func (g *Gateway) objectPath(bucket, key string) string {
-	return filepath.Join(g.syncDir, bucket, filepath.FromSlash(key))
+// objectPath returns the absolute path for an object within a bucket. It routes
+// through gateway.SafePath (which resolves symlinks and rejects any escape from
+// syncDir) and additionally confirms the result stays within the bucket dir.
+func (g *Gateway) objectPath(bucket, key string) (string, bool) {
+	_, full, err := gateway.SafePath(g.syncDir, bucket+"/"+key, g.ignorePatterns)
+	if err != nil {
+		return "", false
+	}
+	if !isUnderDir(filepath.Join(g.syncDir, bucket), full) {
+		return "", false
+	}
+	return full, true
 }
 
 // validateBucketName checks that a bucket name is safe.
@@ -158,9 +186,33 @@ func validateKey(key string) bool {
 	if key == "" {
 		return false
 	}
+	// Reject any ".." path segment outright rather than letting filepath.Clean
+	// collapse it: a key like "a/../b" must not be silently rewritten to "b"
+	// (AWS treats keys literally), and the traversal intent is refused either way.
+	for _, seg := range strings.Split(filepath.ToSlash(key), "/") {
+		if seg == ".." {
+			return false
+		}
+	}
 	cleaned := filepath.ToSlash(filepath.Clean(key))
 	if strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") || cleaned == ".." {
 		return false
+	}
+	return true
+}
+
+// isHexSHA256 reports whether s is a 64-character lowercase hex string, i.e. a
+// concrete SHA-256 digest as opposed to UNSIGNED-PAYLOAD, a streaming marker, or
+// an absent header.
+func isHexSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
 	}
 	return true
 }
@@ -235,7 +287,11 @@ func (g *Gateway) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	info, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -257,8 +313,8 @@ func (g *Gateway) handleCreateBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	bp := g.bucketPath(bucket)
-	if !isUnderDir(g.syncDir, bp) {
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
@@ -289,8 +345,8 @@ func (g *Gateway) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	bp := g.bucketPath(bucket)
-	if !isUnderDir(g.syncDir, bp) {
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
@@ -337,7 +393,11 @@ func (g *Gateway) handleGetBucketLocation(w http.ResponseWriter, r *http.Request
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	info, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -356,7 +416,11 @@ func (g *Gateway) handleGetBucketVersioning(w http.ResponseWriter, r *http.Reque
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	info, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -375,7 +439,11 @@ func (g *Gateway) handleGetBucketACL(w http.ResponseWriter, r *http.Request, buc
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	info, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -408,10 +476,19 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string, maxKeys int) ([]O
 
 	err := filepath.Walk(bp, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
-			return nil // skip errors
+			// Skip an unreadable entry but log it: silently dropping it would make
+			// objects beneath it vanish from the listing with no signal.
+			g.logger.Warn("list objects: skipping unreadable entry", "path", path, "error", err)
+			return nil
 		}
 		if path == bp {
 			return nil // skip the bucket root
+		}
+
+		// Stop the walk once we have collected the cap; better to truncate (and log)
+		// than to hold an unbounded result set in memory.
+		if len(objects)+len(commonPrefixes) >= maxListWalkEntries {
+			return errWalkLimit
 		}
 
 		relPath, _ := filepath.Rel(bp, path)
@@ -466,8 +543,11 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string, maxKeys int) ([]O
 
 		return nil
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, errWalkLimit) {
 		return nil, nil, false, err
+	}
+	if errors.Is(err, errWalkLimit) {
+		g.logger.Warn("list objects: result truncated at limit", "limit", maxListWalkEntries)
 	}
 
 	// Sort objects by key.
@@ -506,7 +586,11 @@ func (g *Gateway) handleListObjects(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	info, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -526,7 +610,11 @@ func (g *Gateway) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 	prefix := r.URL.Query().Get("prefix")
 	delimiter := r.URL.Query().Get("delimiter")
 	marker := r.URL.Query().Get("marker")
-	maxKeys := parseMaxKeys(r)
+	maxKeys, ok := parseMaxKeys(r)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid max-keys value")
+		return
+	}
 
 	objects, cpList, isTruncated, err := g.collectObjects(bp, prefix, delimiter, maxKeys)
 	if err != nil {
@@ -575,7 +663,11 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	delimiter := r.URL.Query().Get("delimiter")
 	startAfter := r.URL.Query().Get("start-after")
 	contToken := r.URL.Query().Get("continuation-token")
-	maxKeys := parseMaxKeys(r)
+	maxKeys, ok := parseMaxKeys(r)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid max-keys value")
+		return
+	}
 
 	objects, cpList, isTruncated, err := g.collectObjects(bp, prefix, delimiter, maxKeys)
 	if err != nil {
@@ -623,19 +715,26 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	writeXML(w, http.StatusOK, result)
 }
 
-// parseMaxKeys extracts max-keys from query, defaulting to 1000.
-func parseMaxKeys(r *http.Request) int {
-	maxKeys := 1000
-	if s := r.URL.Query().Get("max-keys"); s != "" {
-		fmt.Sscanf(s, "%d", &maxKeys)
-		if maxKeys <= 0 {
-			maxKeys = 1000
-		}
-		if maxKeys > 10000 {
-			maxKeys = 10000
-		}
+// parseMaxKeys extracts max-keys from the query, defaulting to 1000. It returns
+// ok=false for a non-numeric value (e.g. "abc" or trailing garbage like "5x") so
+// the caller can reject it with InvalidArgument instead of silently using a
+// default or a partially-parsed number.
+func parseMaxKeys(r *http.Request) (int, bool) {
+	s := r.URL.Query().Get("max-keys")
+	if s == "" {
+		return 1000, true
 	}
-	return maxKeys
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0, false
+	}
+	if n <= 0 {
+		n = 1000
+	}
+	if n > 10000 {
+		n = 10000
+	}
+	return n, true
 }
 
 // handleHeadObject returns metadata for an object.
@@ -645,8 +744,8 @@ func (g *Gateway) handleHeadObject(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	op := g.objectPath(bucket, key)
-	if !isUnderDir(g.bucketPath(bucket), op) {
+	op, ok := g.objectPath(bucket, key)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
 		return
 	}
@@ -679,8 +778,8 @@ func (g *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	op := g.objectPath(bucket, key)
-	if !isUnderDir(g.bucketPath(bucket), op) {
+	op, ok := g.objectPath(bucket, key)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
 		return
 	}
@@ -715,19 +814,36 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	op := g.objectPath(bucket, key)
-	if !isUnderDir(g.bucketPath(bucket), op) {
+	op, ok := g.objectPath(bucket, key)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
 		return
 	}
 
 	// Verify bucket exists.
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	bInfo, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !bInfo.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
 		return
 	}
+
+	// Cap the upload size when configured, translating an overflow into 413.
+	if g.config.MaxUploadBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, g.config.MaxUploadBytes)
+	}
+
+	// When the client declares a concrete payload SHA-256 (the value the SigV4
+	// signature is computed over), verify the streamed body against it and reject a
+	// mismatch. This closes the integrity gap where a captured signed request could
+	// be replayed with a swapped body. UNSIGNED-PAYLOAD and aws-chunked streaming
+	// markers carry no verifiable digest, so they are not checked.
+	declaredHash := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Amz-Content-Sha256")))
+	checkDigest := isHexSHA256(declaredHash)
 
 	// Create parent directories if needed.
 	dir := filepath.Dir(op)
@@ -746,16 +862,29 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 	tmpPath := tmpFile.Name()
 
-	// Hash while writing.
+	// Hash while writing. The digest is Birak's content-addressed ETag and, when the
+	// client supplied one, is also compared against the declared payload SHA-256.
 	h := sha256.New()
-	tee := io.TeeReader(r.Body, h)
-
-	size, err := io.Copy(tmpFile, tee)
+	size, err := io.Copy(io.MultiWriter(tmpFile, h), r.Body)
 	tmpFile.Close()
 	if err != nil {
 		os.Remove(tmpPath)
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size")
+			return
+		}
 		g.logger.Error("put object: write failed", "bucket", bucket, "key", key, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to write object")
+		return
+	}
+
+	actualHash := hex.EncodeToString(h.Sum(nil))
+	if checkDigest && actualHash != declaredHash {
+		os.Remove(tmpPath)
+		g.logger.Warn("put object: content sha256 mismatch", "bucket", bucket, "key", key)
+		writeS3Error(w, http.StatusBadRequest, "XAmzContentSHA256Mismatch",
+			"The provided 'x-amz-content-sha256' header does not match what was computed.")
 		return
 	}
 
@@ -767,7 +896,7 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(h.Sum(nil)))
+	etag := fmt.Sprintf("\"%s\"", actualHash)
 
 	g.logger.Info("object created", "bucket", bucket, "key", key, "size", size)
 
@@ -782,22 +911,30 @@ func (g *Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	op := g.objectPath(bucket, key)
-	if !isUnderDir(g.bucketPath(bucket), op) {
+	op, ok := g.objectPath(bucket, key)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
 		return
 	}
-
-	// S3 DELETE returns 204 even if the object doesn't exist.
-	if err := os.Remove(op); err != nil && !os.IsNotExist(err) {
-		g.logger.Error("delete object failed", "bucket", bucket, "key", key, "error", err)
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to delete object")
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
 
-	// Clean up empty parent directories.
-	watcher.CleanEmptyParents(op, g.bucketPath(bucket), g.ignorePatterns, g.logger)
+	// Only a regular file is an object. Deleting a missing key is a success no-op
+	// in S3, and a key that resolves to a directory must not be removed via the
+	// object API (os.Remove on a non-empty directory would otherwise return 500).
+	if info, err := os.Stat(op); err == nil && !info.IsDir() {
+		if rmErr := os.Remove(op); rmErr != nil && !os.IsNotExist(rmErr) {
+			g.logger.Error("delete object failed", "bucket", bucket, "key", key, "error", rmErr)
+			writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to delete object")
+			return
+		}
+		// Clean up empty parent directories.
+		watcher.CleanEmptyParents(op, bp, g.ignorePatterns, g.logger)
+		g.logger.Info("object deleted", "bucket", bucket, "key", key)
+	}
 
-	g.logger.Info("object deleted", "bucket", bucket, "key", key)
 	w.WriteHeader(http.StatusNoContent)
 }

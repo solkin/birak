@@ -13,14 +13,17 @@ import (
 
 // Config holds all daemon configuration.
 type Config struct {
-	NodeID     string          `yaml:"node_id"`
-	SyncDir    string          `yaml:"sync_dir"`
-	MetaDir    string          `yaml:"meta_dir"`
-	ListenAddr string          `yaml:"listen_addr"`
-	Peers      []string        `yaml:"peers"`
-	Ignore     []string        `yaml:"ignore"`
-	Sync       SyncConfig      `yaml:"sync"`
-	Gateways   GatewaysConfig  `yaml:"gateways"`
+	NodeID     string   `yaml:"node_id"`
+	SyncDir    string   `yaml:"sync_dir"`
+	MetaDir    string   `yaml:"meta_dir"`
+	ListenAddr string   `yaml:"listen_addr"`
+	Peers      []string `yaml:"peers"`
+	Ignore     []string `yaml:"ignore"`
+	// MaxUploadBytes caps the size of a single uploaded object/file across all
+	// gateways (S3, WebDAV, HTTP UI, SFTP). 0 means unlimited.
+	MaxUploadBytes int64          `yaml:"max_upload_bytes"`
+	Sync           SyncConfig     `yaml:"sync"`
+	Gateways       GatewaysConfig `yaml:"gateways"`
 }
 
 // GatewaysConfig holds configuration for all gateways.
@@ -33,10 +36,10 @@ type GatewaysConfig struct {
 
 // SFTPGatewayConfig holds configuration for the SFTP gateway.
 type SFTPGatewayConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	ListenAddr string `yaml:"listen_addr"`
-	Username   string `yaml:"username"`
-	Password   string `yaml:"password"`
+	Enabled     bool   `yaml:"enabled"`
+	ListenAddr  string `yaml:"listen_addr"`
+	Username    string `yaml:"username"`
+	Password    string `yaml:"password"`
 	HostKeyPath string `yaml:"host_key_path"`
 }
 
@@ -82,7 +85,7 @@ func DefaultConfig() Config {
 		SyncDir:    "./sync",
 		MetaDir:    "./meta",
 		ListenAddr: ":9100",
-		Ignore: []string{},
+		Ignore:     []string{},
 		Gateways: GatewaysConfig{
 			S3: S3GatewayConfig{
 				Enabled:    false,
@@ -105,9 +108,9 @@ func DefaultConfig() Config {
 			PollInterval:           3 * time.Second,
 			BatchLimit:             1000,
 			MaxConcurrentDownloads: 5,
-			TombstoneTTL:          168 * time.Hour, // 7 days
-			ScanInterval:          5 * time.Minute,
-			DebounceWindow:        300 * time.Millisecond,
+			TombstoneTTL:           168 * time.Hour, // 7 days
+			ScanInterval:           5 * time.Minute,
+			DebounceWindow:         300 * time.Millisecond,
 		},
 	}
 }
@@ -161,6 +164,11 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("BIRAK_IGNORE"); v != "" {
 		c.Ignore = strings.Split(v, ",")
+	}
+	if v := os.Getenv("BIRAK_MAX_UPLOAD_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
+			c.MaxUploadBytes = n
+		}
 	}
 
 	// Sync settings.
@@ -285,6 +293,9 @@ func (c *Config) validate() error {
 	if c.Sync.MaxConcurrentDownloads <= 0 {
 		return fmt.Errorf("sync.max_concurrent_downloads must be positive")
 	}
+	if c.MaxUploadBytes < 0 {
+		return fmt.Errorf("max_upload_bytes must not be negative")
+	}
 	for _, pattern := range c.Ignore {
 		if _, err := filepath.Match(pattern, "test"); err != nil {
 			return fmt.Errorf("invalid ignore pattern %q: %w", pattern, err)
@@ -303,4 +314,26 @@ func (c *Config) validate() error {
 		return fmt.Errorf("gateways.sftp.listen_addr is required when SFTP gateway is enabled")
 	}
 	return nil
+}
+
+// SecurityWarnings returns messages for enabled gateways that run without any
+// credentials configured. Such gateways accept unauthenticated access, which is
+// easy to enable by accident — e.g. a default container run — so the operator is
+// warned at startup rather than silently exposing the filesystem.
+func SecurityWarnings(c Config) []string {
+	var warnings []string
+	g := c.Gateways
+	if g.S3.Enabled && g.S3.AccessKey == "" && g.S3.SecretKey == "" {
+		warnings = append(warnings, "S3 gateway is enabled without access_key/secret_key; it accepts unauthenticated requests")
+	}
+	if g.WebDAV.Enabled && g.WebDAV.Username == "" && g.WebDAV.Password == "" {
+		warnings = append(warnings, "WebDAV gateway is enabled without username/password; it accepts unauthenticated requests")
+	}
+	if g.HTTP.Enabled && g.HTTP.Username == "" && g.HTTP.Password == "" {
+		warnings = append(warnings, "HTTP UI gateway is enabled without username/password; it accepts unauthenticated requests")
+	}
+	if g.SFTP.Enabled && g.SFTP.Username == "" && g.SFTP.Password == "" {
+		warnings = append(warnings, "SFTP gateway is enabled without username/password; it accepts unauthenticated connections")
+	}
+	return warnings
 }

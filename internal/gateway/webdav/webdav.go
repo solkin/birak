@@ -5,21 +5,31 @@ package webdav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/birak/birak/internal/gateway"
 )
 
+// Destination-header error sentinels, so MOVE/COPY can map a missing or malformed
+// Destination to 400 and a forbidden target to 403 (rather than a blanket 502).
+var (
+	errMissingDestination = errors.New("missing Destination header")
+	errBadDestination     = errors.New("invalid Destination header")
+)
+
 // Config holds WebDAV gateway configuration.
 type Config struct {
-	ListenAddr string `yaml:"listen_addr"`
-	Username   string `yaml:"username"`
-	Password   string `yaml:"password"`
+	ListenAddr     string `yaml:"listen_addr"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	MaxUploadBytes int64  // max body size for PUT; 0 = unlimited
 }
 
 // Gateway implements the WebDAV protocol over HTTP.
@@ -29,6 +39,7 @@ type Gateway struct {
 	config         Config
 	logger         *slog.Logger
 	server         *http.Server
+	locks          *lockManager
 }
 
 // New creates a new WebDAV Gateway.
@@ -38,6 +49,7 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 		ignorePatterns: ignorePatterns,
 		config:         cfg,
 		logger:         logger.With("gateway", "webdav"),
+		locks:          newLockManager(),
 	}
 
 	mux := http.NewServeMux()
@@ -45,6 +57,11 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 
 	g.server = &http.Server{
 		Handler: gateway.LogMiddleware(g.logger, mux),
+		// Bound header-read and idle-connection time to blunt Slowloris-style
+		// attacks. Read/Write timeouts are left unset so large file transfers are
+		// not cut off mid-stream.
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	return g
@@ -63,7 +80,9 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		g.server.Close()
+		// Drain in-flight requests rather than cutting connections abruptly; Stop
+		// bounds the overall drain time.
+		g.server.Shutdown(context.Background())
 	}()
 
 	if err := g.server.Serve(ln); err != http.ErrServerClosed {
@@ -125,17 +144,28 @@ func (g *Gateway) resolvePath(urlPath string) (relName string, fullPath string, 
 	return gateway.SafePath(g.syncDir, urlPath, g.ignorePatterns)
 }
 
+// lockBlocked reports whether a mutating request on relPath must be refused
+// because a live lock covers it and the request's If header lacks the lock token.
+// It writes a 423 Locked response when it returns true.
+func (g *Gateway) lockBlocked(w http.ResponseWriter, r *http.Request, relPath string) bool {
+	if !g.locks.canModify(relPath, r.Header.Get("If")) {
+		http.Error(w, "Locked", http.StatusLocked)
+		return true
+	}
+	return false
+}
+
 // resolveDestination extracts and validates the Destination header used by
 // MOVE and COPY methods.
 func (g *Gateway) resolveDestination(r *http.Request) (string, string, error) {
 	dest := r.Header.Get("Destination")
 	if dest == "" {
-		return "", "", fmt.Errorf("missing Destination header")
+		return "", "", errMissingDestination
 	}
 
 	u, err := url.Parse(dest)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid Destination URL: %w", err)
+		return "", "", errBadDestination
 	}
 
 	return g.resolvePath(u.Path)

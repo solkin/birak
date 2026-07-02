@@ -3,9 +3,12 @@ package gateway
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -22,6 +25,27 @@ type Gateway interface {
 
 	// Name returns the protocol name (e.g. "s3", "ftp", "webdav").
 	Name() string
+}
+
+// SweepTempFiles removes stale atomic-write scratch files (".birak-tmp-*" and
+// ".birak-bak-*") left under rootDir by a previous process that died between
+// creating a temp file and renaming it into place. It is safe to call once at
+// startup, when no uploads are in flight.
+func SweepTempFiles(rootDir string, logger *slog.Logger) {
+	filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if strings.HasPrefix(name, ".birak-tmp-") || strings.HasPrefix(name, ".birak-bak-") {
+			if rmErr := os.Remove(path); rmErr != nil {
+				logger.Warn("failed to remove stale temp file", "path", path, "error", rmErr)
+			} else {
+				logger.Info("removed stale temp file", "path", path)
+			}
+		}
+		return nil
+	})
 }
 
 // SafePath validates reqPath and returns the cleaned relative path and full
@@ -54,7 +78,45 @@ func SafePath(rootDir, reqPath string, ignorePatterns []string) (relPath string,
 		return "", "", fmt.Errorf("path traversal")
 	}
 
+	if err := verifyNoSymlinkEscape(rootDir, full); err != nil {
+		return "", "", err
+	}
+
 	return cleaned, full, nil
+}
+
+// verifyNoSymlinkEscape ensures that, after resolving symlinks, full still lies
+// within rootDir. full need not exist yet: the nearest existing ancestor is
+// resolved and the remaining (not-yet-created) components are re-appended. This
+// closes symlink-based escapes that the textual check above cannot detect.
+func verifyNoSymlinkEscape(rootDir, full string) error {
+	realRoot, err := filepath.EvalSymlinks(rootDir)
+	if err != nil {
+		// rootDir normally exists; if it cannot be resolved, rely on the textual
+		// check already performed by the caller.
+		return nil
+	}
+
+	cur := full
+	rest := ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			if rest != "" {
+				resolved = filepath.Join(resolved, rest)
+			}
+			if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
+				return fmt.Errorf("path traversal")
+			}
+			return nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// Reached the filesystem root without resolving; the textual check stands.
+			return nil
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
 }
 
 // CheckBasicAuth validates HTTP Basic Auth credentials.
@@ -67,7 +129,9 @@ func CheckBasicAuth(r *http.Request, username, password string) bool {
 	if !ok {
 		return false
 	}
-	return user == username && pass == password
+	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(username))
+	passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(password))
+	return userOK&passOK == 1
 }
 
 // ResponseLogger wraps http.ResponseWriter to capture status code and body size.

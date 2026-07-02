@@ -17,13 +17,20 @@ import (
 
 func newTestGateway(t *testing.T, username, password string) (*Gateway, string) {
 	t.Helper()
+	return newTestGatewayWithConfig(t, Config{
+		Username: username,
+		Password: password,
+	})
+}
+
+func newTestGatewayWithConfig(t *testing.T, cfg Config) (*Gateway, string) {
+	t.Helper()
 	dir := t.TempDir()
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = ":0"
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	g := New(dir, []string{".DS_Store", ".birak-tmp-*"}, Config{
-		ListenAddr: ":0",
-		Username:   username,
-		Password:   password,
-	}, logger)
+	g := New(dir, []string{".DS_Store", ".birak-tmp-*"}, cfg, logger)
 	return g, dir
 }
 
@@ -87,6 +94,43 @@ func TestAuthDisabled(t *testing.T) {
 	}
 }
 
+// --- CSRF tests ---
+
+func TestCSRF_CrossOriginPostRejected(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+
+	// A cross-origin POST must be rejected before touching the filesystem.
+	w := serve(g, http.MethodPost, "/_api/mkdir", jsonBody(map[string]string{"path": "evil"}),
+		func(r *http.Request) { r.Header.Set("Origin", "http://attacker.example") })
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin POST, got %d", w.Code)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "evil")); !os.IsNotExist(err) {
+		t.Fatal("cross-origin request must not create the directory")
+	}
+}
+
+func TestCSRF_SameOriginPostAllowed(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+
+	w := serve(g, http.MethodPost, "/_api/mkdir", jsonBody(map[string]string{"path": "ok"}),
+		func(r *http.Request) { r.Header.Set("Origin", "http://"+r.Host) })
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for same-origin POST, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCSRF_NoOriginHeaderAllowed(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+
+	// Non-browser API clients send no Origin/Referer and carry no ambient
+	// credentials, so they are not a CSRF vector and must still work.
+	w := serve(g, http.MethodPost, "/_api/mkdir", jsonBody(map[string]string{"path": "api"}), noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for header-less POST, got %d", w.Code)
+	}
+}
+
 // --- Page tests ---
 
 func TestServesHTMLPage(t *testing.T) {
@@ -101,6 +145,50 @@ func TestServesHTMLPage(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "Birak") {
 		t.Fatal("expected HTML to contain 'Birak'")
+	}
+}
+
+func TestSecurityHeadersAndNonce(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+
+	w := serve(g, http.MethodGet, "/", nil, noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("expected nosniff, got %q", got)
+	}
+	if got := w.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Fatalf("expected X-Frame-Options DENY, got %q", got)
+	}
+	if got := w.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("expected Referrer-Policy no-referrer, got %q", got)
+	}
+
+	csp := w.Header().Get("Content-Security-Policy")
+	const marker = "script-src 'nonce-"
+	i := strings.Index(csp, marker)
+	if i < 0 {
+		t.Fatalf("expected script-src nonce in CSP, got %q", csp)
+	}
+	nonce := csp[i+len(marker):]
+	nonce = nonce[:strings.IndexByte(nonce, '\'')]
+	if nonce == "" {
+		t.Fatal("empty CSP nonce")
+	}
+
+	body := w.Body.String()
+	if strings.Contains(body, noncePlaceholder) {
+		t.Fatal("served page still contains the unsubstituted nonce placeholder")
+	}
+	if !strings.Contains(body, `<script nonce="`+nonce+`">`) {
+		t.Fatalf("served page script tag does not carry the CSP nonce %q", nonce)
+	}
+
+	// The nonce must be fresh per request, otherwise it provides no protection.
+	csp2 := serve(g, http.MethodGet, "/", nil, noAuth()).Header().Get("Content-Security-Policy")
+	if csp2 == csp {
+		t.Fatal("CSP nonce should be unique per request")
 	}
 }
 
@@ -427,6 +515,23 @@ func TestUploadIgnoredFileSkipped(t *testing.T) {
 	// File should NOT be created on disk.
 	if _, err := os.Stat(filepath.Join(dir, ".birak-tmp-test")); err == nil {
 		t.Fatal("ignored file should not be created")
+	}
+}
+
+func TestUploadMaxBytesLimit(t *testing.T) {
+	g, dir := newTestGatewayWithConfig(t, Config{MaxUploadBytes: 64})
+
+	body, ct := createMultipartUpload("", "large.txt", strings.Repeat("x", 1024))
+	req := httptest.NewRequest(http.MethodPost, "/_api/upload", body)
+	req.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for over-limit upload, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "large.txt")); !os.IsNotExist(err) {
+		t.Fatal("over-limit upload must not create the file")
 	}
 }
 
