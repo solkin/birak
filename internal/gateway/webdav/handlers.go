@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/watcher"
 )
 
@@ -83,6 +84,9 @@ func (g *Gateway) handlePropfind(w http.ResponseWriter, r *http.Request) {
 			for {
 				children, rerr := f.ReadDir(512)
 				for _, child := range children {
+					if gateway.IsReservedPath(g.syncDir, filepath.Join(fullPath, child.Name())) {
+						continue
+					}
 					childRel := child.Name()
 					if relName != "" {
 						childRel = relName + "/" + childRel

@@ -21,9 +21,35 @@ type Config struct {
 	Ignore     []string `yaml:"ignore"`
 	// MaxUploadBytes caps the size of a single uploaded object/file across all
 	// gateways (S3, WebDAV, HTTP UI, SFTP). 0 means unlimited.
-	MaxUploadBytes int64          `yaml:"max_upload_bytes"`
-	Sync           SyncConfig     `yaml:"sync"`
-	Gateways       GatewaysConfig `yaml:"gateways"`
+	MaxUploadBytes int64           `yaml:"max_upload_bytes"`
+	Multipart      MultipartConfig `yaml:"multipart"`
+	Sync           SyncConfig      `yaml:"sync"`
+	Gateways       GatewaysConfig  `yaml:"gateways"`
+}
+
+// MultipartConfig holds limits and retention settings for S3 multipart uploads.
+// Sizes are in bytes; durations use Go duration syntax ("24h", "30m").
+type MultipartConfig struct {
+	// MinPartBytes is the minimum size of every part but the last (S3: 5 MiB).
+	MinPartBytes int64 `yaml:"min_part_bytes"`
+	// MaxPartBytes is the maximum size of a single part (S3: 5 GiB).
+	MaxPartBytes int64 `yaml:"max_part_bytes"`
+	// MaxParts is the highest accepted part number (S3: 10000).
+	MaxParts int `yaml:"max_parts"`
+	// MaxActiveUploads caps simultaneously staged uploads; 0 means unlimited.
+	MaxActiveUploads int `yaml:"max_active_uploads"`
+	// MaxConcurrentPartUploads caps in-flight part uploads across all uploads;
+	// 0 means unlimited. Requests over the cap are rejected with SlowDown, which
+	// every S3 SDK retries with backoff.
+	MaxConcurrentPartUploads int `yaml:"max_concurrent_part_uploads"`
+	// UploadTTL is how long an untouched incomplete upload is kept before the
+	// janitor discards it.
+	UploadTTL time.Duration `yaml:"upload_ttl"`
+	// CleanupInterval is how often the janitor sweeps.
+	CleanupInterval time.Duration `yaml:"cleanup_interval"`
+	// TempFileMaxAge is how old an orphaned atomic-write scratch file must be
+	// before a running server removes it.
+	TempFileMaxAge time.Duration `yaml:"temp_file_max_age"`
 }
 
 // GatewaysConfig holds configuration for all gateways.
@@ -264,6 +290,44 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("BIRAK_SFTP_HOST_KEY_PATH"); v != "" {
 		c.Gateways.SFTP.HostKeyPath = v
 	}
+
+	envInt64Map := map[string]*int64{
+		"BIRAK_MULTIPART_MIN_PART_BYTES": &c.Multipart.MinPartBytes,
+		"BIRAK_MULTIPART_MAX_PART_BYTES": &c.Multipart.MaxPartBytes,
+	}
+	for env, ptr := range envInt64Map {
+		if v := os.Getenv(env); v != "" {
+			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
+				*ptr = n
+			}
+		}
+	}
+
+	envIntMap := map[string]*int{
+		"BIRAK_MULTIPART_MAX_PARTS":                   &c.Multipart.MaxParts,
+		"BIRAK_MULTIPART_MAX_ACTIVE_UPLOADS":          &c.Multipart.MaxActiveUploads,
+		"BIRAK_MULTIPART_MAX_CONCURRENT_PART_UPLOADS": &c.Multipart.MaxConcurrentPartUploads,
+	}
+	for env, ptr := range envIntMap {
+		if v := os.Getenv(env); v != "" {
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+				*ptr = n
+			}
+		}
+	}
+
+	envDurationMap := map[string]*time.Duration{
+		"BIRAK_MULTIPART_UPLOAD_TTL":        &c.Multipart.UploadTTL,
+		"BIRAK_MULTIPART_CLEANUP_INTERVAL":  &c.Multipart.CleanupInterval,
+		"BIRAK_MULTIPART_TEMP_FILE_MAX_AGE": &c.Multipart.TempFileMaxAge,
+	}
+	for env, ptr := range envDurationMap {
+		if v := os.Getenv(env); v != "" {
+			if d, err := time.ParseDuration(strings.TrimSpace(v)); err == nil && d > 0 {
+				*ptr = d
+			}
+		}
+	}
 }
 
 func parseBool(s string) bool {
@@ -312,6 +376,24 @@ func (c *Config) validate() error {
 	}
 	if c.Gateways.SFTP.Enabled && c.Gateways.SFTP.ListenAddr == "" {
 		return fmt.Errorf("gateways.sftp.listen_addr is required when SFTP gateway is enabled")
+	}
+	m := c.Multipart
+	if m.MinPartBytes < 0 || m.MaxPartBytes < 0 {
+		return fmt.Errorf("multipart part size limits must not be negative")
+	}
+	// A minimum above the maximum would reject every multi-part upload with a
+	// contradictory pair of errors, so refuse it at startup instead.
+	if m.MinPartBytes > 0 && m.MaxPartBytes > 0 && m.MinPartBytes > m.MaxPartBytes {
+		return fmt.Errorf("multipart.min_part_bytes must not exceed multipart.max_part_bytes")
+	}
+	if m.MaxParts < 0 {
+		return fmt.Errorf("multipart.max_parts must not be negative")
+	}
+	if m.MaxActiveUploads < 0 || m.MaxConcurrentPartUploads < 0 {
+		return fmt.Errorf("multipart upload count limits must not be negative")
+	}
+	if m.UploadTTL < 0 || m.CleanupInterval < 0 || m.TempFileMaxAge < 0 {
+		return fmt.Errorf("multipart durations must not be negative")
 	}
 	return nil
 }

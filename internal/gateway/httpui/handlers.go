@@ -80,7 +80,8 @@ func (g *Gateway) handleList(w http.ResponseWriter, r *http.Request) {
 	// os.ReadDir returns entries sorted by name within each category.
 	var dirs, files []os.DirEntry
 	for _, e := range rawEntries {
-		if watcher.ShouldIgnore(e.Name(), g.ignorePatterns) {
+		if watcher.ShouldIgnore(e.Name(), g.ignorePatterns) ||
+			gateway.IsReservedPath(g.syncDir, filepath.Join(fullPath, e.Name())) {
 			continue
 		}
 		if e.IsDir() {

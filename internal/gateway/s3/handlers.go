@@ -123,6 +123,9 @@ type CommonPrefix struct {
 // s3TimeFormat is the time format used by S3 (ISO 8601 with milliseconds, always UTC).
 const s3TimeFormat = "2006-01-02T15:04:05.000Z"
 
+// s3Xmlns is the namespace every S3 response document carries.
+const s3Xmlns = "http://s3.amazonaws.com/doc/2006-03-01/"
+
 // --- Helpers ---
 
 // writeS3Error writes an S3-formatted XML error response.
@@ -176,6 +179,11 @@ func validateBucketName(name string) bool {
 		return false
 	}
 	if strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return false
+	}
+	// The reserved state directory is not a bucket; refusing the name here keeps a
+	// client from creating, listing, or deleting it through the bucket API.
+	if gateway.IsReserved(name) {
 		return false
 	}
 	return true
@@ -252,7 +260,7 @@ func (g *Gateway) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 
 	var buckets []BucketInfo
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || gateway.IsReserved(entry.Name()) {
 			continue
 		}
 		if watcher.ShouldIgnore(entry.Name(), g.ignorePatterns) {
@@ -269,7 +277,7 @@ func (g *Gateway) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := ListAllMyBucketsResult{
-		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
+		Xmlns: s3Xmlns,
 		Owner: Owner{ID: "birak", DisplayName: "birak"},
 		Buckets: Buckets{
 			Bucket: buckets,
@@ -370,6 +378,15 @@ func (g *Gateway) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 		}
 	}
 
+	// Staged parts live outside the bucket directory, so an in-progress upload
+	// leaves the bucket looking empty. Deleting it would strand those parts and
+	// break the client's pending completion.
+	if g.multipart != nil && g.multipart.HasUploads(bucket) {
+		writeS3Error(w, http.StatusConflict, "BucketNotEmpty",
+			"The bucket you tried to delete has in-progress multipart uploads.")
+		return
+	}
+
 	// Remove ignored files before removing the directory.
 	for _, e := range entries {
 		os.Remove(filepath.Join(bp, e.Name()))
@@ -404,7 +421,7 @@ func (g *Gateway) handleGetBucketLocation(w http.ResponseWriter, r *http.Request
 		return
 	}
 	result := LocationConstraint{
-		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
+		Xmlns: s3Xmlns,
 	}
 	g.logger.Debug("get bucket location", "bucket", bucket)
 	writeXML(w, http.StatusOK, result)
@@ -427,7 +444,7 @@ func (g *Gateway) handleGetBucketVersioning(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	result := VersioningConfiguration{
-		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
+		Xmlns: s3Xmlns,
 	}
 	g.logger.Debug("get bucket versioning", "bucket", bucket)
 	writeXML(w, http.StatusOK, result)
@@ -641,7 +658,7 @@ func (g *Gateway) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	result := ListBucketResultV1{
-		Xmlns:          "http://s3.amazonaws.com/doc/2006-03-01/",
+		Xmlns:          s3Xmlns,
 		Name:           bucket,
 		Prefix:         prefix,
 		Marker:         marker,
@@ -697,7 +714,7 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	result := ListBucketResultV2{
-		Xmlns:                 "http://s3.amazonaws.com/doc/2006-03-01/",
+		Xmlns:                 s3Xmlns,
 		Name:                  bucket,
 		Prefix:                prefix,
 		Delimiter:             delimiter,

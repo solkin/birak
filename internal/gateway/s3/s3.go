@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/birak/birak/internal/gateway"
+	"github.com/birak/birak/internal/multipart"
 	"github.com/birak/birak/internal/watcher"
 )
 
@@ -22,6 +23,10 @@ type Config struct {
 	SecretKey      string `yaml:"secret_key"`
 	Domain         string `yaml:"domain"`
 	MaxUploadBytes int64  // max object size for PutObject; 0 = unlimited
+	// Multipart is the staging store backing the multipart upload API. When nil,
+	// multipart operations answer NotImplemented and the rest of the gateway is
+	// unaffected.
+	Multipart *multipart.Store
 }
 
 // Gateway implements the S3-compatible API.
@@ -31,6 +36,7 @@ type Gateway struct {
 	config         Config
 	logger         *slog.Logger
 	server         *http.Server
+	multipart      *multipart.Store
 }
 
 // New creates a new S3 Gateway.
@@ -40,6 +46,7 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 		ignorePatterns: ignorePatterns,
 		config:         cfg,
 		logger:         logger.With("gateway", "s3"),
+		multipart:      cfg.Multipart,
 	}
 
 	mux := http.NewServeMux()
@@ -173,6 +180,10 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 	if key == "" {
 		// Check for sub-resource queries before bucket-level operations.
 		query := r.URL.Query()
+		if _, ok := query["uploads"]; ok && r.Method == http.MethodGet {
+			g.handleListMultipartUploads(w, r, bucket)
+			return
+		}
 		if _, ok := query["location"]; ok && r.Method == http.MethodGet {
 			g.handleGetBucketLocation(w, r, bucket)
 			return
@@ -213,6 +224,30 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 	// Check ignore patterns on key.
 	if watcher.ShouldIgnore(key, g.ignorePatterns) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
+		return
+	}
+
+	// Multipart operations are selected by query parameters on the object URL:
+	// ?uploads starts one, and ?uploadId=... addresses an existing one.
+	query := r.URL.Query()
+	_, initiating := query["uploads"]
+	uploadID := query.Get("uploadId")
+
+	switch {
+	case initiating && r.Method == http.MethodPost:
+		g.handleCreateMultipartUpload(w, r, bucket, key)
+		return
+	case uploadID != "" && r.Method == http.MethodPut:
+		g.handleUploadPart(w, r, bucket, key, uploadID)
+		return
+	case uploadID != "" && r.Method == http.MethodPost:
+		g.handleCompleteMultipartUpload(w, r, bucket, key, uploadID)
+		return
+	case uploadID != "" && r.Method == http.MethodDelete:
+		g.handleAbortMultipartUpload(w, r, bucket, key, uploadID)
+		return
+	case uploadID != "" && r.Method == http.MethodGet:
+		g.handleListParts(w, r, bucket, key, uploadID)
 		return
 	}
 

@@ -19,6 +19,7 @@ import (
 	s3gw "github.com/birak/birak/internal/gateway/s3"
 	sftpgw "github.com/birak/birak/internal/gateway/sftp"
 	webdavgw "github.com/birak/birak/internal/gateway/webdav"
+	"github.com/birak/birak/internal/multipart"
 	"github.com/birak/birak/internal/server"
 	"github.com/birak/birak/internal/store"
 	"github.com/birak/birak/internal/syncer"
@@ -184,7 +185,23 @@ func run(configPath string) error {
 
 	// S3 Gateway (if enabled).
 	var s3Gateway *s3gw.Gateway
+	var multipartStore *multipart.Store
 	if cfg.Gateways.S3.Enabled {
+		multipartStore, err = multipart.New(cfg.SyncDir, multipart.Limits{
+			MinPartBytes:       cfg.Multipart.MinPartBytes,
+			MaxPartBytes:       cfg.Multipart.MaxPartBytes,
+			MaxParts:           cfg.Multipart.MaxParts,
+			MaxObjectBytes:     cfg.MaxUploadBytes,
+			MaxActiveUploads:   cfg.Multipart.MaxActiveUploads,
+			MaxConcurrentParts: cfg.Multipart.MaxConcurrentPartUploads,
+			UploadTTL:          cfg.Multipart.UploadTTL,
+			CleanupInterval:    cfg.Multipart.CleanupInterval,
+			TempFileMaxAge:     cfg.Multipart.TempFileMaxAge,
+		}, logger)
+		if err != nil {
+			return fmt.Errorf("multipart store init: %w", err)
+		}
+
 		s3Gateway = s3gw.New(
 			cfg.SyncDir,
 			cfg.Ignore,
@@ -194,6 +211,7 @@ func run(configPath string) error {
 				SecretKey:      cfg.Gateways.S3.SecretKey,
 				Domain:         cfg.Gateways.S3.Domain,
 				MaxUploadBytes: cfg.MaxUploadBytes,
+				Multipart:      multipartStore,
 			},
 			logger,
 		)
@@ -204,6 +222,12 @@ func run(configPath string) error {
 				logger.Error("S3 gateway error", "error", err)
 				cancel()
 			}
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			multipart.NewJanitor(multipartStore, logger).Run(ctx)
 		}()
 	}
 

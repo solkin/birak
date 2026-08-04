@@ -83,7 +83,7 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 		scanInterval:      scanInterval,
 		ignorePatterns:    ignorePatterns,
 		recentlySynced:    make(map[string]string),
-		onChange:           onChange,
+		onChange:          onChange,
 		ready:             make(chan struct{}),
 	}
 }
@@ -756,6 +756,15 @@ func isOutsideSyncDir(relPath string) bool {
 // user-provided patterns to prevent syncing temporary files created during
 // atomic writes.
 func ShouldIgnore(relPath string, patterns []string) bool {
+	// Birak's private state directory contains staged multipart uploads and must
+	// never be indexed or replicated as user data.
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+	for _, part := range parts {
+		if part == ".birak" {
+			return true
+		}
+	}
+
 	// Check the basename of the file.
 	base := filepath.Base(relPath)
 	if matched, _ := filepath.Match(".birak-tmp-*", base); matched {
@@ -767,7 +776,6 @@ func ShouldIgnore(relPath string, patterns []string) bool {
 		}
 	}
 	// Also check each parent directory segment.
-	parts := strings.Split(filepath.ToSlash(relPath), "/")
 	for _, part := range parts[:len(parts)-1] {
 		for _, pattern := range patterns {
 			if matched, _ := filepath.Match(pattern, part); matched {

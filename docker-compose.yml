@@ -47,5 +47,14 @@ services:
       # Peer-sync HTTP API — publish only when forming a multi-node cluster:
       # - "9100:9100"
 
+    networks:
+      - reverseproxy
+
 volumes:
   birak-meta:
+
+networks:
+  # Pre-existing network shared with the nginx reverse proxy.
+  # Create it once if missing: docker network create reverseproxy
+  reverseproxy:
+    external: true

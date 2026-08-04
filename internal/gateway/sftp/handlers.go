@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/watcher"
 
 	"golang.org/x/crypto/ssh"
@@ -302,7 +303,8 @@ func (s *session) handleReaddir(payload []byte) {
 	var body []byte
 	count := 0
 	for _, e := range batch {
-		if watcher.ShouldIgnore(e.Name(), s.g.ignorePatterns) {
+		if watcher.ShouldIgnore(e.Name(), s.g.ignorePatterns) ||
+			gateway.IsReservedPath(s.g.syncDir, filepath.Join(entry.path, e.Name())) {
 			continue
 		}
 		fi, err := e.Info()
