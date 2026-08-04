@@ -298,7 +298,8 @@ object is replicated.
 
 - Each part is streamed to a scratch file, hashed, and published with an atomic
   rename. Retrying the same part number safely replaces it.
-- `Content-MD5` is enforced when present, and the part response `ETag` is its MD5.
+- `Content-MD5` and a concrete `x-amz-content-sha256` are enforced when present,
+  and the part response `ETag` is its MD5.
 - Completion requires strictly ascending parts, matching ETags, and the configured
   minimum size for every part except the last.
 - Assembly re-hashes every part and checks final size before publishing the object
