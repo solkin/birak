@@ -759,10 +759,8 @@ func ShouldIgnore(relPath string, patterns []string) bool {
 	// Birak's private state directory contains staged multipart uploads and must
 	// never be indexed or replicated as user data.
 	parts := strings.Split(filepath.ToSlash(relPath), "/")
-	for _, part := range parts {
-		if part == ".birak" {
-			return true
-		}
+	if len(parts) > 0 && parts[0] == ".birak" {
+		return true
 	}
 
 	// Check the basename of the file.

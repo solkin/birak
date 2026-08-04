@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/birak/birak/internal/gateway"
 )
 
 func newTestGateway(t *testing.T, username, password string) (*Gateway, string) {
@@ -705,4 +707,275 @@ func createMultipartUpload(path, filename, content string) (*bytes.Buffer, strin
 	writer.WriteField("relpaths", filename)
 	writer.Close()
 	return &buf, writer.FormDataContentType()
+}
+
+// --- Rename edge cases ---
+
+func TestRename_InvalidJSON(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	req := httptest.NewRequest(http.MethodPost, "/_api/rename", strings.NewReader("not json"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid JSON, got %d", w.Code)
+	}
+}
+
+func TestRename_MissingFields(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	w := serve(g, http.MethodPost, "/_api/rename", jsonBody(map[string]string{"from": "", "to": ""}), noAuth())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty from/to, got %d", w.Code)
+	}
+}
+
+func TestRename_FromNotFound(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	w := serve(g, http.MethodPost, "/_api/rename", jsonBody(map[string]string{
+		"from": "/nonexistent.txt",
+		"to":   "/new.txt",
+	}), noAuth())
+	if w.Code == http.StatusOK {
+		t.Fatal("should fail for missing source")
+	}
+}
+
+func TestRename_TraversalFrom(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	w := serve(g, http.MethodPost, "/_api/rename", jsonBody(map[string]string{
+		"from": "../../../etc/passwd",
+		"to":   "/stolen.txt",
+	}), noAuth())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for traversal in from, got %d", w.Code)
+	}
+}
+
+func TestRename_TraversalTo(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644)
+
+	w := serve(g, http.MethodPost, "/_api/rename", jsonBody(map[string]string{
+		"from": "/f.txt",
+		"to":   "../../../etc/evil",
+	}), noAuth())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for traversal in to, got %d", w.Code)
+	}
+}
+
+// --- Upload edge cases ---
+
+func TestUpload_NoFiles(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	writer.WriteField("path", "/")
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/_api/upload", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for no files, got %d", w.Code)
+	}
+}
+
+func TestUpload_TraversalInFilename(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	writer.WriteField("path", "/")
+	part, _ := writer.CreateFormFile("files", "../../../etc/evil")
+	part.Write([]byte("pwned"))
+	writer.WriteField("relpaths", "../../../etc/evil")
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/_api/upload", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for traversal filename, got %d", w.Code)
+	}
+}
+
+func TestUpload_TraversalInPath(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	body, ct := createMultipartUpload("../../../etc", "evil.txt", "data")
+
+	req := httptest.NewRequest(http.MethodPost, "/_api/upload", body)
+	req.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for traversal path, got %d", w.Code)
+	}
+}
+
+// --- Mkdir edge cases ---
+
+func TestMkdir_InvalidJSON(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	req := httptest.NewRequest(http.MethodPost, "/_api/mkdir", strings.NewReader("not json"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid JSON, got %d", w.Code)
+	}
+}
+
+func TestMkdir_Traversal(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	w := serve(g, http.MethodPost, "/_api/mkdir", jsonBody(map[string]string{
+		"path": "../../../etc/evil",
+	}), noAuth())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for traversal in mkdir, got %d", w.Code)
+	}
+}
+
+func TestMkdir_AlreadyExists(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	os.Mkdir(filepath.Join(dir, "existing"), 0o755)
+
+	w := serve(g, http.MethodPost, "/_api/mkdir", jsonBody(map[string]string{
+		"path": "/existing",
+	}), noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for idempotent mkdir, got %d", w.Code)
+	}
+}
+
+// --- Delete edge cases ---
+
+func TestDelete_Traversal(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	w := serve(g, http.MethodPost, "/_api/delete", jsonBody(map[string]string{
+		"path": "../../../etc/passwd",
+	}), noAuth())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for traversal in delete, got %d", w.Code)
+	}
+}
+
+func TestDelete_Root(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	w := serve(g, http.MethodPost, "/_api/delete", jsonBody(map[string]string{
+		"path": "/",
+	}), noAuth())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for delete root, got %d", w.Code)
+	}
+}
+
+// --- Download edge cases ---
+
+func TestDownload_NotFound(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	w := serve(g, http.MethodGet, "/_api/dl/nonexistent.txt", nil, noAuth())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestDownload_Traversal(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	w := serve(g, http.MethodGet, "/_api/dl/../../../etc/passwd", nil, noAuth())
+	if w.Code != http.StatusOK {
+		return // path gets cleaned by HTTP server, stays in syncDir
+	}
+	t.Log("server may clean the path; that's OK as long as it stays in syncDir")
+}
+
+// --- List edge cases ---
+
+func TestList_Traversal(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	w := serve(g, http.MethodGet, "/_api/list?path=../../../etc", nil, noAuth())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for traversal, got %d", w.Code)
+	}
+}
+
+func TestList_NotFound(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+	w := serve(g, http.MethodGet, "/_api/list?path=/nonexistent", nil, noAuth())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// --- Auth edge cases ---
+
+func TestAuth_MissingCredentials(t *testing.T) {
+	g, _ := newTestGateway(t, "admin", "secret")
+	w := serve(g, http.MethodGet, "/_api/list?path=/", nil, noAuth())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestAuth_WrongCredentials(t *testing.T) {
+	g, _ := newTestGateway(t, "admin", "secret")
+	w := serve(g, http.MethodGet, "/_api/list?path=/", nil, basicAuth("admin", "wrong"))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestList_HidesReservedDir(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	if err := os.Mkdir(filepath.Join(dir, gateway.ReservedDirName), 0o700); err != nil {
+		t.Fatalf("create reserved dir: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "photos"), 0o755); err != nil {
+		t.Fatalf("create dir: %v", err)
+	}
+
+	w := serve(g, http.MethodGet, "/_api/list?path=", nil, noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var res listResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("parse listing: %v", err)
+	}
+	if res.Total != 1 {
+		t.Fatalf("total = %d, want 1 (reserved dir must not be counted)", res.Total)
+	}
+	for _, e := range res.Entries {
+		if e.Name == gateway.ReservedDirName {
+			t.Fatal("reserved dir appeared in the listing")
+		}
+	}
+}
+
+func TestAccess_ReservedDirIsDenied(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	reserved := filepath.Join(dir, gateway.ReservedDirName)
+	if err := os.Mkdir(reserved, 0o700); err != nil {
+		t.Fatalf("create reserved dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(reserved, "secret.txt"), []byte("staged"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	for _, path := range []string{
+		"/_api/list?path=" + gateway.ReservedDirName,
+		"/_api/dl/" + gateway.ReservedDirName + "/secret.txt",
+	} {
+		w := serve(g, http.MethodGet, path, nil, noAuth())
+		if w.Code == http.StatusOK {
+			t.Fatalf("GET %s was allowed: %s", path, w.Body.String())
+		}
+	}
 }

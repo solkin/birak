@@ -160,3 +160,20 @@ func TestCleanEmptyParents_GlobPattern(t *testing.T) {
 		t.Fatal("logs/ should have been removed (only *.log files)")
 	}
 }
+
+func TestShouldIgnore_ReservedStateDir(t *testing.T) {
+	for _, path := range []string{
+		".birak",
+		".birak/multipart",
+		".birak/multipart/upload-id/part-00001",
+	} {
+		if !ShouldIgnore(path, nil) {
+			t.Errorf("ShouldIgnore(%q) = false, want true", path)
+		}
+	}
+	for _, path := range []string{"photos/.birak/file", "photos/.birak-backup/file"} {
+		if ShouldIgnore(path, nil) {
+			t.Fatalf("a non-reserved path was ignored: %s", path)
+		}
+	}
+}
