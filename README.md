@@ -171,7 +171,7 @@ gateways:
     password: "secret123"
 ```
 
-The `ignore`, `multipart`, and `sync` sections are optional — defaults will be used if omitted. Internal state (`.birak/`) and temp files (`.birak-tmp-*`) are always ignored regardless of configuration.
+The `ignore`, `multipart`, and `sync` sections are optional — defaults will be used if omitted. Internal state (`.birak/`) and scratch files (`.birak-tmp-*`, `.birak-bak-*`) are always ignored regardless of configuration.
 
 ### Environment variables
 
@@ -303,7 +303,10 @@ object is replicated.
 - Completion requires strictly ascending parts, matching ETags, and the configured
   minimum size for every part except the last.
 - Assembly re-hashes every part and checks final size before publishing the object
-  with a single atomic rename.
+  with a single atomic rename in the destination directory, so it also works when
+  a bucket is a separate mount.
+- Atomic-write scratch files (`.birak-tmp-*`, `.birak-bak-*`) are never reported
+  by `ListObjects`.
 - The background janitor removes uploads untouched for `upload_ttl` and orphaned
   scratch files older than `temp_file_max_age`. A bucket with active uploads cannot
   be deleted.

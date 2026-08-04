@@ -524,6 +524,13 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string, maxKeys int) ([]O
 			return nil
 		}
 
+		// A scratch file is a write in flight, not an object: listing it would
+		// advertise a key that disappears the moment the write is renamed into
+		// place.
+		if gateway.IsScratchFile(fi.Name()) {
+			return nil
+		}
+
 		// Apply prefix filter.
 		if prefix != "" && !strings.HasPrefix(key, prefix) {
 			return nil

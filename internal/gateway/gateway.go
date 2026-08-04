@@ -55,6 +55,20 @@ func IsReservedPath(rootDir, fullPath string) bool {
 	return absPath == filepath.Join(absRoot, ReservedDirName)
 }
 
+// Prefixes of the scratch files every gateway writes while performing an atomic
+// write (create temp, fill, rename into place).
+const (
+	tempFilePrefix   = ".birak-tmp-"
+	backupFilePrefix = ".birak-bak-"
+)
+
+// IsScratchFile reports whether name is an atomic-write scratch file. Such a file
+// is an implementation detail of a write in flight — it is not an object and must
+// not be presented as one.
+func IsScratchFile(name string) bool {
+	return strings.HasPrefix(name, tempFilePrefix) || strings.HasPrefix(name, backupFilePrefix)
+}
+
 // SweepTempFiles removes stale atomic-write scratch files (".birak-tmp-*" and
 // ".birak-bak-*") left under rootDir by a process that died between creating a temp
 // file and renaming it into place.
@@ -69,8 +83,7 @@ func SweepTempFiles(rootDir string, maxAge time.Duration, logger *slog.Logger) {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		name := d.Name()
-		if !strings.HasPrefix(name, ".birak-tmp-") && !strings.HasPrefix(name, ".birak-bak-") {
+		if !IsScratchFile(d.Name()) {
 			return nil
 		}
 		if maxAge > 0 {

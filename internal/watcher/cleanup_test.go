@@ -177,3 +177,15 @@ func TestShouldIgnore_ReservedStateDir(t *testing.T) {
 		}
 	}
 }
+
+func TestShouldIgnore_ScratchFiles(t *testing.T) {
+	for _, path := range []string{
+		".birak-tmp-upload",
+		"bucket/.birak-tmp-upload",
+		"bucket/.birak-bak-rollback",
+	} {
+		if !ShouldIgnore(path, nil) {
+			t.Errorf("ShouldIgnore(%q) = false, want true", path)
+		}
+	}
+}
