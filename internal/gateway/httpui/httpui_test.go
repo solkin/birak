@@ -520,6 +520,22 @@ func TestUploadIgnoredFileSkipped(t *testing.T) {
 	}
 }
 
+func TestUploadScratchParentRejected(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	body, ct := createMultipartUpload("", "dir/.birak-bak-staged/file.txt", "data")
+	req := httptest.NewRequest(http.MethodPost, "/_api/upload", body)
+	req.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for reserved scratch path, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "dir", ".birak-bak-staged", "file.txt")); !os.IsNotExist(err) {
+		t.Fatal("upload created a file in the reserved scratch namespace")
+	}
+}
+
 func TestUploadMaxBytesLimit(t *testing.T) {
 	g, dir := newTestGatewayWithConfig(t, Config{MaxUploadBytes: 64})
 

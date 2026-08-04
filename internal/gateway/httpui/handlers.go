@@ -6,6 +6,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -232,8 +233,6 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// paths as separate "relpaths" form fields in the same order as "files".
 	relpaths := r.MultipartForm.Value["relpaths"]
 
-	absSync, _ := filepath.Abs(g.syncDir)
-
 	for i, fh := range files {
 		// Use relpath if provided, otherwise fall back to the base filename.
 		name := fh.Filename
@@ -253,9 +252,8 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		destPath := filepath.Join(dirFullPath, filepath.FromSlash(cleanName))
-		absDest, _ := filepath.Abs(destPath)
-		if !strings.HasPrefix(absDest, absSync+string(filepath.Separator)) {
+		destPath, err := g.resolvePath(path.Join(targetDir, cleanName))
+		if err != nil {
 			jsonError(w, http.StatusBadRequest, "invalid file name")
 			return
 		}

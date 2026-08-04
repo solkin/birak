@@ -165,6 +165,11 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 	// Split into bucket and key.
 	bucket, key, _ := strings.Cut(path, "/")
 
+	if gateway.IsScratchFile(bucket) {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
+
 	// Check ignore patterns on bucket name.
 	if watcher.ShouldIgnore(bucket, g.ignorePatterns) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -219,6 +224,13 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 			writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "Method not allowed")
 		}
 		return
+	}
+
+	for _, segment := range strings.Split(key, "/") {
+		if gateway.IsScratchFile(segment) {
+			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
+			return
+		}
 	}
 
 	// Check ignore patterns on key.

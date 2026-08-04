@@ -305,8 +305,9 @@ object is replicated.
 - Assembly re-hashes every part and checks final size before publishing the object
   with a single atomic rename in the destination directory, so it also works when
   a bucket is a separate mount.
-- Atomic-write scratch files (`.birak-tmp-*`, `.birak-bak-*`) are never reported
-  by `ListObjects`.
+- Atomic-write scratch files (`.birak-tmp-*`, `.birak-bak-*`) are a reserved
+  namespace: they are never reported by `ListObjects`, and no gateway accepts a
+  client path using one of those prefixes.
 - The background janitor removes uploads untouched for `upload_ttl` and orphaned
   scratch files older than `temp_file_max_age`. A bucket with active uploads cannot
   be deleted.
