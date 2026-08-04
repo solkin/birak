@@ -9,6 +9,7 @@ Birak is a distributed file server with built-in replication. Each node stores a
 ## Key Features
 
 - **Multi-protocol access** — S3 API, WebDAV, SFTP, HTTP file browser, or direct filesystem.
+- **S3 multipart uploads** — crash-safe, resumable parallel uploads with TTL cleanup and per-part checksums.
 - **Automatic replication** — nodes discover changes in real time and replicate them to all peers.
 - **Conflict resolution** — newest version wins, verified by SHA256 hash.
 - **No single point of failure** — every node is equal; any node can accept reads and writes.
@@ -131,6 +132,15 @@ ignore:
   - "Thumbs.db"
   - "*.swp"
 max_upload_bytes: 1073741824   # 1 GiB cap per upload; 0 = unlimited
+multipart:                    # S3 multipart upload limits and retention
+  min_part_bytes: 5242880     # 5 MiB — minimum size of every part but the last
+  max_part_bytes: 5368709120  # 5 GiB — maximum size of a single part
+  max_parts: 10000            # highest accepted part number
+  max_active_uploads: 10000   # simultaneously staged uploads; 0 = unlimited
+  max_concurrent_part_uploads: 0  # in-flight part uploads; 0 = unlimited
+  upload_ttl: 168h            # discard an untouched incomplete upload after this
+  cleanup_interval: 1h        # how often the janitor sweeps
+  temp_file_max_age: 24h      # age at which an orphaned scratch file is removed
 sync:
   poll_interval: 3s
   batch_limit: 1000
@@ -161,7 +171,7 @@ gateways:
     password: "secret123"
 ```
 
-The `ignore` and `sync` sections are optional — defaults will be used if omitted. Internal temp files (`.birak-tmp-*`) are always ignored regardless of configuration.
+The `ignore`, `multipart`, and `sync` sections are optional — defaults will be used if omitted. Internal state (`.birak/`) and temp files (`.birak-tmp-*`) are always ignored regardless of configuration.
 
 ### Environment variables
 
@@ -185,6 +195,14 @@ export BIRAK_HTTP_ENABLED=true
 | `peers` | `BIRAK_PEERS` | `[]` | Peer URLs (comma-separated in env) |
 | `ignore` | `BIRAK_IGNORE` | `[]` | Ignore patterns (comma-separated in env) |
 | `max_upload_bytes` | `BIRAK_MAX_UPLOAD_BYTES` | `0` | Max single-upload size in bytes across all gateways (0 = unlimited) |
+| `multipart.min_part_bytes` | `BIRAK_MULTIPART_MIN_PART_BYTES` | `5242880` | Minimum size of every multipart part but the last |
+| `multipart.max_part_bytes` | `BIRAK_MULTIPART_MAX_PART_BYTES` | `5368709120` | Maximum size of a single multipart part |
+| `multipart.max_parts` | `BIRAK_MULTIPART_MAX_PARTS` | `10000` | Highest accepted part number |
+| `multipart.max_active_uploads` | `BIRAK_MULTIPART_MAX_ACTIVE_UPLOADS` | `10000` | Simultaneously staged uploads; 0 = unlimited |
+| `multipart.max_concurrent_part_uploads` | `BIRAK_MULTIPART_MAX_CONCURRENT_PART_UPLOADS` | `0` | In-flight part uploads; 0 = unlimited |
+| `multipart.upload_ttl` | `BIRAK_MULTIPART_UPLOAD_TTL` | `168h` | Retention for untouched incomplete uploads |
+| `multipart.cleanup_interval` | `BIRAK_MULTIPART_CLEANUP_INTERVAL` | `1h` | Janitor sweep interval |
+| `multipart.temp_file_max_age` | `BIRAK_MULTIPART_TEMP_FILE_MAX_AGE` | `24h` | Age for orphaned atomic-write scratch cleanup |
 | `sync.poll_interval` | `BIRAK_SYNC_POLL_INTERVAL` | `3s` | Peer polling interval |
 | `sync.batch_limit` | `BIRAK_SYNC_BATCH_LIMIT` | `1000` | Max entries per sync request |
 | `sync.max_concurrent_downloads` | `BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS` | `5` | Concurrent downloads per peer |
@@ -243,6 +261,12 @@ S3-compatible API for use with AWS CLI, SDKs, and any S3 client.
 | `GetObject` | Download file (GET /{bucket}/{key}) |
 | `DeleteObject` | Delete file (DELETE /{bucket}/{key}) |
 | `HeadObject` | File metadata (HEAD /{bucket}/{key}) |
+| `CreateMultipartUpload` | Start multipart upload (POST /{bucket}/{key}?uploads) |
+| `UploadPart` | Upload a part (PUT /{bucket}/{key}?partNumber={n}&uploadId={id}) |
+| `CompleteMultipartUpload` | Assemble and publish an upload (POST /{bucket}/{key}?uploadId={id}) |
+| `AbortMultipartUpload` | Discard an upload (DELETE /{bucket}/{key}?uploadId={id}) |
+| `ListParts` | List staged parts (GET /{bucket}/{key}?uploadId={id}) |
+| `ListMultipartUploads` | List in-progress uploads (GET /{bucket}?uploads) |
 
 **Usage with AWS CLI:**
 
@@ -256,6 +280,37 @@ aws --endpoint-url http://localhost:9200 s3 ls s3://photos/
 aws --endpoint-url http://localhost:9200 s3 cp s3://photos/2024/image.jpg ./local.jpg
 aws --endpoint-url http://localhost:9200 s3 rm s3://photos/2024/image.jpg
 ```
+
+`sync_dir/.birak/` is reserved for Birak's own multipart staging state. It is
+hidden from every gateway and from replication, and cannot be read or written
+through any protocol.
+
+#### S3 Multipart Uploads
+
+The full multipart API is supported, so `aws s3 cp` of a large file, `aws s3api`,
+boto3, rclone, and S3 SDKs upload parallel chunks out of the box.
+
+Multipart upload state is stored on disk under
+`sync_dir/.birak/multipart/{uploadId}/`, so an interrupted process can resume,
+complete, or abort an upload after restart. Staged parts are never visible as
+objects or replicated to peer nodes; only the atomically published completed
+object is replicated.
+
+- Each part is streamed to a scratch file, hashed, and published with an atomic
+  rename. Retrying the same part number safely replaces it.
+- `Content-MD5` is enforced when present, and the part response `ETag` is its MD5.
+- Completion requires strictly ascending parts, matching ETags, and the configured
+  minimum size for every part except the last.
+- Assembly re-hashes every part and checks final size before publishing the object
+  with a single atomic rename.
+- The background janitor removes uploads untouched for `upload_ttl` and orphaned
+  scratch files older than `temp_file_max_age`. A bucket with active uploads cannot
+  be deleted.
+
+`CompleteMultipartUpload` returns the standard composite ETag (the MD5 of the
+concatenated part digests plus `-{partCount}`). Later `GET`/`HEAD`/`LIST` requests
+return Birak's normal SHA256 content ETag, so the values differ; standard S3 SDK
+upload and download paths do not depend on their equality.
 
 ### WebDAV Gateway
 
