@@ -64,7 +64,8 @@ func run(configPath string) error {
 	}
 
 	// Clear scratch files left by a previous crash before serving any requests.
-	gateway.SweepTempFiles(cfg.SyncDir, logger)
+	// No upload can be in flight yet, so age is irrelevant here.
+	gateway.SweepTempFiles(cfg.SyncDir, 0, logger)
 
 	// Warn about enabled gateways running without credentials.
 	for _, warning := range config.SecurityWarnings(cfg) {

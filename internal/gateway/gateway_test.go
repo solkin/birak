@@ -233,7 +233,7 @@ func TestSweepTempFiles(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	SweepTempFiles(root, logger)
+	SweepTempFiles(root, 0, logger)
 
 	if _, err := os.Stat(keep); err != nil {
 		t.Errorf("regular file should survive: %v", err)
