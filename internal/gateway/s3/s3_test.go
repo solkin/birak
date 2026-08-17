@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,207 @@ func testGateway(t *testing.T, cfg Config) (*Gateway, string) {
 	ignorePatterns := []string{".DS_Store", "Thumbs.db", "desktop.ini", ".birak-tmp-*"}
 	g := New(syncDir, ignorePatterns, cfg, logger)
 	return g, syncDir
+}
+
+func TestGetObject_IndexHTMLServedWithoutRedirect(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	bp := filepath.Join(syncDir, "mybucket")
+	if err := os.Mkdir(bp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bp, "index.html"), []byte("<h1>ok</h1>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := serveRequest(g, http.MethodGet, "/mybucket/index.html", nil, noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; Location=%q body=%q", w.Code, w.Header().Get("Location"), w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "" {
+		t.Fatalf("expected no redirect Location header, got %q", loc)
+	}
+	if w.Body.String() != "<h1>ok</h1>" {
+		t.Fatalf("unexpected body: %q", w.Body.String())
+	}
+}
+
+func TestGetObject_OpenFailureAfterStat(t *testing.T) {
+	syncDir, err := os.MkdirTemp("/tmp", "birak-s3-*")
+	if err != nil {
+		t.Skipf("short temp dir unavailable: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(syncDir) })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := New(syncDir, nil, Config{}, logger)
+
+	bp := filepath.Join(syncDir, "mybucket")
+	if err := os.Mkdir(bp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	socketPath := filepath.Join(bp, "not-a-regular-file")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Skipf("unix sockets unsupported: %v", err)
+	}
+	defer ln.Close()
+
+	w := serveRequest(g, http.MethodGet, "/mybucket/not-a-regular-file", nil, noAuth())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for open failure, got %d: %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Content-Length") != "" {
+		t.Fatalf("error response must not keep object Content-Length, got %q", w.Header().Get("Content-Length"))
+	}
+}
+
+func TestListObjectsV2_PaginationReachesAllObjects(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	bp := filepath.Join(syncDir, "mybucket")
+	os.Mkdir(bp, 0o755)
+	const n = 7
+	for i := 0; i < n; i++ {
+		os.WriteFile(filepath.Join(bp, fmt.Sprintf("file%02d.txt", i)), []byte("x"), 0o644)
+	}
+
+	seen := make(map[string]bool)
+	token := ""
+	for page := 0; page < n+2; page++ {
+		url := "/mybucket?list-type=2&max-keys=2"
+		if token != "" {
+			url += "&continuation-token=" + token
+		}
+		w := serveRequest(g, http.MethodGet, url, nil, noAuth())
+		var result ListBucketResultV2
+		if err := xml.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(result.Contents) > 2 {
+			t.Fatalf("page returned %d objects, exceeds max-keys=2", len(result.Contents))
+		}
+		for _, o := range result.Contents {
+			if seen[o.Key] {
+				t.Fatalf("duplicate key across pages: %s", o.Key)
+			}
+			seen[o.Key] = true
+		}
+		if !result.IsTruncated {
+			break
+		}
+		if result.NextContinuationToken == "" {
+			t.Fatal("truncated page must return a continuation token")
+		}
+		token = result.NextContinuationToken
+	}
+
+	if len(seen) != n {
+		t.Fatalf("expected to page through all %d objects, got %d", n, len(seen))
+	}
+}
+
+func TestListObjectsV1_PaginationReachesAllObjects(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	bp := filepath.Join(syncDir, "mybucket")
+	os.Mkdir(bp, 0o755)
+	const n = 7
+	for i := 0; i < n; i++ {
+		os.WriteFile(filepath.Join(bp, fmt.Sprintf("file%02d.txt", i)), []byte("x"), 0o644)
+	}
+
+	seen := make(map[string]bool)
+	marker := ""
+	for page := 0; page < n+2; page++ {
+		url := "/mybucket?max-keys=3"
+		if marker != "" {
+			url += "&marker=" + marker
+		}
+		w := serveRequest(g, http.MethodGet, url, nil, noAuth())
+		var result ListBucketResultV1
+		if err := xml.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		for _, o := range result.Contents {
+			if seen[o.Key] {
+				t.Fatalf("duplicate key across pages: %s", o.Key)
+			}
+			seen[o.Key] = true
+		}
+		if !result.IsTruncated {
+			break
+		}
+		if result.NextMarker == "" {
+			t.Fatal("truncated page must return NextMarker")
+		}
+		marker = result.NextMarker
+	}
+
+	if len(seen) != n {
+		t.Fatalf("expected to page through all %d objects, got %d", n, len(seen))
+	}
+}
+
+func TestETag_ListMatchesHead(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	bp := filepath.Join(syncDir, "mybucket")
+	os.Mkdir(bp, 0o755)
+	os.WriteFile(filepath.Join(bp, "obj.txt"), []byte("hello world"), 0o644)
+
+	w := serveRequest(g, http.MethodGet, "/mybucket?list-type=2", nil, noAuth())
+	var result ListBucketResultV2
+	if err := xml.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(result.Contents) != 1 {
+		t.Fatalf("expected 1 object, got %d", len(result.Contents))
+	}
+	listETag := result.Contents[0].ETag
+	if listETag == "" {
+		t.Fatal("listing must report a non-empty ETag")
+	}
+
+	wHead := serveRequest(g, http.MethodHead, "/mybucket/obj.txt", nil, noAuth())
+	if headETag := wHead.Header().Get("ETag"); headETag != listETag {
+		t.Fatalf("ETag mismatch: LIST=%q HEAD=%q", listETag, headETag)
+	}
+}
+
+func TestETag_FormatIsSizeMtimeEverywhere(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
+
+	format := regexp.MustCompile(`^"[0-9a-f]+-[0-9a-f]+"$`)
+
+	put := serveRequest(g, http.MethodPut, "/mybucket/obj.txt", strings.NewReader("hello"), noAuth())
+	if put.Code != http.StatusOK {
+		t.Fatalf("put: expected 200, got %d", put.Code)
+	}
+	head := serveRequest(g, http.MethodHead, "/mybucket/obj.txt", nil, noAuth())
+	get := serveRequest(g, http.MethodGet, "/mybucket/obj.txt", nil, noAuth())
+
+	list := serveRequest(g, http.MethodGet, "/mybucket?list-type=2", nil, noAuth())
+	var lr ListBucketResultV2
+	if err := xml.Unmarshal(list.Body.Bytes(), &lr); err != nil {
+		t.Fatalf("unmarshal listing: %v", err)
+	}
+	if len(lr.Contents) != 1 {
+		t.Fatalf("expected 1 object in listing, got %d", len(lr.Contents))
+	}
+
+	etags := map[string]string{
+		"PUT":  put.Header().Get("ETag"),
+		"HEAD": head.Header().Get("ETag"),
+		"GET":  get.Header().Get("ETag"),
+		"LIST": lr.Contents[0].ETag,
+	}
+	for op, etag := range etags {
+		if !format.MatchString(etag) {
+			t.Errorf("%s ETag %q is not the size+mtime format", op, etag)
+		}
+	}
+	if etags["PUT"] != etags["HEAD"] || etags["HEAD"] != etags["GET"] || etags["GET"] != etags["LIST"] {
+		t.Fatalf("ETags differ across operations: %#v", etags)
+	}
 }
 
 // serveRequest is a helper to perform a request directly against the gateway handler.

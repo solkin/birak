@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -232,19 +233,12 @@ func isUnderDir(parent, child string) bool {
 	return strings.HasPrefix(absChild, absParent+string(filepath.Separator)) || absChild == absParent
 }
 
-// hashFile computes SHA256 hex digest of a file.
-func hashFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+// etagFor returns a deterministic, content-independent ETag derived from a file's
+// size and modification time. It avoids reading file contents on list/get/head,
+// stays stable while the file is unchanged, and is identical across LIST, GET,
+// HEAD, and PUT. Note: it is intentionally NOT a hash of the object's content.
+func etagFor(fi os.FileInfo) string {
+	return fmt.Sprintf("\"%x-%x\"", fi.Size(), fi.ModTime().UnixNano())
 }
 
 // --- Bucket handlers ---
@@ -486,8 +480,10 @@ func (g *Gateway) handleGetBucketACL(w http.ResponseWriter, r *http.Request, buc
 
 // --- Object handlers ---
 
-// collectObjects walks a bucket directory and collects objects and common prefixes.
-func (g *Gateway) collectObjects(bp, prefix, delimiter string, maxKeys int) ([]ObjectInfo, []CommonPrefix, bool, error) {
+// collectObjects walks a bucket directory and collects all matching objects and
+// common prefixes, sorted lexicographically. It does not read file contents and
+// does not paginate — pagination is applied separately by paginate.
+func (g *Gateway) collectObjects(bp, prefix, delimiter string) ([]ObjectInfo, []string, error) {
 	var objects []ObjectInfo
 	commonPrefixes := make(map[string]bool)
 
@@ -499,7 +495,7 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string, maxKeys int) ([]O
 			return nil
 		}
 		if path == bp {
-			return nil // skip the bucket root
+			return nil
 		}
 
 		// Stop the walk once we have collected the cap; better to truncate (and log)
@@ -519,7 +515,6 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string, maxKeys int) ([]O
 			return nil
 		}
 
-		// Skip directories (we handle them via delimiter logic).
 		if fi.IsDir() {
 			return nil
 		}
@@ -531,36 +526,25 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string, maxKeys int) ([]O
 			return nil
 		}
 
-		// Apply prefix filter.
 		if prefix != "" && !strings.HasPrefix(key, prefix) {
 			return nil
 		}
 
-		// Handle delimiter (virtual directories).
 		if delimiter != "" {
 			rest := key
 			if prefix != "" {
 				rest = key[len(prefix):]
 			}
-			idx := strings.Index(rest, delimiter)
-			if idx >= 0 {
-				cp := prefix + rest[:idx+len(delimiter)]
-				commonPrefixes[cp] = true
+			if idx := strings.Index(rest, delimiter); idx >= 0 {
+				commonPrefixes[prefix+rest[:idx+len(delimiter)]] = true
 				return nil
 			}
-		}
-
-		// Compute ETag (SHA256).
-		hash, hashErr := hashFile(path)
-		etag := ""
-		if hashErr == nil {
-			etag = hash
 		}
 
 		objects = append(objects, ObjectInfo{
 			Key:          key,
 			LastModified: fi.ModTime().UTC().Format(s3TimeFormat),
-			ETag:         etag,
+			ETag:         etagFor(fi),
 			Size:         fi.Size(),
 			StorageClass: "STANDARD",
 		})
@@ -568,39 +552,66 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string, maxKeys int) ([]O
 		return nil
 	})
 	if err != nil && !errors.Is(err, errWalkLimit) {
-		return nil, nil, false, err
+		return nil, nil, err
 	}
 	if errors.Is(err, errWalkLimit) {
 		g.logger.Warn("list objects: result truncated at limit", "limit", maxListWalkEntries)
 	}
 
-	// Sort objects by key.
 	sort.Slice(objects, func(i, j int) bool {
 		return objects[i].Key < objects[j].Key
 	})
 
-	// Build sorted common prefixes list.
-	var cpList []CommonPrefix
-	cpKeys := make([]string, 0, len(commonPrefixes))
+	cpList := make([]string, 0, len(commonPrefixes))
 	for cp := range commonPrefixes {
-		cpKeys = append(cpKeys, cp)
+		cpList = append(cpList, cp)
 	}
-	sort.Strings(cpKeys)
-	for _, cp := range cpKeys {
-		cpList = append(cpList, CommonPrefix{Prefix: cp})
+	sort.Strings(cpList)
+
+	return objects, cpList, nil
+}
+
+// paginate applies S3 list pagination over the merged, lexically ordered key
+// space of objects and common prefixes: it drops everything up to and including
+// startAfter, keeps at most maxKeys items, and reports whether the listing was
+// truncated along with the token to resume from (the last key returned).
+func paginate(objects []ObjectInfo, commonPrefixes []string, startAfter string, maxKeys int) (pageObjects []ObjectInfo, pagePrefixes []CommonPrefix, isTruncated bool, nextToken string) {
+	type item struct {
+		key      string
+		obj      ObjectInfo
+		isPrefix bool
 	}
 
-	// Apply maxKeys truncation.
-	isTruncated := false
-	totalItems := len(objects) + len(cpList)
-	if totalItems > maxKeys {
+	items := make([]item, 0, len(objects)+len(commonPrefixes))
+	for _, o := range objects {
+		items = append(items, item{key: o.Key, obj: o})
+	}
+	for _, p := range commonPrefixes {
+		items = append(items, item{key: p, isPrefix: true})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].key < items[j].key })
+
+	if startAfter != "" {
+		idx := sort.Search(len(items), func(i int) bool { return items[i].key > startAfter })
+		items = items[idx:]
+	}
+
+	if len(items) > maxKeys {
 		isTruncated = true
-		if len(objects) > maxKeys {
-			objects = objects[:maxKeys]
+		items = items[:maxKeys]
+	}
+
+	for _, it := range items {
+		if it.isPrefix {
+			pagePrefixes = append(pagePrefixes, CommonPrefix{Prefix: it.key})
+		} else {
+			pageObjects = append(pageObjects, it.obj)
 		}
 	}
-
-	return objects, cpList, isTruncated, nil
+	if isTruncated && len(items) > 0 {
+		nextToken = items[len(items)-1].key
+	}
+	return pageObjects, pagePrefixes, isTruncated, nextToken
 }
 
 // handleListObjects dispatches to V1 or V2 based on the list-type query parameter.
@@ -640,44 +651,29 @@ func (g *Gateway) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	objects, cpList, isTruncated, err := g.collectObjects(bp, prefix, delimiter, maxKeys)
+	objects, cpList, err := g.collectObjects(bp, prefix, delimiter)
 	if err != nil {
 		g.logger.Error("list objects walk failed", "bucket", bucket, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
 		return
 	}
 
-	// Apply marker filter: skip objects with key <= marker.
-	if marker != "" {
-		filtered := objects[:0]
-		for _, obj := range objects {
-			if obj.Key > marker {
-				filtered = append(filtered, obj)
-			}
-		}
-		objects = filtered
-	}
-
-	// Determine NextMarker for truncated results.
-	nextMarker := ""
-	if isTruncated && len(objects) > 0 {
-		nextMarker = objects[len(objects)-1].Key
-	}
+	pageObjects, pagePrefixes, isTruncated, nextToken := paginate(objects, cpList, marker, maxKeys)
 
 	result := ListBucketResultV1{
 		Xmlns:          s3Xmlns,
 		Name:           bucket,
 		Prefix:         prefix,
 		Marker:         marker,
-		NextMarker:     nextMarker,
+		NextMarker:     nextToken,
 		Delimiter:      delimiter,
 		MaxKeys:        maxKeys,
 		IsTruncated:    isTruncated,
-		Contents:       objects,
-		CommonPrefixes: cpList,
+		Contents:       pageObjects,
+		CommonPrefixes: pagePrefixes,
 	}
 
-	g.logger.Debug("list objects v1", "bucket", bucket, "prefix", prefix, "count", len(objects))
+	g.logger.Debug("list objects v1", "bucket", bucket, "prefix", prefix, "count", len(pageObjects))
 	writeXML(w, http.StatusOK, result)
 }
 
@@ -693,32 +689,20 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	objects, cpList, isTruncated, err := g.collectObjects(bp, prefix, delimiter, maxKeys)
+	objects, cpList, err := g.collectObjects(bp, prefix, delimiter)
 	if err != nil {
 		g.logger.Error("list objects walk failed", "bucket", bucket, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
 		return
 	}
 
-	// Apply start-after / continuation-token filter.
+	// A continuation token, when present, takes precedence over start-after.
 	skipAfter := startAfter
 	if contToken != "" {
 		skipAfter = contToken
 	}
-	if skipAfter != "" {
-		filtered := objects[:0]
-		for _, obj := range objects {
-			if obj.Key > skipAfter {
-				filtered = append(filtered, obj)
-			}
-		}
-		objects = filtered
-	}
 
-	nextContToken := ""
-	if isTruncated && len(objects) > 0 {
-		nextContToken = objects[len(objects)-1].Key
-	}
+	pageObjects, pagePrefixes, isTruncated, nextToken := paginate(objects, cpList, skipAfter, maxKeys)
 
 	result := ListBucketResultV2{
 		Xmlns:                 s3Xmlns,
@@ -727,15 +711,15 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 		Delimiter:             delimiter,
 		MaxKeys:               maxKeys,
 		IsTruncated:           isTruncated,
-		KeyCount:              len(objects),
-		Contents:              objects,
-		CommonPrefixes:        cpList,
+		KeyCount:              len(pageObjects),
+		Contents:              pageObjects,
+		CommonPrefixes:        pagePrefixes,
 		StartAfter:            startAfter,
 		ContinuationToken:     contToken,
-		NextContinuationToken: nextContToken,
+		NextContinuationToken: nextToken,
 	}
 
-	g.logger.Debug("list objects v2", "bucket", bucket, "prefix", prefix, "count", len(objects))
+	g.logger.Debug("list objects v2", "bucket", bucket, "prefix", prefix, "count", len(pageObjects))
 	writeXML(w, http.StatusOK, result)
 }
 
@@ -784,14 +768,10 @@ func (g *Gateway) handleHeadObject(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	hash, _ := hashFile(op)
-
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
 	w.Header().Set("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
 	w.Header().Set("Content-Type", "application/octet-stream")
-	if hash != "" {
-		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", hash))
-	}
+	w.Header().Set("ETag", etagFor(info))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -818,17 +798,21 @@ func (g *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	hash, _ := hashFile(op)
+	f, err := os.Open(op)
+	if err != nil {
+		g.logger.Error("get object: open failed", "bucket", bucket, "key", key, "error", err)
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+		return
+	}
+	defer f.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
 	w.Header().Set("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
-	if hash != "" {
-		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", hash))
-	}
+	w.Header().Set("ETag", etagFor(info))
 
 	g.logger.Debug("get object", "bucket", bucket, "key", key, "size", info.Size())
-	http.ServeFile(w, r, op)
+	http.ServeContent(w, r, filepath.Base(op), info.ModTime(), f)
 }
 
 // handlePutObject writes an object to the bucket.
@@ -867,7 +851,10 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	// be replayed with a swapped body. UNSIGNED-PAYLOAD and aws-chunked streaming
 	// markers carry no verifiable digest, so they are not checked.
 	declaredHash := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Amz-Content-Sha256")))
-	checkDigest := isHexSHA256(declaredHash)
+	var hasher hash.Hash
+	if isHexSHA256(declaredHash) {
+		hasher = sha256.New()
+	}
 
 	// Create parent directories if needed.
 	dir := filepath.Dir(op)
@@ -886,10 +873,11 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 	tmpPath := tmpFile.Name()
 
-	// Hash while writing. The digest is Birak's content-addressed ETag and, when the
-	// client supplied one, is also compared against the declared payload SHA-256.
-	h := sha256.New()
-	size, err := io.Copy(io.MultiWriter(tmpFile, h), r.Body)
+	var dst io.Writer = tmpFile
+	if hasher != nil {
+		dst = io.MultiWriter(tmpFile, hasher)
+	}
+	size, err := io.Copy(dst, r.Body)
 	tmpFile.Close()
 	if err != nil {
 		os.Remove(tmpPath)
@@ -903,13 +891,14 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	actualHash := hex.EncodeToString(h.Sum(nil))
-	if checkDigest && actualHash != declaredHash {
-		os.Remove(tmpPath)
-		g.logger.Warn("put object: content sha256 mismatch", "bucket", bucket, "key", key)
-		writeS3Error(w, http.StatusBadRequest, "XAmzContentSHA256Mismatch",
-			"The provided 'x-amz-content-sha256' header does not match what was computed.")
-		return
+	if hasher != nil {
+		if actual := hex.EncodeToString(hasher.Sum(nil)); actual != declaredHash {
+			os.Remove(tmpPath)
+			g.logger.Warn("put object: content sha256 mismatch", "bucket", bucket, "key", key)
+			writeS3Error(w, http.StatusBadRequest, "XAmzContentSHA256Mismatch",
+				"The provided 'x-amz-content-sha256' header does not match what was computed.")
+			return
+		}
 	}
 
 	// Rename temp file to final path.
@@ -920,11 +909,16 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	etag := fmt.Sprintf("\"%s\"", actualHash)
+	info, err := os.Stat(op)
+	if err != nil {
+		g.logger.Error("put object: stat failed", "bucket", bucket, "key", key, "error", err)
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to finalize object")
+		return
+	}
 
 	g.logger.Info("object created", "bucket", bucket, "key", key, "size", size)
 
-	w.Header().Set("ETag", etag)
+	w.Header().Set("ETag", etagFor(info))
 	w.WriteHeader(http.StatusOK)
 }
 

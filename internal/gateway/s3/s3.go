@@ -79,7 +79,9 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		g.server.Close()
+		// Drain in-flight requests rather than cutting connections abruptly; Stop
+		// bounds the overall drain time.
+		g.server.Shutdown(context.Background())
 	}()
 
 	if err := g.server.Serve(ln); err != http.ErrServerClosed {

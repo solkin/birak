@@ -314,8 +314,9 @@ object is replicated.
 
 `CompleteMultipartUpload` returns the standard composite ETag (the MD5 of the
 concatenated part digests plus `-{partCount}`). Later `GET`/`HEAD`/`LIST` requests
-return Birak's normal SHA256 content ETag, so the values differ; standard S3 SDK
-upload and download paths do not depend on their equality.
+return Birak's usual ETag, which is derived from size and modification time rather
+than content (the same as for objects written with a plain `PUT`). The values
+differ; standard S3 SDK upload and download paths do not depend on their equality.
 
 ### WebDAV Gateway
 
@@ -455,7 +456,7 @@ birak/
 
 ```bash
 # All tests
-go test -v -timeout 120s ./...
+go test -race -v -timeout 120s ./...
 
 # Unit tests for a specific package
 go test -v ./internal/store/
