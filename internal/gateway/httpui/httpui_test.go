@@ -975,6 +975,32 @@ func TestList_HidesReservedDir(t *testing.T) {
 	}
 }
 
+func TestList_HidesSymlinkAliasToReservedDir(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	reserved := filepath.Join(dir, gateway.ReservedDirName)
+	if err := os.Mkdir(reserved, 0o700); err != nil {
+		t.Fatalf("create reserved dir: %v", err)
+	}
+	if err := os.Symlink(reserved, filepath.Join(dir, "multipart-state")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "visible.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := serve(g, http.MethodGet, "/_api/list?path=", nil, noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var res listResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("parse listing: %v", err)
+	}
+	if res.Total != 1 || len(res.Entries) != 1 || res.Entries[0].Name != "visible.txt" {
+		t.Fatalf("listing exposed reserved alias: %+v", res)
+	}
+}
+
 func TestAccess_ReservedDirIsDenied(t *testing.T) {
 	g, dir := newTestGateway(t, "", "")
 	reserved := filepath.Join(dir, gateway.ReservedDirName)

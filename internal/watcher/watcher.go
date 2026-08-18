@@ -126,25 +126,7 @@ func (w *Watcher) isSynced(name, hash string) bool {
 // shouldIgnore checks if a file path matches any of the configured ignore patterns.
 // It matches each path segment's basename against the patterns.
 func (w *Watcher) shouldIgnore(relPath string) bool {
-	// Check the basename of the file.
-	base := filepath.Base(relPath)
-	for _, pattern := range w.ignorePatterns {
-		if matched, _ := filepath.Match(pattern, base); matched {
-			return true
-		}
-	}
-	// Also check each parent directory segment.
-	dir := filepath.Dir(relPath)
-	for dir != "." && dir != "" {
-		seg := filepath.Base(dir)
-		for _, pattern := range w.ignorePatterns {
-			if matched, _ := filepath.Match(pattern, seg); matched {
-				return true
-			}
-		}
-		dir = filepath.Dir(dir)
-	}
-	return false
+	return ShouldIgnore(relPath, w.ignorePatterns)
 }
 
 // Run starts the watcher. It blocks until ctx is cancelled.
@@ -387,7 +369,7 @@ func (w *Watcher) inspectFile(name string) (*FileEvent, error) {
 	}
 
 	fullPath := filepath.Join(w.dir, filepath.FromSlash(name))
-	info, err := os.Stat(fullPath)
+	info, err := os.Lstat(fullPath)
 	if os.IsNotExist(err) {
 		// File was deleted — look up the last known ModTime from the store
 		// so the deletion timestamp reflects the file's real age rather than
@@ -431,6 +413,13 @@ func (w *Watcher) inspectFile(name string) (*FileEvent, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("stat %s: %w", fullPath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		resolvedInfo, safe := w.safeSymlinkInfo(fullPath)
+		if !safe {
+			return nil, nil
+		}
+		info = resolvedInfo
 	}
 
 	// Skip directories.
@@ -540,13 +529,20 @@ func (w *Watcher) periodicScan() {
 			return nil
 		}
 
-		onDisk[name] = struct{}{}
-
 		info, infoErr := d.Info()
 		if infoErr != nil {
 			w.logger.Error("periodic scan: stat failed", "name", name, "error", infoErr)
 			return nil
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolvedInfo, safe := w.safeSymlinkInfo(path)
+			if !safe {
+				return nil
+			}
+			info = resolvedInfo
+		}
+
+		onDisk[name] = struct{}{}
 
 		batch = append(batch, diskFile{
 			name:    name,
@@ -623,6 +619,38 @@ func (w *Watcher) periodicScan() {
 	} else {
 		w.logger.Debug("periodic scan completed, no changes")
 	}
+}
+
+// safeSymlinkInfo follows a file symlink only when its target remains inside the
+// sync root and is not hidden by reserved or configured ignore rules. Birak
+// replicates the target bytes as a regular file; links to directories, private
+// state, or external files are not indexable.
+func (w *Watcher) safeSymlinkInfo(path string) (os.FileInfo, bool) {
+	absRoot, err := filepath.Abs(w.dir)
+	if err != nil {
+		return nil, false
+	}
+	realRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return nil, false
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, false
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil || (resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator))) {
+		return nil, false
+	}
+	targetRel, err := filepath.Rel(realRoot, resolved)
+	if err != nil || targetRel == "." || w.shouldIgnore(filepath.ToSlash(targetRel)) {
+		return nil, false
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return nil, false
+	}
+	return info, true
 }
 
 // compareScanBatch queries the store for a batch of on-disk files and returns
@@ -702,7 +730,7 @@ func CleanEmptyParents(filePath, rootDir string, ignorePatterns []string, logger
 	dir := filepath.Dir(filePath)
 	for {
 		absDir, _ := filepath.Abs(dir)
-		if absDir == absRoot || !strings.HasPrefix(absDir, absRoot) {
+		if absDir == absRoot || !strings.HasPrefix(absDir, absRoot+string(filepath.Separator)) {
 			break
 		}
 		if !removeIfOnlyIgnored(dir, ignorePatterns, logger) {
@@ -726,7 +754,7 @@ func removeIfOnlyIgnored(dir string, ignorePatterns []string, logger *slog.Logge
 		if entry.IsDir() {
 			return false // subdirectory present — don't remove
 		}
-		if !ShouldIgnore(entry.Name(), ignorePatterns) {
+		if !shouldIgnoreCleanupFile(entry.Name(), ignorePatterns) {
 			return false // non-ignored file present — don't remove
 		}
 	}
@@ -742,6 +770,25 @@ func removeIfOnlyIgnored(dir string, ignorePatterns []string, logger *slog.Logge
 	}
 
 	return os.Remove(dir) == nil
+}
+
+// shouldIgnoreCleanupFile applies basename and scratch-file rules without the
+// top-level .birak rule. removeIfOnlyIgnored receives only an entry name, so
+// treating a nested user file named ".birak" as the root state directory would
+// delete data that the watcher otherwise considers visible.
+func shouldIgnoreCleanupFile(name string, patterns []string) bool {
+	if matched, _ := filepath.Match(".birak-tmp-*", name); matched {
+		return true
+	}
+	if matched, _ := filepath.Match(".birak-bak-*", name); matched {
+		return true
+	}
+	for _, pattern := range patterns {
+		if matched, _ := filepath.Match(pattern, name); matched {
+			return true
+		}
+	}
+	return false
 }
 
 // isOutsideSyncDir returns true if a relative path escapes the sync directory

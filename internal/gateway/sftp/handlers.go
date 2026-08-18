@@ -303,8 +303,7 @@ func (s *session) handleReaddir(payload []byte) {
 	var body []byte
 	count := 0
 	for _, e := range batch {
-		if watcher.ShouldIgnore(e.Name(), s.g.ignorePatterns) ||
-			gateway.IsReservedPath(s.g.syncDir, filepath.Join(entry.path, e.Name())) {
+		if !gateway.IsClientVisiblePath(s.g.syncDir, filepath.Join(entry.path, e.Name()), s.g.ignorePatterns) {
 			continue
 		}
 		fi, err := e.Info()

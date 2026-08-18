@@ -55,6 +55,48 @@ func IsReservedPath(rootDir, fullPath string) bool {
 	return absPath == filepath.Join(absRoot, ReservedDirName)
 }
 
+// IsClientVisiblePath reports whether a directory entry may be exposed through a
+// gateway listing. It validates both the entry name and any symlink-resolved
+// target, so an alias cannot reveal reserved or ignored data.
+func IsClientVisiblePath(rootDir, fullPath string, ignorePatterns []string) bool {
+	rel, err := filepath.Rel(rootDir, fullPath)
+	if err != nil || rel == "." || strings.HasPrefix(filepath.ToSlash(rel), "../") {
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	if err := validateClientPath(rel, ignorePatterns); err != nil {
+		return false
+	}
+	// The directory containing this entry was already resolved by the listing
+	// handler. Regular children need only the cheap lexical checks above; only a
+	// symlink can redirect the entry to a different protected target.
+	info, err := os.Lstat(fullPath)
+	if err != nil {
+		return false
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return true
+	}
+	_, _, err = SafePath(rootDir, rel, ignorePatterns)
+	return err == nil
+}
+
+// PathResolvesWithin reports whether fullPath is textually and, where possible,
+// symlink-resolved inside rootDir. It is useful for narrower boundaries nested
+// under the served root, such as keeping an S3 object inside its own bucket.
+func PathResolvesWithin(rootDir, fullPath string) bool {
+	absRoot, err := filepath.Abs(rootDir)
+	if err != nil {
+		return false
+	}
+	absFull, err := filepath.Abs(fullPath)
+	if err != nil || (absFull != absRoot && !strings.HasPrefix(absFull, absRoot+string(filepath.Separator))) {
+		return false
+	}
+	_, _, _, err = resolveNoSymlinkEscape(absRoot, absFull)
+	return err == nil
+}
+
 // Prefixes of the scratch files every gateway writes while performing an atomic
 // write (create temp, fill, rename into place).
 const (
@@ -119,28 +161,12 @@ func SafePath(rootDir, reqPath string, ignorePatterns []string) (relPath string,
 		return "", "", fmt.Errorf("path traversal")
 	}
 
-	if cleaned != "" && len(ignorePatterns) > 0 && watcher.ShouldIgnore(cleaned, ignorePatterns) {
-		return "", "", fmt.Errorf("ignored path")
-	}
-
 	if cleaned == "" {
 		return "", rootDir, nil
 	}
 
-	// The reserved state directory holds Birak's own bookkeeping (staged
-	// multipart parts); no protocol may read, write, or delete inside it.
-	if cleaned == ReservedDirName || strings.HasPrefix(cleaned, ReservedDirName+"/") {
-		return "", "", fmt.Errorf("reserved path")
-	}
-
-	// Likewise for the atomic-write scratch namespace. A client-created file with
-	// one of those prefixes would be indistinguishable from an abandoned temp file
-	// and would eventually be swept away, so the name is refused up front rather
-	// than accepted and later deleted.
-	for _, seg := range strings.Split(cleaned, "/") {
-		if IsScratchFile(seg) {
-			return "", "", fmt.Errorf("reserved path")
-		}
+	if err := validateClientPath(cleaned, ignorePatterns); err != nil {
+		return "", "", err
 	}
 
 	full := filepath.Join(rootDir, filepath.FromSlash(cleaned))
@@ -151,26 +177,68 @@ func SafePath(rootDir, reqPath string, ignorePatterns []string) (relPath string,
 		return "", "", fmt.Errorf("path traversal")
 	}
 
-	if err := verifyNoSymlinkEscape(rootDir, full); err != nil {
+	resolved, realRoot, rootResolved, err := resolveNoSymlinkEscape(rootDir, full)
+	if err != nil {
 		return "", "", err
+	}
+
+	// A harmless-looking alias can resolve into .birak, a scratch file, or a path
+	// hidden by an ignore rule. Validate the symlink-resolved target too, otherwise
+	// every gateway could bypass its namespace protections through an in-root link.
+	if rootResolved {
+		resolvedRel, relErr := filepath.Rel(realRoot, resolved)
+		if relErr != nil {
+			return "", "", fmt.Errorf("resolve symlink target: %w", relErr)
+		}
+		resolvedRel = filepath.ToSlash(resolvedRel)
+		if resolvedRel == "." {
+			resolvedRel = ""
+		}
+		if err := validateClientPath(resolvedRel, ignorePatterns); err != nil {
+			return "", "", err
+		}
 	}
 
 	return cleaned, full, nil
 }
 
-// verifyNoSymlinkEscape ensures that, after resolving symlinks, full still lies
-// within rootDir. full need not exist yet: the nearest existing ancestor is
-// resolved and the remaining (not-yet-created) components are re-appended. This
-// closes symlink-based escapes that the textual check above cannot detect.
-func verifyNoSymlinkEscape(rootDir, full string) error {
-	realRoot, err := filepath.EvalSymlinks(rootDir)
+// validateClientPath applies the non-filesystem namespace rules to a cleaned,
+// root-relative path. SafePath calls it for both the requested path and its
+// symlink-resolved target.
+func validateClientPath(rel string, ignorePatterns []string) error {
+	if rel != "" && len(ignorePatterns) > 0 && watcher.ShouldIgnore(rel, ignorePatterns) {
+		return fmt.Errorf("ignored path")
+	}
+	if rel == ReservedDirName || strings.HasPrefix(rel, ReservedDirName+"/") {
+		return fmt.Errorf("reserved path")
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		if IsScratchFile(seg) {
+			return fmt.Errorf("reserved path")
+		}
+	}
+	return nil
+}
+
+// resolveNoSymlinkEscape resolves full through its nearest existing ancestor and
+// ensures the result stays inside rootDir. full itself need not exist yet.
+func resolveNoSymlinkEscape(rootDir, full string) (resolvedPath, realRoot string, rootResolved bool, err error) {
+	absRoot, err := filepath.Abs(rootDir)
+	if err != nil {
+		return "", "", false, err
+	}
+	absFull, err := filepath.Abs(full)
+	if err != nil {
+		return "", "", false, err
+	}
+	realRoot, err = filepath.EvalSymlinks(absRoot)
 	if err != nil {
 		// rootDir normally exists; if it cannot be resolved, rely on the textual
 		// check already performed by the caller.
-		return nil
+		return absFull, absRoot, false, nil
 	}
 
-	cur := full
+	cur := absFull
 	rest := ""
 	for {
 		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
@@ -178,14 +246,14 @@ func verifyNoSymlinkEscape(rootDir, full string) error {
 				resolved = filepath.Join(resolved, rest)
 			}
 			if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
-				return fmt.Errorf("path traversal")
+				return "", realRoot, true, fmt.Errorf("path traversal")
 			}
-			return nil
+			return resolved, realRoot, true, nil
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
 			// Reached the filesystem root without resolving; the textual check stands.
-			return nil
+			return absFull, realRoot, true, nil
 		}
 		rest = filepath.Join(filepath.Base(cur), rest)
 		cur = parent

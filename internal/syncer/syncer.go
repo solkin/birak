@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/store"
 	"github.com/birak/birak/internal/watcher"
 )
@@ -212,21 +214,18 @@ func (s *Syncer) syncOnce(ctx context.Context, peerURL string) (int, error) {
 			break
 		}
 
-		// Skip paths escaping the sync directory (e.g. "../meta/birak.db-wal").
-		// These can appear in a peer's store if the watcher previously tracked
-		// files outside the sync dir (e.g. the SQLite WAL file). We must skip
-		// them to prevent the cursor from getting stuck (the HTTP server
-		// rejects such paths with 400).
-		if strings.HasPrefix(change.Name, "../") || change.Name == ".." {
-			s.logger.Debug("skipping file outside sync dir from peer", "name", change.Name)
+		// Peer metadata is untrusted input. Resolve it with the same path policy as
+		// local gateways and require the canonical relative name to be unchanged;
+		// otherwise names such as a/../../outside could escape after filepath.Join.
+		if _, err := s.safeLocalPath(change.Name); err != nil {
+			s.logger.Debug("skipping unsafe or ignored file from peer", "name", change.Name, "error", err)
 			lastSuccessVer = change.Version
 			processed++
 			continue
 		}
-
-		// Skip ignored files — intentional skip, safe to advance cursor.
-		if watcher.ShouldIgnore(change.Name, s.ignorePatterns) {
-			s.logger.Debug("skipping ignored file from peer", "name", change.Name)
+		if !change.Deleted && (change.Size < 0 || change.Size == math.MaxInt64 || !isSHA256Hex(change.Hash)) {
+			s.logger.Warn("skipping malformed file metadata from peer", "name", change.Name,
+				"size", change.Size, "hash", change.Hash)
 			lastSuccessVer = change.Version
 			processed++
 			continue
@@ -320,6 +319,14 @@ func (s *Syncer) syncOnce(ctx context.Context, peerURL string) (int, error) {
 
 // downloadAndApply downloads a file from a peer and writes it locally.
 func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta store.FileMeta) error {
+	destPath, err := s.safeLocalPath(meta.Name)
+	if err != nil {
+		return err
+	}
+	if meta.Size < 0 || meta.Size == math.MaxInt64 || !isSHA256Hex(meta.Hash) {
+		return fmt.Errorf("invalid metadata for %s", meta.Name)
+	}
+
 	// URL-encode each path segment to handle special characters and subdirectories.
 	encodedName := encodePathSegments(meta.Name)
 	reqURL := fmt.Sprintf("%s/files/%s", peerURL, encodedName)
@@ -345,8 +352,6 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		return fmt.Errorf("download %s: status %d", meta.Name, resp.StatusCode)
 	}
 
-	destPath := filepath.Join(s.syncDir, filepath.FromSlash(meta.Name))
-
 	// Ensure parent directory exists.
 	destDir := filepath.Dir(destPath)
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
@@ -367,12 +372,22 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	hasher := sha256.New()
 	writer := io.MultiWriter(tmpFile, hasher)
 
-	if _, err := copyWithStallDetect(ctx, writer, resp.Body, stallTimeout); err != nil {
+	// Stop one byte beyond the advertised size. Without this bound a malicious
+	// peer could stream forever while continually avoiding the stall timeout.
+	written, err := copyWithStallDetect(ctx, writer, io.LimitReader(resp.Body, meta.Size+1), stallTimeout)
+	if err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("write file %s: %w", meta.Name, err)
 	}
-	tmpFile.Close()
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close file %s: %w", meta.Name, err)
+	}
+	if written != meta.Size {
+		os.Remove(tmpPath)
+		return fmt.Errorf("size mismatch for %s: expected %d, got %d", meta.Name, meta.Size, written)
+	}
 
 	// Verify hash.
 	gotHash := hex.EncodeToString(hasher.Sum(nil))
@@ -472,7 +487,10 @@ func copyWithStallDetect(ctx context.Context, dst io.Writer, src io.Reader, stal
 
 // applyDeletion removes a file locally and marks it as deleted in the store.
 func (s *Syncer) applyDeletion(meta store.FileMeta) error {
-	destPath := filepath.Join(s.syncDir, filepath.FromSlash(meta.Name))
+	destPath, err := s.safeLocalPath(meta.Name)
+	if err != nil {
+		return err
+	}
 
 	// Mark as synced (fast-path optimisation for watcher).
 	s.watcher.MarkSynced(meta.Name, "")
@@ -496,6 +514,29 @@ func (s *Syncer) applyDeletion(meta store.FileMeta) error {
 
 	s.logger.Info("file deletion synced", "name", meta.Name)
 	return nil
+}
+
+// safeLocalPath resolves a peer-supplied file name under syncDir without
+// rewriting it. Watcher-generated names are already canonical, so any change
+// during cleaning signals malformed or traversal-oriented peer metadata.
+func (s *Syncer) safeLocalPath(name string) (string, error) {
+	normalized := filepath.ToSlash(name)
+	rel, full, err := gateway.SafePath(s.syncDir, normalized, s.ignorePatterns)
+	if err != nil {
+		return "", fmt.Errorf("unsafe sync path %q: %w", name, err)
+	}
+	if rel == "" || rel != normalized {
+		return "", fmt.Errorf("unsafe sync path %q: non-canonical name", name)
+	}
+	return full, nil
+}
+
+func isSHA256Hex(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // encodePathSegments URL-encodes each segment of a slash-separated path.

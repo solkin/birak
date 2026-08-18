@@ -142,6 +142,24 @@ func TestCleanEmptyParents_DoesNotRemoveRoot(t *testing.T) {
 	}
 }
 
+func TestCleanEmptyParents_DoesNotTouchSiblingWithSharedPrefix(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "sync")
+	sibling := filepath.Join(parent, "sync-backup")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	CleanEmptyParents(filepath.Join(sibling, "deleted.txt"), root, nil, slog.Default())
+
+	if _, err := os.Stat(sibling); err != nil {
+		t.Fatalf("cleanup escaped root and removed sibling: %v", err)
+	}
+}
+
 func TestCleanEmptyParents_GlobPattern(t *testing.T) {
 	root := t.TempDir()
 	sub := filepath.Join(root, "logs")
@@ -158,6 +176,24 @@ func TestCleanEmptyParents_GlobPattern(t *testing.T) {
 	// logs/ should be removed since *.log matches all remaining files.
 	if _, err := os.Stat(sub); !os.IsNotExist(err) {
 		t.Fatal("logs/ should have been removed (only *.log files)")
+	}
+}
+
+func TestCleanEmptyParents_PreservesNestedBirakNamedFile(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "photos")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(sub, ".birak")
+	if err := os.WriteFile(nested, []byte("user data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	CleanEmptyParents(filepath.Join(sub, "deleted.txt"), root, nil, slog.Default())
+
+	if got, err := os.ReadFile(nested); err != nil || string(got) != "user data" {
+		t.Fatalf("nested .birak file was removed or changed: data=%q err=%v", got, err)
 	}
 }
 
@@ -187,5 +223,25 @@ func TestShouldIgnore_ScratchFiles(t *testing.T) {
 		if !ShouldIgnore(path, nil) {
 			t.Errorf("ShouldIgnore(%q) = false, want true", path)
 		}
+	}
+}
+
+func TestWatcherShouldIgnore_UsesReservedAndConfiguredRules(t *testing.T) {
+	w := &Watcher{ignorePatterns: []string{"*.log", "cache"}}
+
+	for _, path := range []string{
+		".birak/multipart/upload-id/part-00001-deadbeef",
+		"bucket/.birak-tmp-upload",
+		"bucket/.birak-bak-rollback",
+		"bucket/debug.log",
+		"bucket/cache/data.bin",
+	} {
+		if !w.shouldIgnore(path) {
+			t.Errorf("watcher.shouldIgnore(%q) = false, want true", path)
+		}
+	}
+
+	if w.shouldIgnore("bucket/photo.jpg") {
+		t.Fatal("watcher ignored a normal user file")
 	}
 }

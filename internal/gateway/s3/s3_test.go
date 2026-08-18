@@ -3,7 +3,9 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
@@ -28,6 +30,47 @@ func testGateway(t *testing.T, cfg Config) (*Gateway, string) {
 	ignorePatterns := []string{".DS_Store", "Thumbs.db", "desktop.ini", ".birak-tmp-*"}
 	g := New(syncDir, ignorePatterns, cfg, logger)
 	return g, syncDir
+}
+
+func TestPutObject_ContentMD5(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	bp := filepath.Join(syncDir, "mybucket")
+	if err := os.Mkdir(bp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte("verified payload")
+	sum := md5.Sum(body)
+	w := serveRequest(g, http.MethodPut, "/mybucket/good.txt", bytes.NewReader(body),
+		map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:])})
+	if w.Code != http.StatusOK {
+		t.Fatalf("matching Content-MD5: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	original := []byte("keep this object")
+	objectPath := filepath.Join(bp, "existing.txt")
+	if err := os.WriteFile(objectPath, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wrong := md5.Sum([]byte("different payload"))
+	w = serveRequest(g, http.MethodPut, "/mybucket/existing.txt", bytes.NewReader(body),
+		map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(wrong[:])})
+	if w.Code != http.StatusBadRequest || errorCode(t, w) != "BadDigest" {
+		t.Fatalf("mismatched Content-MD5: status %d, body %s", w.Code, w.Body.String())
+	}
+	got, err := os.ReadFile(objectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("mismatched digest overwrote existing object: %q", got)
+	}
+
+	w = serveRequest(g, http.MethodPut, "/mybucket/malformed.txt", bytes.NewReader(body),
+		map[string]string{"Content-MD5": "not-base64"})
+	if w.Code != http.StatusBadRequest || errorCode(t, w) != "BadDigest" {
+		t.Fatalf("malformed Content-MD5: status %d, body %s", w.Code, w.Body.String())
+	}
 }
 
 func TestGetObject_IndexHTMLServedWithoutRedirect(t *testing.T) {
@@ -190,6 +233,76 @@ func TestETag_ListMatchesHead(t *testing.T) {
 	wHead := serveRequest(g, http.MethodHead, "/mybucket/obj.txt", nil, noAuth())
 	if headETag := wHead.Header().Get("ETag"); headETag != listETag {
 		t.Fatalf("ETag mismatch: LIST=%q HEAD=%q", listETag, headETag)
+	}
+}
+
+func TestListObjects_SafeSymlinkMatchesHeadAndEscapeIsHidden(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	bp := filepath.Join(syncDir, "mybucket")
+	if err := os.Mkdir(bp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(bp, "target.txt")
+	if err := os.WriteFile(target, []byte("target contents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target.txt", filepath.Join(bp, "alias.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(bp, "escape.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	otherBucket := filepath.Join(syncDir, "otherbucket")
+	if err := os.Mkdir(otherBucket, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	otherObject := filepath.Join(otherBucket, "other.txt")
+	if err := os.WriteFile(otherObject, []byte("other bucket"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(otherObject, filepath.Join(bp, "cross-bucket.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	w := serveRequest(g, http.MethodGet, "/mybucket?list-type=2", nil, noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var result ListBucketResultV2
+	if err := xml.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	objects := make(map[string]ObjectInfo, len(result.Contents))
+	for _, obj := range result.Contents {
+		objects[obj.Key] = obj
+	}
+	alias, ok := objects["alias.txt"]
+	if !ok {
+		t.Fatal("safe in-root symlink missing from listing")
+	}
+	if _, ok := objects["escape.txt"]; ok {
+		t.Fatal("symlink escaping syncDir must not appear in listing")
+	}
+	if _, ok := objects["cross-bucket.txt"]; ok {
+		t.Fatal("symlink escaping its bucket must not appear in listing")
+	}
+
+	head := serveRequest(g, http.MethodHead, "/mybucket/alias.txt", nil, noAuth())
+	if head.Code != http.StatusOK {
+		t.Fatalf("head alias: expected 200, got %d", head.Code)
+	}
+	if alias.ETag != head.Header().Get("ETag") {
+		t.Fatalf("alias ETag mismatch: LIST=%q HEAD=%q", alias.ETag, head.Header().Get("ETag"))
+	}
+	if alias.Size != int64(len("target contents")) {
+		t.Fatalf("alias size = %d, want target size %d", alias.Size, len("target contents"))
+	}
+	if cross := serveRequest(g, http.MethodGet, "/mybucket/cross-bucket.txt", nil, noAuth()); cross.Code == http.StatusOK {
+		t.Fatalf("cross-bucket symlink was readable: %q", cross.Body.String())
 	}
 }
 
@@ -947,8 +1060,8 @@ func TestListObjectsV2_WithDelimiter(t *testing.T) {
 	var result ListBucketResultV2
 	xml.Unmarshal(w.Body.Bytes(), &result)
 
-	if result.KeyCount != 1 {
-		t.Fatalf("expected KeyCount 1, got %d", result.KeyCount)
+	if result.KeyCount != 2 {
+		t.Fatalf("expected KeyCount 2 (one object plus one common prefix), got %d", result.KeyCount)
 	}
 	if len(result.CommonPrefixes) != 1 || result.CommonPrefixes[0].Prefix != "photos/" {
 		t.Fatalf("expected [photos/] in common prefixes, got %v", result.CommonPrefixes)

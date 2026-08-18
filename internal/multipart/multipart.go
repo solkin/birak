@@ -15,6 +15,7 @@
 package multipart
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
@@ -505,6 +506,14 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, checks Ch
 	if number < 1 || number > s.limits.MaxParts {
 		return Part{}, ErrInvalidPartNumber
 	}
+	var wantMD5 []byte
+	if checks.ContentMD5 != "" {
+		var err error
+		wantMD5, err = base64.StdEncoding.DecodeString(strings.TrimSpace(checks.ContentMD5))
+		if err != nil || len(wantMD5) != md5.Size {
+			return Part{}, ErrBadDigest
+		}
+	}
 
 	if s.sem != nil {
 		select {
@@ -558,12 +567,9 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, checks Ch
 	}
 
 	digest := hex.EncodeToString(hasher.Sum(nil))
-	if checks.ContentMD5 != "" {
-		want, err := base64.StdEncoding.DecodeString(strings.TrimSpace(checks.ContentMD5))
-		if err != nil || hex.EncodeToString(want) != digest {
-			os.Remove(tmpPath)
-			return Part{}, ErrBadDigest
-		}
+	if wantMD5 != nil && !bytes.Equal(wantMD5, hasher.Sum(nil)) {
+		os.Remove(tmpPath)
+		return Part{}, ErrBadDigest
 	}
 	if sha != nil {
 		if hex.EncodeToString(sha.Sum(nil)) != normalizeHex(checks.ContentSHA256) {
@@ -630,7 +636,11 @@ func (s *Store) stagedParts(id string) ([]Part, error) {
 		return nil, fmt.Errorf("multipart: read upload dir: %w", err)
 	}
 
-	var parts []Part
+	// A crash immediately after publishing a replacement part but before removing
+	// its predecessor can leave two digest-named files for one part number. Treat
+	// the newest one as authoritative so restart recovery still presents exactly
+	// one part and completion can proceed with the ETag returned to the client.
+	byNumber := make(map[int]Part)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -643,12 +653,22 @@ func (s *Store) stagedParts(id string) ([]Part, error) {
 		if err != nil {
 			continue
 		}
-		parts = append(parts, Part{
+		candidate := Part{
 			Number:       number,
 			Size:         info.Size(),
 			ETag:         digest,
 			LastModified: info.ModTime().UTC(),
-		})
+		}
+		current, exists := byNumber[number]
+		if !exists || candidate.LastModified.After(current.LastModified) ||
+			(candidate.LastModified.Equal(current.LastModified) && candidate.ETag > current.ETag) {
+			byNumber[number] = candidate
+		}
+	}
+
+	parts := make([]Part, 0, len(byNumber))
+	for _, p := range byNumber {
+		parts = append(parts, p)
 	}
 	sort.Slice(parts, func(i, j int) bool { return parts[i].Number < parts[j].Number })
 	return parts, nil
@@ -731,10 +751,14 @@ func (s *Store) List(bucket, prefix, keyMarker, uploadIDMarker string, maxUpload
 }
 
 // HasUploads reports whether any upload is staged for a bucket. A bucket with
-// in-progress uploads is not empty and must not be deleted.
-func (s *Store) HasUploads(bucket string) bool {
+// in-progress uploads is not empty and must not be deleted. Storage errors are
+// returned so callers do not mistake an unreadable staging area for no uploads.
+func (s *Store) HasUploads(bucket string) (bool, error) {
 	ups, _, err := s.List(bucket, "", "", "", 1)
-	return err == nil && len(ups) > 0
+	if err != nil {
+		return false, err
+	}
+	return len(ups) > 0, nil
 }
 
 // Abort discards an upload and every part staged for it.
@@ -855,6 +879,9 @@ func (s *Store) Complete(id string, want []CompletePart, dest string) (CompleteR
 // validateDest guards against a destination outside the served root or inside the
 // staging area, whatever the caller passed in.
 func (s *Store) validateDest(dest string) error {
+	if !filepath.IsAbs(dest) {
+		return fmt.Errorf("multipart: destination must be absolute")
+	}
 	absRoot, err := filepath.Abs(s.rootDir)
 	if err != nil {
 		return fmt.Errorf("multipart: resolve root: %w", err)
@@ -869,6 +896,13 @@ func (s *Store) validateDest(dest string) error {
 	reserved := filepath.Join(absRoot, gateway.ReservedDirName)
 	if absDest == reserved || strings.HasPrefix(absDest, reserved+string(filepath.Separator)) {
 		return fmt.Errorf("multipart: destination inside reserved directory")
+	}
+	rel, err := filepath.Rel(absRoot, absDest)
+	if err != nil {
+		return fmt.Errorf("multipart: resolve destination relative to root: %w", err)
+	}
+	if _, _, err := gateway.SafePath(absRoot, filepath.ToSlash(rel), nil); err != nil {
+		return fmt.Errorf("multipart: unsafe destination: %w", err)
 	}
 	return nil
 }

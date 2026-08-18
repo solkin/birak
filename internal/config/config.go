@@ -112,6 +112,10 @@ func DefaultConfig() Config {
 		MetaDir:    "./meta",
 		ListenAddr: ":9100",
 		Ignore:     []string{},
+		// Unlike the other multipart limits, zero means unlimited for the active
+		// upload cap. Seed its documented default here so an omitted setting is
+		// distinguishable from an explicit max_active_uploads: 0 in YAML.
+		Multipart: MultipartConfig{MaxActiveUploads: 10000},
 		Gateways: GatewaysConfig{
 			S3: S3GatewayConfig{
 				Enabled:    false,

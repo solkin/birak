@@ -151,6 +151,40 @@ func TestSafePath_SymlinkEscape(t *testing.T) {
 	}
 }
 
+func TestSafePath_SymlinkCannotBypassReservedOrIgnoredPaths(t *testing.T) {
+	root := t.TempDir()
+	reserved := filepath.Join(root, ReservedDirName, "multipart")
+	ignored := filepath.Join(root, "private")
+	if err := os.MkdirAll(reserved, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(ignored, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(reserved, "upload.json"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ignored, "secret.txt"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, ReservedDirName), filepath.Join(root, "state-alias")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := os.Symlink(ignored, filepath.Join(root, "public-alias")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	if _, _, err := SafePath(root, "state-alias/multipart/upload.json", nil); err == nil {
+		t.Fatal("symlink bypassed the reserved .birak namespace")
+	}
+	if _, _, err := SafePath(root, "public-alias/secret.txt", []string{"private"}); err == nil {
+		t.Fatal("symlink bypassed an ignore pattern on its target")
+	}
+	if _, _, err := SafePath(root, "public-alias/secret.txt", nil); err != nil {
+		t.Fatalf("safe in-root symlink should remain usable without an ignore rule: %v", err)
+	}
+}
+
 func TestCheckBasicAuth_NoAuth(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	if !CheckBasicAuth(req, "", "") {

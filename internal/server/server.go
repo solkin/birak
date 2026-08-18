@@ -6,12 +6,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
 
+	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/store"
-	"github.com/birak/birak/internal/watcher"
 )
 
 // Server provides the HTTP API for peers to pull changes and files.
@@ -96,26 +94,9 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Prevent path traversal: clean the path and ensure it doesn't escape.
-	cleaned := filepath.ToSlash(filepath.Clean(name))
-	if strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") || cleaned == ".." {
-		http.Error(w, "invalid file name", http.StatusBadRequest)
-		return
-	}
-
-	// Check ignore patterns.
-	if watcher.ShouldIgnore(cleaned, s.ignorePatterns) {
+	cleaned, fullPath, err := gateway.SafePath(s.syncDir, name, s.ignorePatterns)
+	if err != nil || cleaned == "" {
 		http.Error(w, "file not found", http.StatusNotFound)
-		return
-	}
-
-	fullPath := filepath.Join(s.syncDir, filepath.FromSlash(cleaned))
-
-	// Verify the resolved path is still under syncDir (belt-and-suspenders).
-	absSync, _ := filepath.Abs(s.syncDir)
-	absFile, _ := filepath.Abs(fullPath)
-	if !strings.HasPrefix(absFile, absSync+string(filepath.Separator)) && absFile != absSync {
-		http.Error(w, "invalid file name", http.StatusBadRequest)
 		return
 	}
 

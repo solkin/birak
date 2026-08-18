@@ -131,10 +131,25 @@ func TestLoad_MultipartDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	// Unset multipart fields stay zero; the store resolves them to the
-	// S3-compatible defaults so there is one source of truth.
+	// Zero means unlimited for MaxActiveUploads, so its finite default must be
+	// applied while loading config. The store resolves the remaining zero fields.
+	if cfg.Multipart.MaxActiveUploads != 10000 {
+		t.Fatalf("max_active_uploads = %d, want default 10000", cfg.Multipart.MaxActiveUploads)
+	}
+	cfg.Multipart.MaxActiveUploads = 0
 	if cfg.Multipart != (MultipartConfig{}) {
-		t.Fatalf("expected zero multipart config, got %+v", cfg.Multipart)
+		t.Fatalf("unexpected non-zero multipart defaults: %+v", cfg.Multipart)
+	}
+}
+
+func TestLoad_MultipartExplicitUnlimitedActiveUploads(t *testing.T) {
+	path := writeYAML(t, "multipart:\n  max_active_uploads: 0\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Multipart.MaxActiveUploads != 0 {
+		t.Fatalf("max_active_uploads = %d, want explicit unlimited value 0", cfg.Multipart.MaxActiveUploads)
 	}
 }
 
