@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -56,7 +57,7 @@ func TestPeriodicScanDoesNotIndexReservedMultipartState(t *testing.T) {
 		}
 	}
 	w := New(root, st, logger, time.Millisecond, time.Hour, nil, onChange)
-	w.periodicScan()
+	w.periodicScan(context.Background())
 
 	if got, err := st.GetFile("bucket/object.txt"); err != nil || got == nil || got.Deleted {
 		t.Fatalf("published object was not indexed: file=%+v err=%v", got, err)

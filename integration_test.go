@@ -22,16 +22,16 @@ import (
 
 // testNode represents a single birak daemon instance for testing.
 type testNode struct {
-	id       string
-	syncDir  string
-	metaDir  string
-	store    *store.Store
-	watcher  *watcher.Watcher
-	syncer   *syncer.Syncer
-	server   *http.Server
-	addr     string
-	logger   *slog.Logger
-	cancel   context.CancelFunc
+	id      string
+	syncDir string
+	metaDir string
+	store   *store.Store
+	watcher *watcher.Watcher
+	syncer  *syncer.Syncer
+	server  *http.Server
+	addr    string
+	logger  *slog.Logger
+	cancel  context.CancelFunc
 }
 
 // defaultTestIgnore provides default ignore patterns for tests.
@@ -577,12 +577,12 @@ func TestIntegration_HTTPPathTraversal(t *testing.T) {
 		path string
 		code int
 	}{
-		{"/files/../../../etc/passwd", http.StatusNotFound},    // cleaned by router
-		{"/files/nonexistent.txt", http.StatusNotFound},        // simply missing
-		{"/changes", http.StatusBadRequest},                    // missing 'since' param
-		{"/changes?since=notanumber", http.StatusBadRequest},   // invalid param
-		{"/changes?since=0&limit=-1", http.StatusBadRequest},   // invalid limit
-		{"/changes?since=0&limit=abc", http.StatusBadRequest},  // invalid limit
+		{"/files/../../../etc/passwd", http.StatusNotFound},   // cleaned by router
+		{"/files/nonexistent.txt", http.StatusNotFound},       // simply missing
+		{"/changes", http.StatusBadRequest},                   // missing 'since' param
+		{"/changes?since=notanumber", http.StatusBadRequest},  // invalid param
+		{"/changes?since=0&limit=-1", http.StatusBadRequest},  // invalid limit
+		{"/changes?since=0&limit=abc", http.StatusBadRequest}, // invalid limit
 	}
 
 	for _, tc := range testCases {
@@ -1375,12 +1375,15 @@ func newTestNodeWithOptions(t *testing.T, id, addr, syncDir, metaDir string, ign
 
 	w := watcher.New(syncDir, st, logger, 200*time.Millisecond, 30*time.Second, ignorePatterns, onChange)
 
-	syn := syncer.New(st, w, syncDir, id, peers, ignorePatterns, logger,
-		500*time.Millisecond, // fast poll for tests
-		1000, 5,
-	)
+	syn := syncer.New(st, w, syncDir, id, peers, ignorePatterns, logger, syncer.Options{
+		PollInterval:           500 * time.Millisecond, // fast poll for tests
+		BatchLimit:             1000,
+		MaxConcurrentDownloads: 5,
+		RepairInterval:         500 * time.Millisecond,
+		ReconcileInterval:      5 * time.Second,
+	})
 
-	srv := server.New(st, syncDir, id, ignorePatterns, logger)
+	srv := server.New(st, syncDir, id, ignorePatterns, server.Config{Stats: syn}, logger)
 	httpServer := &http.Server{
 		Addr:    addr,
 		Handler: srv.Handler(),
@@ -1409,16 +1412,16 @@ func newTestNodeWithOptions(t *testing.T, id, addr, syncDir, metaDir string, ign
 	go syn.Run(ctx)
 
 	node := &testNode{
-		id:       id,
+		id:      id,
 		syncDir: syncDir,
-		metaDir:  metaDir,
-		store:    st,
-		watcher:  w,
-		syncer:   syn,
-		server:   httpServer,
-		addr:     addr,
-		logger:   logger,
-		cancel:   cancel,
+		metaDir: metaDir,
+		store:   st,
+		watcher: w,
+		syncer:  syn,
+		server:  httpServer,
+		addr:    addr,
+		logger:  logger,
+		cancel:  cancel,
 	}
 
 	t.Cleanup(func() {

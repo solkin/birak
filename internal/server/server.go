@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -12,35 +13,126 @@ import (
 	"github.com/birak/birak/internal/store"
 )
 
+// Cluster protocol headers. Peers exchange them on every metadata request so a
+// stale cursor or a rebuilt database is detected on the very next poll instead
+// of silently hiding changes forever.
+const (
+	// HeaderEpoch carries the responding node's database incarnation.
+	HeaderEpoch = "X-Birak-Epoch"
+	// HeaderMaxVersion carries the responding node's highest assigned version.
+	HeaderMaxVersion = "X-Birak-Max-Version"
+	// HeaderNodeID identifies the caller so the callee can track how far that
+	// peer has consumed its change stream.
+	HeaderNodeID = "X-Birak-Node-Id"
+	// HeaderSecret carries the optional cluster shared secret.
+	HeaderSecret = "X-Birak-Secret"
+	// HeaderMode carries the source file's permission bits on /files responses,
+	// so a replica is created with the same mode rather than 0600.
+	HeaderMode = "X-Birak-Mode"
+)
+
+// StatsProvider exposes live replication state for /status. The syncer
+// implements it; a node with no peers may pass nil.
+type StatsProvider interface {
+	PeerStats() []PeerStatus
+}
+
+// PeerStatus is the per-peer replication state reported by /status. It is what
+// makes a stalled peer visible: without it, a halted stream is only detectable
+// by manually comparing file counts between nodes.
+type PeerStatus struct {
+	Peer            string `json:"peer"`
+	Cursor          int64  `json:"cursor"`
+	PeerMaxVersion  int64  `json:"peer_max_version"`
+	Lag             int64  `json:"lag"`
+	Epoch           string `json:"epoch"`
+	Healthy         bool   `json:"healthy"`
+	LastSuccessAgo  int64  `json:"last_success_ms_ago"`
+	LastError       string `json:"last_error,omitempty"`
+	ConsecutiveErrs int64  `json:"consecutive_errors"`
+	Pending         int64  `json:"pending_repairs"`
+	LastReconcileMS int64  `json:"last_reconcile_ms_ago"`
+}
+
 // Server provides the HTTP API for peers to pull changes and files.
 type Server struct {
 	store          *store.Store
 	syncDir        string
 	nodeID         string
 	ignorePatterns []string
+	secret         string
+	stats          StatsProvider
 	logger         *slog.Logger
 	mux            *http.ServeMux
 }
 
+// Config holds the server's optional settings.
+type Config struct {
+	// Secret, when set, is required in the X-Birak-Secret header of every
+	// cluster endpoint. Empty keeps the API open, matching earlier releases.
+	Secret string
+	// Stats supplies live peer state for /status; may be nil.
+	Stats StatsProvider
+}
+
 // New creates a new HTTP server.
-func New(s *store.Store, syncDir, nodeID string, ignorePatterns []string, logger *slog.Logger) *Server {
+func New(s *store.Store, syncDir, nodeID string, ignorePatterns []string, cfg Config, logger *slog.Logger) *Server {
 	srv := &Server{
 		store:          s,
 		syncDir:        syncDir,
 		nodeID:         nodeID,
 		ignorePatterns: ignorePatterns,
+		secret:         cfg.Secret,
+		stats:          cfg.Stats,
 		logger:         logger,
 		mux:            http.NewServeMux(),
 	}
-	srv.mux.HandleFunc("GET /changes", srv.handleChanges)
-	srv.mux.HandleFunc("GET /files/{name...}", srv.handleFile)
-	srv.mux.HandleFunc("GET /status", srv.handleStatus)
+	srv.mux.HandleFunc("GET /changes", srv.guard(srv.handleChanges))
+	srv.mux.HandleFunc("GET /manifest", srv.guard(srv.handleManifest))
+	srv.mux.HandleFunc("GET /meta/{name...}", srv.guard(srv.handleMeta))
+	srv.mux.HandleFunc("GET /files/{name...}", srv.guard(srv.handleFile))
+	srv.mux.HandleFunc("GET /status", srv.guard(srv.handleStatus))
+	// Liveness stays unauthenticated so a Kubernetes probe needs no secret.
+	srv.mux.HandleFunc("GET /healthz", srv.handleHealthz)
 	return srv
+}
+
+// SetStats attaches the stats provider after construction, which breaks the
+// initialization cycle between the server and the syncer.
+func (s *Server) SetStats(p StatsProvider) {
+	s.stats = p
 }
 
 // Handler returns the HTTP handler.
 func (s *Server) Handler() http.Handler {
 	return s.mux
+}
+
+// guard enforces the shared secret and stamps every cluster response with this
+// node's epoch and max version.
+func (s *Server) guard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.secret != "" {
+			got := r.Header.Get(HeaderSecret)
+			if subtle.ConstantTimeCompare([]byte(got), []byte(s.secret)) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		w.Header().Set(HeaderEpoch, s.store.Epoch())
+		if maxVer, err := s.store.MaxVersion(); err == nil {
+			w.Header().Set(HeaderMaxVersion, strconv.FormatInt(maxVer, 10))
+		}
+		next(w, r)
+	}
+}
+
+// handleHealthz reports process liveness. It deliberately does not touch the
+// database or the peers: a probe must fail only when this process is unusable,
+// not when a peer is down.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintln(w, "ok")
 }
 
 // handleChanges returns file metadata entries with version > since.
@@ -57,15 +149,19 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit := 1000
-	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
-		limit, err = strconv.Atoi(limitStr)
-		if err != nil || limit <= 0 {
-			http.Error(w, "invalid limit value", http.StatusBadRequest)
-			return
-		}
-		if limit > 10000 {
-			limit = 10000
+	limit, ok := parseLimit(w, r, 1000)
+	if !ok {
+		return
+	}
+
+	// The caller asking for "everything after N" is proof it will never ask for
+	// anything at or below N again. That is the acknowledgement tombstone
+	// retention needs, and it costs no extra round trip.
+	// Recorded even at since=0: a peer that has consumed nothing must pin every
+	// tombstone, not be invisible to the retention gate.
+	if peer := r.Header.Get(HeaderNodeID); peer != "" {
+		if err := s.store.RecordAck(peer, since); err != nil {
+			s.logger.Warn("record peer ack failed", "peer", peer, "error", err)
 		}
 	}
 
@@ -80,10 +176,51 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("serving changes", "since", since, "count", len(changes))
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(changes); err != nil {
-		s.logger.Error("encode changes response failed", "error", err)
+	writeJSON(w, s.logger, changes)
+}
+
+// handleManifest returns entries in name order, tombstones included, starting
+// after the "after" cursor. Full reconciliation walks it to find divergence the
+// version stream cannot express — anything skipped, lost, or written while this
+// node was unreachable.
+func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
+	after := r.URL.Query().Get("after")
+	limit, ok := parseLimit(w, r, 1000)
+	if !ok {
+		return
 	}
+
+	entries, err := s.store.ListManifest(after, limit)
+	if err != nil {
+		s.logger.Error("list manifest failed", "after", after, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, s.logger, entries)
+}
+
+// handleMeta returns the current metadata for a single name. The repair worker
+// calls it before retrying so it always targets the peer's newest state instead
+// of re-fetching a version that has already been superseded.
+func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cleaned, _, err := gateway.SafePath(s.syncDir, name, s.ignorePatterns)
+	if err != nil || cleaned == "" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	meta, err := s.store.GetFile(cleaned)
+	if err != nil {
+		s.logger.Error("get file meta failed", "name", cleaned, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if meta == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, s.logger, meta)
 }
 
 // handleFile serves a file's raw content from the sync directory.
@@ -130,6 +267,9 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
+	// Advertise the source mode so the replica does not inherit the 0600 of the
+	// downloader's temp file, which would make it unreadable to other UIDs.
+	w.Header().Set(HeaderMode, strconv.FormatUint(uint64(info.Mode().Perm()), 8))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(w, r, "", info.ModTime(), f)
 }
@@ -137,8 +277,14 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 // StatusResponse is the response for /status.
 type StatusResponse struct {
 	NodeID     string `json:"node_id"`
+	Epoch      string `json:"epoch"`
 	MaxVersion int64  `json:"max_version"`
 	FileCount  int64  `json:"file_count"`
+
+	// Repairs and Peers make replication health observable. A peer whose
+	// stream has stalled shows up here rather than only as a file-count drift.
+	Repairs store.RepairStats `json:"repairs"`
+	Peers   []PeerStatus      `json:"peers"`
 }
 
 // handleStatus returns daemon health and current state.
@@ -157,12 +303,51 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := StatusResponse{
-		NodeID:     s.nodeID,
-		MaxVersion: maxVer,
-		FileCount:  count,
+	repairs, err := s.store.RepairQueueStats()
+	if err != nil {
+		s.logger.Error("get repair stats failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
 
+	resp := StatusResponse{
+		NodeID:     s.nodeID,
+		Epoch:      s.store.Epoch(),
+		MaxVersion: maxVer,
+		FileCount:  count,
+		Repairs:    repairs,
+		Peers:      []PeerStatus{},
+	}
+	if s.stats != nil {
+		if peers := s.stats.PeerStats(); peers != nil {
+			resp.Peers = peers
+		}
+	}
+
+	writeJSON(w, s.logger, resp)
+}
+
+// parseLimit reads a bounded "limit" query parameter, writing the error
+// response itself and reporting whether the caller may continue.
+func parseLimit(w http.ResponseWriter, r *http.Request, def int) (int, bool) {
+	limit := def
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		parsed, err := strconv.Atoi(limitStr)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "invalid limit value", http.StatusBadRequest)
+			return 0, false
+		}
+		limit = parsed
+		if limit > 10000 {
+			limit = 10000
+		}
+	}
+	return limit, true
+}
+
+func writeJSON(w http.ResponseWriter, logger *slog.Logger, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		logger.Error("encode response failed", "error", err)
+	}
 }

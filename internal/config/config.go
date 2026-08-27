@@ -19,6 +19,10 @@ type Config struct {
 	ListenAddr string   `yaml:"listen_addr"`
 	Peers      []string `yaml:"peers"`
 	Ignore     []string `yaml:"ignore"`
+	// ClusterSecret, when set, is required in the X-Birak-Secret header of
+	// every peer-to-peer request. Empty leaves the sync API open, which is only
+	// safe when the listen address is unreachable from outside the cluster.
+	ClusterSecret string `yaml:"cluster_secret"`
 	// MaxUploadBytes caps the size of a single uploaded object/file across all
 	// gateways (S3, WebDAV, HTTP UI, SFTP). 0 means unlimited.
 	MaxUploadBytes int64           `yaml:"max_upload_bytes"`
@@ -102,6 +106,12 @@ type SyncConfig struct {
 	TombstoneTTL           time.Duration `yaml:"tombstone_ttl"`
 	ScanInterval           time.Duration `yaml:"scan_interval"`
 	DebounceWindow         time.Duration `yaml:"debounce_window"`
+	// RepairInterval is how often queued failed changes are retried.
+	RepairInterval time.Duration `yaml:"repair_interval"`
+	// ReconcileInterval is how often a full manifest comparison runs against
+	// every peer. This is the backstop that catches anything the version
+	// cursor has already moved past; set it to 0 to disable (not recommended).
+	ReconcileInterval time.Duration `yaml:"reconcile_interval"`
 }
 
 // DefaultConfig returns a config with sensible defaults.
@@ -141,6 +151,8 @@ func DefaultConfig() Config {
 			TombstoneTTL:           168 * time.Hour, // 7 days
 			ScanInterval:           5 * time.Minute,
 			DebounceWindow:         300 * time.Millisecond,
+			RepairInterval:         30 * time.Second,
+			ReconcileInterval:      time.Hour,
 		},
 	}
 }
@@ -195,6 +207,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("BIRAK_IGNORE"); v != "" {
 		c.Ignore = strings.Split(v, ",")
 	}
+	if v := os.Getenv("BIRAK_CLUSTER_SECRET"); v != "" {
+		c.ClusterSecret = v
+	}
 	if v := os.Getenv("BIRAK_MAX_UPLOAD_BYTES"); v != "" {
 		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
 			c.MaxUploadBytes = n
@@ -230,6 +245,16 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("BIRAK_SYNC_DEBOUNCE_WINDOW"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			c.Sync.DebounceWindow = d
+		}
+	}
+	if v := os.Getenv("BIRAK_SYNC_REPAIR_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.Sync.RepairInterval = d
+		}
+	}
+	if v := os.Getenv("BIRAK_SYNC_RECONCILE_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.Sync.ReconcileInterval = d
 		}
 	}
 
@@ -361,6 +386,18 @@ func (c *Config) validate() error {
 	if c.Sync.MaxConcurrentDownloads <= 0 {
 		return fmt.Errorf("sync.max_concurrent_downloads must be positive")
 	}
+	if c.Sync.TombstoneTTL <= 0 {
+		return fmt.Errorf("sync.tombstone_ttl must be positive")
+	}
+	if c.Sync.ScanInterval <= 0 {
+		return fmt.Errorf("sync.scan_interval must be positive")
+	}
+	if c.Sync.RepairInterval < 0 {
+		return fmt.Errorf("sync.repair_interval must not be negative")
+	}
+	if c.Sync.ReconcileInterval < 0 {
+		return fmt.Errorf("sync.reconcile_interval must not be negative")
+	}
 	if c.MaxUploadBytes < 0 {
 		return fmt.Errorf("max_upload_bytes must not be negative")
 	}
@@ -408,6 +445,12 @@ func (c *Config) validate() error {
 // warned at startup rather than silently exposing the filesystem.
 func SecurityWarnings(c Config) []string {
 	var warnings []string
+	if len(c.Peers) > 0 && c.ClusterSecret == "" {
+		warnings = append(warnings, "peers are configured without cluster_secret; the sync API serves every file to anyone who can reach listen_addr")
+	}
+	if c.Sync.ReconcileInterval == 0 {
+		warnings = append(warnings, "sync.reconcile_interval is 0: full reconciliation is disabled, so anything the change stream misses will never be repaired")
+	}
 	g := c.Gateways
 	if g.S3.Enabled && g.S3.AccessKey == "" && g.S3.SecretKey == "" {
 		warnings = append(warnings, "S3 gateway is enabled without access_key/secret_key; it accepts unauthenticated requests")

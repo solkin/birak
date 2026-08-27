@@ -170,37 +170,163 @@ func TestFileCount(t *testing.T) {
 func TestPurgeTombstones(t *testing.T) {
 	s := newTestStore(t)
 
+	// A file last modified long ago that is deleted right now. Retention must
+	// age the tombstone from the deletion, not from the file's mtime — the old
+	// behaviour discarded it on the very next sweep, so a peer that was down
+	// missed the deletion permanently.
 	oldTime := time.Now().Add(-48 * time.Hour).UnixNano()
-	recentTime := time.Now().UnixNano()
+	s.PutFile("old-file-deleted-now.txt", oldTime, 0, "", true)
+	s.PutFile("alive.txt", time.Now().UnixNano(), 100, "h1", false)
 
-	s.PutFile("old-deleted.txt", oldTime, 0, "", true)
-	s.PutFile("recent-deleted.txt", recentTime, 0, "", true)
-	s.PutFile("alive.txt", recentTime, 100, "h1", false)
+	purged, err := s.PurgeTombstones(24*time.Hour, NoAckGate)
+	if err != nil {
+		t.Fatalf("PurgeTombstones: %v", err)
+	}
+	if purged != 0 {
+		t.Fatalf("a deletion recorded now must survive a 24h TTL, purged %d", purged)
+	}
+	if f, _ := s.GetFile("old-file-deleted-now.txt"); f == nil {
+		t.Fatal("tombstone for an old file was purged immediately after deletion")
+	}
 
-	purged, err := s.PurgeTombstones(24 * time.Hour)
+	// With a TTL that has already elapsed, the tombstone goes.
+	purged, err = s.PurgeTombstones(0, NoAckGate)
 	if err != nil {
 		t.Fatalf("PurgeTombstones: %v", err)
 	}
 	if purged != 1 {
 		t.Fatalf("expected 1 purged, got %d", purged)
 	}
+	if f, _ := s.GetFile("alive.txt"); f == nil {
+		t.Fatal("live file must never be purged")
+	}
+}
 
-	// old-deleted should be gone.
-	f, _ := s.GetFile("old-deleted.txt")
-	if f != nil {
-		t.Fatalf("expected old-deleted to be purged, got %+v", f)
+func TestPurgeTombstonesRespectsAckGate(t *testing.T) {
+	s := newTestStore(t)
+
+	v, err := s.PutFile("gone.txt", time.Now().UnixNano(), 0, "", true)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// recent-deleted should remain.
-	f, _ = s.GetFile("recent-deleted.txt")
-	if f == nil {
-		t.Fatal("expected recent-deleted to remain")
+	// A peer that has only consumed up to v-1 must hold the tombstone back;
+	// purging it here would let the next reconciliation copy the file back.
+	if err := s.RecordAck("peer-a", v-1); err != nil {
+		t.Fatal(err)
+	}
+	gate, err := s.MinAckedVersion(time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	purged, err := s.PurgeTombstones(0, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if purged != 0 {
+		t.Fatalf("tombstone purged while peer-a had not consumed it (gate=%d, version=%d)", gate, v)
 	}
 
-	// alive should remain.
-	f, _ = s.GetFile("alive.txt")
-	if f == nil || f.Deleted {
-		t.Fatal("expected alive to remain")
+	// Once the peer has read past it, the tombstone may go.
+	if err := s.RecordAck("peer-a", v); err != nil {
+		t.Fatal(err)
+	}
+	gate, _ = s.MinAckedVersion(time.Hour)
+	purged, err = s.PurgeTombstones(0, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if purged != 1 {
+		t.Fatalf("expected tombstone purged after acknowledgement, got %d", purged)
+	}
+}
+
+func TestMinAckedVersionIgnoresStalePeers(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.RecordAck("peer-live", 100); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.MinAckedVersion(time.Hour); err != nil || got != 100 {
+		t.Fatalf("MinAckedVersion = %d, %v; want 100", got, err)
+	}
+	// A peer nobody has heard from within the window no longer pins tombstones.
+	if got, err := s.MinAckedVersion(time.Nanosecond); err != nil || got != NoAckGate {
+		t.Fatalf("stale peer still counted: got %d, %v", got, err)
+	}
+}
+
+func TestPeerStateTracksEpoch(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.SetPeerState("peer", PeerState{Version: 42, Epoch: "aaa"}); err != nil {
+		t.Fatal(err)
+	}
+	ps, err := s.GetPeerState("peer")
+	if err != nil || ps.Version != 42 || ps.Epoch != "aaa" {
+		t.Fatalf("GetPeerState = %+v, %v", ps, err)
+	}
+
+	// A reset must land atomically: a new epoch may never be paired with the
+	// old cursor, or the peer's changes stay invisible.
+	if err := s.SetPeerState("peer", PeerState{Version: 0, Epoch: "bbb"}); err != nil {
+		t.Fatal(err)
+	}
+	ps, _ = s.GetPeerState("peer")
+	if ps.Version != 0 || ps.Epoch != "bbb" {
+		t.Fatalf("after reset GetPeerState = %+v", ps)
+	}
+}
+
+func TestRepairQueueRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.EnqueueRepair("peer", "a.txt", 7, "hash mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	// A repeated sighting keeps the highest version and does not reset backoff.
+	if err := s.EnqueueRepair("peer", "a.txt", 9, "hash mismatch"); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := s.DueRepairs("peer", 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DueRepairs = %v, %v", items, err)
+	}
+	if items[0].Version != 9 {
+		t.Fatalf("expected newest version 9, got %d", items[0].Version)
+	}
+
+	if err := s.DeferRepair("peer", "a.txt", time.Hour, "still failing"); err != nil {
+		t.Fatal(err)
+	}
+	items, _ = s.DueRepairs("peer", 10)
+	if len(items) != 0 {
+		t.Fatalf("deferred item is still due: %v", items)
+	}
+	// It is deferred, not dropped: a failing file must stay visible.
+	if n, err := s.PendingRepairCount("peer"); err != nil || n != 1 {
+		t.Fatalf("PendingRepairCount = %d, %v; want 1", n, err)
+	}
+
+	if err := s.ResolveRepair("peer", "a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.PendingRepairCount("peer"); n != 0 {
+		t.Fatalf("resolved item still queued: %d", n)
+	}
+}
+
+func TestEpochIsStableAndUnique(t *testing.T) {
+	s1 := newTestStore(t)
+	if s1.Epoch() == "" {
+		t.Fatal("epoch must not be empty")
+	}
+	// A fresh meta directory is a different incarnation — that difference is
+	// what tells peers to reset their cursors.
+	s2 := newTestStore(t)
+	if s1.Epoch() == s2.Epoch() {
+		t.Fatal("two independent databases share an epoch")
 	}
 }
 
@@ -417,7 +543,7 @@ func TestCachedVersionCounter(t *testing.T) {
 
 	// Purge should not affect the version counter.
 	s.PutFile("del.txt", 1, 0, "", true) // v3
-	s.PurgeTombstones(0)
+	s.PurgeTombstones(0, NoAckGate)
 
 	v, _ = s.MaxVersion()
 	if v != 3 {

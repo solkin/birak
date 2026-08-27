@@ -42,13 +42,19 @@ type Watcher struct {
 	// ignored by the watcher to prevent sync loops. This serves as a
 	// fast-path optimisation — the store-based dedup in inspectFile is
 	// the authoritative check.
-	recentlySynced   map[string]string // relPath -> expected hash
+	recentlySynced   map[string]syncedMark // relPath -> mark
 	recentlySyncedMu sync.Mutex
+	lastSyncedSweep  time.Time
 
-	// scanning prevents overlapping periodicScan runs. When a scan takes
-	// longer than scanInterval the ticker fires while a scan is still
-	// running; this flag causes the second invocation to be skipped.
-	scanning bool
+	// work carries debounced batches from the fsnotify loop to the processing
+	// goroutine. Hashing and directory scans must never run on the event loop:
+	// while they do, fsnotify events are not drained and the kernel queue
+	// overflows, silently dropping changes.
+	work chan []string
+
+	// rescan requests an out-of-band full scan. It is the recovery path for
+	// anything the event stream may have dropped.
+	rescan chan struct{}
 
 	// onChange is called for each debounced file event batch.
 	onChange func([]FileEvent)
@@ -56,6 +62,22 @@ type Watcher struct {
 	// ready is closed after the initial scan completes.
 	// Other components (e.g. syncer) should wait on this before starting.
 	ready chan struct{}
+}
+
+// syncedTTL is how long a MarkSynced hint stays usable. It is only a
+// fast path; the store-based dedup in inspectFile is authoritative, so an
+// expired hint costs a hash, never correctness.
+const syncedTTL = 5 * time.Second
+
+// workQueueDepth bounds the batches buffered between the event loop and the
+// processing goroutine. On overflow the watcher falls back to a full scan
+// rather than blocking the event loop.
+const workQueueDepth = 256
+
+// syncedMark records a file the syncer just wrote, with the time it did so.
+type syncedMark struct {
+	hash string
+	at   time.Time
 }
 
 // diskFile holds file metadata collected during a directory walk.
@@ -82,9 +104,11 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 		maxDebounceWindow: maxDebounce,
 		scanInterval:      scanInterval,
 		ignorePatterns:    ignorePatterns,
-		recentlySynced:    make(map[string]string),
+		recentlySynced:    make(map[string]syncedMark),
 		onChange:          onChange,
 		ready:             make(chan struct{}),
+		work:              make(chan []string, workQueueDepth),
+		rescan:            make(chan struct{}, 1),
 	}
 }
 
@@ -97,30 +121,37 @@ func (w *Watcher) Ready() <-chan struct{} {
 // next fsnotify event for it. The entry expires after 5 seconds.
 func (w *Watcher) MarkSynced(name, hash string) {
 	w.recentlySyncedMu.Lock()
-	w.recentlySynced[name] = hash
-	w.recentlySyncedMu.Unlock()
+	defer w.recentlySyncedMu.Unlock()
+	w.recentlySynced[name] = syncedMark{hash: hash, at: time.Now()}
+	w.sweepSyncedLocked()
+}
 
-	// Auto-expire after 5 seconds.
-	go func() {
-		time.Sleep(5 * time.Second)
-		w.recentlySyncedMu.Lock()
-		if w.recentlySynced[name] == hash {
+// sweepSyncedLocked drops expired marks. Entries expire by timestamp rather
+// than by a timer goroutine each: a bulk sync marks thousands of files, and one
+// sleeping goroutine per file is a needless pile of scheduler work.
+func (w *Watcher) sweepSyncedLocked() {
+	now := time.Now()
+	if now.Sub(w.lastSyncedSweep) < syncedTTL {
+		return
+	}
+	w.lastSyncedSweep = now
+	for name, mark := range w.recentlySynced {
+		if now.Sub(mark.at) > syncedTTL {
 			delete(w.recentlySynced, name)
 		}
-		w.recentlySyncedMu.Unlock()
-	}()
+	}
 }
 
 // isSynced checks if a file event should be ignored (was recently synced).
 func (w *Watcher) isSynced(name, hash string) bool {
 	w.recentlySyncedMu.Lock()
 	defer w.recentlySyncedMu.Unlock()
-	expected, ok := w.recentlySynced[name]
-	if ok && expected == hash {
-		delete(w.recentlySynced, name)
-		return true
+	mark, ok := w.recentlySynced[name]
+	if !ok || mark.hash != hash {
+		return false
 	}
-	return false
+	delete(w.recentlySynced, name)
+	return time.Since(mark.at) <= syncedTTL
 }
 
 // shouldIgnore checks if a file path matches any of the configured ignore patterns.
@@ -155,12 +186,20 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 	w.logger.Info("watcher started", "dir", w.dir)
 
-	// Run initial scan to pick up any changes that happened while daemon was down.
-	w.periodicScan()
-
-	// Signal that the initial scan is complete. Other components (syncer) wait on this
-	// to avoid syncing before the local state is known.
-	close(w.ready)
+	// The processing goroutine owns every expensive operation: hashing,
+	// store writes and full directory scans. Keeping them off this loop is what
+	// lets fsnotify events be drained continuously — a scan that blocked the
+	// loop would let the kernel queue overflow and drop changes outright.
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		w.processLoop(ctx)
+	}()
+	defer func() {
+		close(w.work)
+		workers.Wait()
+	}()
 
 	// Debounce timer and pending events.
 	pending := make(map[string]struct{})
@@ -191,11 +230,8 @@ func (w *Watcher) Run(ctx context.Context) error {
 			names = append(names, name)
 		}
 		pending = make(map[string]struct{})
-		w.processBatch(names)
+		w.submit(names)
 	}
-
-	scanTicker := time.NewTicker(w.scanInterval)
-	defer scanTicker.Stop()
 
 	for {
 		select {
@@ -277,7 +313,11 @@ func (w *Watcher) Run(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			w.logger.Error("fsnotify error", "error", err)
+			// This is where an inotify queue overflow surfaces. Events have
+			// been lost, so the only sound response is to rebuild state from
+			// the filesystem rather than trust the stream.
+			w.logger.Error("fsnotify error, requesting full scan", "error", err)
+			w.requestRescan()
 
 		case <-debounceCh:
 			flushPending()
@@ -286,13 +326,79 @@ func (w *Watcher) Run(ctx context.Context) error {
 			// Hard deadline reached — flush regardless of ongoing events.
 			w.logger.Debug("max debounce deadline reached, flushing")
 			flushPending()
+		}
+	}
+}
+
+// submit hands a debounced batch to the processing goroutine. It never blocks:
+// stalling here would stop fsnotify from being drained, which is the very
+// failure the split is meant to prevent. If the queue is full the batch is
+// dropped and a full scan is requested instead, which rediscovers the same
+// changes from disk.
+func (w *Watcher) submit(names []string) {
+	select {
+	case w.work <- names:
+	default:
+		w.logger.Warn("watcher work queue full, falling back to full scan", "dropped", len(names))
+		w.requestRescan()
+	}
+}
+
+// requestRescan asks for an out-of-band full scan, coalescing repeats.
+func (w *Watcher) requestRescan() {
+	select {
+	case w.rescan <- struct{}{}:
+	default:
+	}
+}
+
+// processLoop performs all expensive work: hashing batches, writing to the
+// store, and running periodic scans. Being a single goroutine, scans can never
+// overlap each other or a batch.
+func (w *Watcher) processLoop(ctx context.Context) {
+	// Initial scan picks up anything that changed while the daemon was down.
+	w.periodicScan(ctx)
+
+	// Signal that the initial scan is complete. Other components (syncer) wait
+	// on this to avoid syncing before the local state is known.
+	close(w.ready)
+
+	scanTicker := time.NewTicker(w.scanInterval)
+	defer scanTicker.Stop()
+
+	for {
+		select {
+		case names, ok := <-w.work:
+			if !ok {
+				return
+			}
+			w.processBatch(names)
+
+		case <-w.rescan:
+			w.logger.Info("running requested full scan")
+			w.periodicScan(ctx)
+			drainTicker(scanTicker)
 
 		case <-scanTicker.C:
-			w.periodicScan()
+			w.periodicScan(ctx)
 			// Drain any ticks that accumulated while the scan was running.
 			// Without this, a slow scan would be immediately followed by
 			// another scan from the buffered tick.
 			drainTicker(scanTicker)
+
+		case <-ctx.Done():
+			// Drain whatever the event loop already handed over, then stop.
+			for {
+				select {
+				case names, ok := <-w.work:
+					if !ok {
+						return
+					}
+					w.processBatch(names)
+				default:
+					return
+				}
+			}
 		}
 	}
 }
@@ -464,17 +570,11 @@ func (w *Watcher) inspectFile(name string) (*FileEvent, error) {
 //   - Files on disk are checked against the store in batches (not one-by-one).
 //   - Deletion detection iterates the store in pages instead of loading
 //     all entries into a single map.
-//   - An overlap guard prevents back-to-back scans when a scan takes longer
-//     than the scan interval.
-func (w *Watcher) periodicScan() {
-	// Overlap guard: skip if a previous scan is still running.
-	if w.scanning {
-		w.logger.Debug("periodic scan skipped, previous scan still running")
-		return
-	}
-	w.scanning = true
-	defer func() { w.scanning = false }()
-
+//   - Scans cannot overlap: periodicScan only ever runs on processLoop, so a
+//     scan that outlasts its interval simply delays the next tick rather than
+//     racing a second walk.
+func (w *Watcher) periodicScan(ctx context.Context) {
+	started := time.Now()
 	w.logger.Debug("periodic scan started")
 
 	// Record the max version BEFORE walking the disk. Files added by the
@@ -502,6 +602,10 @@ func (w *Watcher) periodicScan() {
 	}
 
 	err = filepath.WalkDir(w.dir, func(path string, d fs.DirEntry, walkErr error) error {
+		// A scan over a large tree must not hold up shutdown.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if walkErr != nil {
 			w.logger.Error("periodic scan: walk error", "path", path, "error", walkErr)
 			return nil // continue walking
@@ -556,6 +660,10 @@ func (w *Watcher) periodicScan() {
 		return nil
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			w.logger.Debug("periodic scan aborted by shutdown")
+			return
+		}
 		w.logger.Error("periodic scan: walk failed", "error", err)
 	}
 	processBatch() // flush remaining
@@ -566,6 +674,10 @@ func (w *Watcher) periodicScan() {
 	const pageSize = 5000
 	var afterName string
 	for {
+		if ctx.Err() != nil {
+			w.logger.Debug("periodic scan aborted by shutdown")
+			return
+		}
 		page, pageErr := w.store.ListNonDeleted(afterName, pageSize)
 		if pageErr != nil {
 			w.logger.Error("periodic scan: list non-deleted failed", "error", pageErr)
@@ -614,10 +726,10 @@ func (w *Watcher) periodicScan() {
 	}
 
 	if len(events) > 0 {
-		w.logger.Info("periodic scan completed", "changes", len(events))
+		w.logger.Info("periodic scan completed", "changes", len(events), "took", time.Since(started))
 		w.onChange(events)
 	} else {
-		w.logger.Debug("periodic scan completed, no changes")
+		w.logger.Debug("periodic scan completed, no changes", "took", time.Since(started))
 	}
 }
 

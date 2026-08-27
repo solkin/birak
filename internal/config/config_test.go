@@ -84,22 +84,28 @@ func TestLoad_MaxUploadBytes_NegativeRejected(t *testing.T) {
 }
 
 func TestSecurityWarnings(t *testing.T) {
-	open := Config{Gateways: GatewaysConfig{
-		S3:     S3GatewayConfig{Enabled: true},
-		WebDAV: WebDAVGatewayConfig{Enabled: true},
-		HTTP:   HTTPGatewayConfig{Enabled: true},
-		SFTP:   SFTPGatewayConfig{Enabled: true},
-	}}
+	open := Config{
+		Sync: SyncConfig{ReconcileInterval: time.Hour},
+		Gateways: GatewaysConfig{
+			S3:     S3GatewayConfig{Enabled: true},
+			WebDAV: WebDAVGatewayConfig{Enabled: true},
+			HTTP:   HTTPGatewayConfig{Enabled: true},
+			SFTP:   SFTPGatewayConfig{Enabled: true},
+		},
+	}
 	if got := SecurityWarnings(open); len(got) != 4 {
 		t.Fatalf("expected 4 warnings for open gateways, got %d: %v", len(got), got)
 	}
 
-	secured := Config{Gateways: GatewaysConfig{
-		S3:     S3GatewayConfig{Enabled: true, AccessKey: "a", SecretKey: "b"},
-		WebDAV: WebDAVGatewayConfig{Enabled: true, Username: "u", Password: "p"},
-		HTTP:   HTTPGatewayConfig{Enabled: false},
-		SFTP:   SFTPGatewayConfig{Enabled: true, Username: "u", Password: "p"},
-	}}
+	secured := Config{
+		Sync: SyncConfig{ReconcileInterval: time.Hour},
+		Gateways: GatewaysConfig{
+			S3:     S3GatewayConfig{Enabled: true, AccessKey: "a", SecretKey: "b"},
+			WebDAV: WebDAVGatewayConfig{Enabled: true, Username: "u", Password: "p"},
+			HTTP:   HTTPGatewayConfig{Enabled: false},
+			SFTP:   SFTPGatewayConfig{Enabled: true, Username: "u", Password: "p"},
+		},
+	}
 	if got := SecurityWarnings(secured); len(got) != 0 {
 		t.Fatalf("expected no warnings for secured/disabled gateways, got %v", got)
 	}

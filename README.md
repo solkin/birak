@@ -11,7 +11,8 @@ Birak is a distributed file server with built-in replication. Each node stores a
 - **Multi-protocol access** — S3 API, WebDAV, SFTP, HTTP file browser, or direct filesystem.
 - **S3 multipart uploads** — crash-safe, resumable parallel uploads with TTL cleanup and per-part checksums.
 - **Automatic replication** — nodes discover changes in real time and replicate them to all peers.
-- **Conflict resolution** — newest version wins, verified by SHA256 hash.
+- **Guaranteed convergence** — a durable repair queue retries anything that fails, and periodic full reconciliation catches anything the change stream ever missed.
+- **Conflict resolution** — newest version wins, verified by SHA256 hash, with a deterministic tie-break so two nodes can never keep diverging copies.
 - **No single point of failure** — every node is equal; any node can accept reads and writes.
 - **Zero external dependencies** — single Go binary, embedded SQLite for metadata.
 
@@ -141,6 +142,7 @@ multipart:                    # S3 multipart upload limits and retention
   upload_ttl: 168h            # discard an untouched incomplete upload after this
   cleanup_interval: 1h        # how often the janitor sweeps
   temp_file_max_age: 24h      # age at which an orphaned scratch file is removed
+cluster_secret: "shared-secret"  # required on every peer-to-peer request; omit to leave the sync API open
 sync:
   poll_interval: 3s
   batch_limit: 1000
@@ -148,6 +150,8 @@ sync:
   tombstone_ttl: 168h       # 7 days
   scan_interval: 5m
   debounce_window: 300ms
+  repair_interval: 30s      # how often failed changes are retried
+  reconcile_interval: 1h    # full manifest comparison with every peer
 gateways:
   s3:
     enabled: true
@@ -194,6 +198,7 @@ export BIRAK_HTTP_ENABLED=true
 | `listen_addr` | `BIRAK_LISTEN_ADDR` | `:9100` | Peer-to-peer HTTP server address |
 | `peers` | `BIRAK_PEERS` | `[]` | Peer URLs (comma-separated in env) |
 | `ignore` | `BIRAK_IGNORE` | `[]` | Ignore patterns (comma-separated in env) |
+| `cluster_secret` | `BIRAK_CLUSTER_SECRET` | _(empty)_ | Shared secret required on peer-to-peer requests; empty leaves the sync API open |
 | `max_upload_bytes` | `BIRAK_MAX_UPLOAD_BYTES` | `0` | Max single-upload size in bytes across all gateways (0 = unlimited) |
 | `multipart.min_part_bytes` | `BIRAK_MULTIPART_MIN_PART_BYTES` | `5242880` | Minimum size of every multipart part but the last |
 | `multipart.max_part_bytes` | `BIRAK_MULTIPART_MAX_PART_BYTES` | `5368709120` | Maximum size of a single multipart part |
@@ -209,6 +214,8 @@ export BIRAK_HTTP_ENABLED=true
 | `sync.tombstone_ttl` | `BIRAK_SYNC_TOMBSTONE_TTL` | `168h` | Deleted file record TTL (7 days) |
 | `sync.scan_interval` | `BIRAK_SYNC_SCAN_INTERVAL` | `5m` | Full filesystem scan interval |
 | `sync.debounce_window` | `BIRAK_SYNC_DEBOUNCE_WINDOW` | `300ms` | Delay before processing file events |
+| `sync.repair_interval` | `BIRAK_SYNC_REPAIR_INTERVAL` | `30s` | How often the repair queue is retried |
+| `sync.reconcile_interval` | `BIRAK_SYNC_RECONCILE_INTERVAL` | `1h` | Full manifest comparison interval (0 disables — not recommended) |
 | `gateways.s3.enabled` | `BIRAK_S3_ENABLED` | `false` | Enable S3 Gateway |
 | `gateways.s3.listen_addr` | `BIRAK_S3_LISTEN_ADDR` | `:9200` | S3 Gateway address |
 | `gateways.s3.access_key` | `BIRAK_S3_ACCESS_KEY` | _(empty)_ | S3 access key |
@@ -364,21 +371,34 @@ sftp> rm old-file.txt
 
 1. Every file change (create, modify, delete) gets a new monotonic **version** in the local SQLite database.
 2. Each peer polls others: `GET /changes?since=<cursor>` — returns only files changed since the last sync.
-3. For each changed file: if the SHA256 hash differs and the incoming `mod_time` is newer, the file is downloaded.
-4. The cursor is saved — next poll only returns new changes.
-5. A new node joining the cluster starts with `since=0` and downloads everything.
+3. The batch is collapsed to the newest entry per name, then applied — up to `max_concurrent_downloads` files at a time.
+4. For each file: if the SHA256 hash differs and the incoming state wins conflict resolution, the file is downloaded, verified against its hash, fsynced, and renamed into place.
+5. The cursor is saved — the next poll only returns new changes.
+6. A new node joining the cluster starts with `since=0` and downloads everything.
+
+Nothing in that path can strand a file. Every failure is recorded in a durable **repair queue** and retried with exponential backoff, so a single unreadable file never holds up the rest of the stream. On top of that, **full reconciliation** compares the entire manifest with each peer every `reconcile_interval` and queues whatever diverged — the backstop for anything the version cursor has already moved past.
 
 ### Conflict Resolution
 
-If the same file is modified on two nodes simultaneously, the version with the newer `mod_time` wins. The file hash is checked to avoid redundant downloads.
+If the same file is modified on two nodes, the version with the newer `mod_time` wins, and the hash is checked to avoid redundant downloads. When timestamps are exactly equal — which happens on filesystems with coarse timestamps, with `rsync -t`, or with restored backups — the tie is broken deterministically: an existing file beats a tombstone, and between two files the lexicographically greater hash wins. The rule is identical on every node, so the cluster always converges on one copy instead of each node silently keeping its own.
 
 ### Cycle Prevention
 
-When a node writes a file received from a peer, it marks it in memory. The file watcher sees the event but skips it if the hash matches. The mark is removed after 5 seconds.
+When a node writes a file received from a peer, it marks it in memory. The file watcher sees the event but skips it if the hash matches. The mark expires after 5 seconds; the authoritative check is the store itself, which already holds that hash.
 
 ### Deletions
 
-When a file is deleted, a **tombstone** record (`deleted=true`) is created. Peers receive it and delete the file locally. Tombstones are purged after `tombstone_ttl` (default 7 days).
+When a file is deleted, a **tombstone** record (`deleted=true`) is created. Peers receive it and delete the file locally.
+
+Tombstones are purged only when both conditions hold: the deletion is older than `tombstone_ttl` (default 7 days) **and** every live peer has already read past it. Peers acknowledge implicitly — the `since` value of each poll proves what a peer has consumed. This is what keeps a deletion from being lost while a node is down and then undone by the next reconciliation.
+
+> **Operational rule:** a node that has been unreachable for longer than `tombstone_ttl` must be re-seeded from scratch (wipe its `sync_dir` and `meta_dir` and let it resync), not simply reconnected. After that window the cluster stops holding tombstones for it, so reconnecting it can resurrect deleted files. This is the same constraint as `gc_grace_seconds` in Cassandra and applies to any last-writer-wins replicated store.
+
+### Node Identity and Epochs
+
+Each database carries an **epoch** — a random ID generated when the metadata is first created. Every cluster response includes it. If a node loses or restores its `meta_dir`, it comes back with a new epoch and restarts version numbering at 1; peers detect the change and reset their cursors, instead of sitting on a stale cursor that would hide every one of that node's changes forever.
+
+For the same reason, **`meta_dir` should be persistent storage.** Birak recovers correctly if it is lost, but the node then has to be re-fetched by its peers from scratch.
 
 ## Peer-to-Peer HTTP API
 
@@ -407,16 +427,28 @@ curl 'http://localhost:9100/changes?since=0&limit=100'
 
 ### GET /files/{name...}
 
-Downloads a file by path.
+Downloads a file by path. The response carries `X-Birak-Mode` with the source's permission bits, so replicas keep the original mode.
 
 ```bash
 curl -O 'http://localhost:9100/files/report.txt'
 curl -O 'http://localhost:9100/files/docs/drafts/spec.pdf'
 ```
 
+### GET /manifest?after=&limit=1000
+
+Returns entries in name order, tombstones included, for full reconciliation. Page through it by passing the last name returned as `after`.
+
+```bash
+curl 'http://localhost:9100/manifest?limit=100'
+```
+
+### GET /meta/{name...}
+
+Returns the current metadata for a single name, or 404 if the node has no record of it. The repair worker calls it before each retry so it always targets the peer's newest state.
+
 ### GET /status
 
-Returns node status.
+Returns node status and live replication health.
 
 ```bash
 curl 'http://localhost:9100/status'
@@ -425,9 +457,44 @@ curl 'http://localhost:9100/status'
 ```json
 {
   "node_id": "node-1",
+  "epoch": "5f3c1a9e8b2d4f60a7c1e9d3b5a7f218",
   "max_version": 42,
-  "file_count": 1500
+  "file_count": 1500,
+  "repairs": { "total": 0, "due": 0, "oldest_age_ms": 0 },
+  "peers": [
+    {
+      "peer": "http://192.168.1.2:9100",
+      "cursor": 42,
+      "peer_max_version": 42,
+      "lag": 0,
+      "epoch": "9a1b...",
+      "healthy": true,
+      "last_success_ms_ago": 812,
+      "consecutive_errors": 0,
+      "pending_repairs": 0,
+      "last_reconcile_ms_ago": 240113
+    }
+  ]
 }
+```
+
+Watch `peers[].lag`, `peers[].healthy` and `repairs.total` to spot a stalled peer: a stream that has stopped moving shows up here rather than only as a file-count drift between nodes.
+
+### GET /healthz
+
+Liveness probe. Always unauthenticated — it reports only whether this process is running, never whether a peer is reachable, so a peer outage does not restart a healthy pod.
+
+```yaml
+livenessProbe:
+  httpGet: { path: /healthz, port: 9100 }
+```
+
+### Authentication
+
+Set `cluster_secret` and every endpoint above except `/healthz` requires the `X-Birak-Secret` header. Peers send it automatically. Without it the sync API serves every file to anyone who can reach `listen_addr`, so either set the secret or keep the port off any untrusted network.
+
+```bash
+curl -H "X-Birak-Secret: shared-secret" 'http://localhost:9100/status'
 ```
 
 ## Development

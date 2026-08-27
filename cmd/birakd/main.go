@@ -36,6 +36,40 @@ func main() {
 	}
 }
 
+// purgeTombstones drops deletion records that are both older than the TTL and
+// already consumed by every live peer.
+//
+// The acknowledgement gate is what stops a deletion from being lost: a peer
+// that has not yet read a tombstone would otherwise keep the file, and the next
+// full reconciliation would copy it back — resurrecting deleted data. A peer
+// silent for longer than the whole TTL is presumed gone and no longer holds
+// tombstones back; such a node must be re-seeded from scratch rather than
+// reconnected, exactly as with any last-writer-wins replicated store.
+func purgeTombstones(st *store.Store, cfg config.Config, logger *slog.Logger) {
+	gate := store.NoAckGate
+	if len(cfg.Peers) > 0 {
+		minAck, err := st.MinAckedVersion(cfg.Sync.TombstoneTTL)
+		if err != nil {
+			logger.Error("read peer acknowledgements failed", "error", err)
+			return
+		}
+		if minAck == store.NoAckGate {
+			logger.Warn("skipping tombstone purge: no peer has acknowledged any change yet")
+			return
+		}
+		gate = minAck
+	}
+
+	purged, err := st.PurgeTombstones(cfg.Sync.TombstoneTTL, gate)
+	if err != nil {
+		logger.Error("tombstone purge failed", "error", err)
+		return
+	}
+	if purged > 0 {
+		logger.Info("tombstones purged", "count", purged, "acked_through", gate)
+	}
+}
+
 func run(configPath string) error {
 	// Load configuration.
 	cfg, err := config.Load(configPath)
@@ -91,12 +125,21 @@ func run(configPath string) error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	// Set up watcher with onChange callback that updates the store.
+	// A store write that fails here is not lost: the file keeps its old (or
+	// absent) entry, so the next periodic scan sees a mismatch and retries.
+	// The failure is still worth shouting about — a persistently failing store
+	// means replication has quietly stopped advancing.
 	onChange := func(events []watcher.FileEvent) {
+		failed := 0
 		for _, ev := range events {
-			_, err := st.PutFile(ev.Name, ev.ModTime, ev.Size, ev.Hash, ev.Deleted)
-			if err != nil {
+			if _, err := st.PutFile(ev.Name, ev.ModTime, ev.Size, ev.Hash, ev.Deleted); err != nil {
+				failed++
 				logger.Error("store update failed", "name", ev.Name, "error", err)
 			}
+		}
+		if failed > 0 {
+			logger.Error("store updates failed, will be retried by the next periodic scan",
+				"failed", failed, "total", len(events))
 		}
 	}
 
@@ -110,6 +153,12 @@ func run(configPath string) error {
 		onChange,
 	)
 
+	// Drop cursors and repair items for peers that are no longer configured, so
+	// a rotated peer list does not leave dead state behind forever.
+	if err := st.PruneCursors(cfg.Peers); err != nil {
+		logger.Error("prune stale peer state failed", "error", err)
+	}
+
 	// Set up syncer.
 	syn := syncer.New(
 		st,
@@ -119,13 +168,22 @@ func run(configPath string) error {
 		cfg.Peers,
 		cfg.Ignore,
 		logger,
-		cfg.Sync.PollInterval,
-		cfg.Sync.BatchLimit,
-		cfg.Sync.MaxConcurrentDownloads,
+		syncer.Options{
+			PollInterval:           cfg.Sync.PollInterval,
+			BatchLimit:             cfg.Sync.BatchLimit,
+			MaxConcurrentDownloads: cfg.Sync.MaxConcurrentDownloads,
+			RepairInterval:         cfg.Sync.RepairInterval,
+			ReconcileInterval:      cfg.Sync.ReconcileInterval,
+			Secret:                 cfg.ClusterSecret,
+		},
 	)
 
-	// Set up HTTP server.
-	srv := server.New(st, cfg.SyncDir, cfg.NodeID, cfg.Ignore, logger)
+	// Set up HTTP server. The syncer is attached afterwards so /status can
+	// report live per-peer replication state.
+	srv := server.New(st, cfg.SyncDir, cfg.NodeID, cfg.Ignore, server.Config{
+		Secret: cfg.ClusterSecret,
+	}, logger)
+	srv.SetStats(syn)
 	httpServer := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: srv.Handler(),
@@ -173,12 +231,7 @@ func run(configPath string) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				purged, err := st.PurgeTombstones(cfg.Sync.TombstoneTTL)
-				if err != nil {
-					logger.Error("tombstone purge failed", "error", err)
-				} else if purged > 0 {
-					logger.Info("tombstones purged", "count", purged)
-				}
+				purgeTombstones(st, cfg, logger)
 			}
 		}
 	}()

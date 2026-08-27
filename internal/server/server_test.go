@@ -10,12 +10,18 @@ import (
 	"testing"
 
 	"github.com/birak/birak/internal/gateway"
+	"github.com/birak/birak/internal/store"
 )
 
 func TestHandleFileRejectsSymlinkToPrivateOrExternalData(t *testing.T) {
 	root := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(nil, root, "node", nil, logger)
+	st, err := store.New(filepath.Join(t.TempDir(), "server.db"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := New(st, root, "node", nil, Config{}, logger)
 
 	visible := filepath.Join(root, "visible.txt")
 	if err := os.WriteFile(visible, []byte("visible"), 0o644); err != nil {
