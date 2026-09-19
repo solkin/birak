@@ -15,6 +15,10 @@ import (
 var ErrIntegrity = errors.New("file checksum changed without a write timestamp")
 
 func (w *Watcher) relativePaths(paths []string) ([]string, error) {
+	realRoot, err := filepath.EvalSymlinks(w.dir)
+	if err != nil {
+		return nil, err
+	}
 	names := make([]string, 0, len(paths))
 	seen := make(map[string]bool)
 	for _, path := range paths {
@@ -22,22 +26,19 @@ func (w *Watcher) relativePaths(paths []string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		name, err := filepath.Rel(w.dir, path)
+		// Resolve directory aliases, but preserve the final component: PUT or
+		// DELETE of a file symlink changes the link, not its target. Missing
+		// ancestors after a tree deletion still need their original names indexed.
+		parent, err := fileops.ResolvePath(filepath.Dir(path))
+		if err != nil {
+			return nil, err
+		}
+		path = filepath.Join(parent, filepath.Base(path))
+		name, err := filepath.Rel(realRoot, path)
 		if err != nil {
 			return nil, err
 		}
 		name = filepath.ToSlash(name)
-		if isOutsideSyncDir(name) {
-			realRoot, err := filepath.EvalSymlinks(w.dir)
-			if err != nil {
-				return nil, err
-			}
-			name, err = filepath.Rel(realRoot, path)
-			if err != nil {
-				return nil, err
-			}
-			name = filepath.ToSlash(name)
-		}
 		if name == "." || isOutsideSyncDir(name) {
 			return nil, fmt.Errorf("invalid mutation path %q", path)
 		}
@@ -48,6 +49,23 @@ func (w *Watcher) relativePaths(paths []string) ([]string, error) {
 	}
 	return names, nil
 }
+func (w *Watcher) checkSourcesLocked(paths []string) error {
+	// Walk directory symlink targets too; ordinary scans do not follow them.
+	resolved := make([]string, 0, 2*len(paths))
+	for _, path := range paths {
+		real, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return err
+		}
+		resolved = append(resolved, real, path)
+	}
+	names, err := w.relativePaths(resolved)
+	if err != nil {
+		return err
+	}
+	return w.indexPathsLocked(names, false)
+}
+
 func (w *Watcher) beginCommitLocked(paths []string) error {
 	names, err := w.relativePaths(paths)
 	if err != nil {
@@ -85,7 +103,7 @@ func (w *Watcher) indexPathsLocked(paths []string, allowIntegrity bool) error {
 			names[meta.Name] = true
 		}
 		err = filepath.WalkDir(filepath.Join(w.dir, filepath.FromSlash(name)), func(path string, d fs.DirEntry, err error) error {
-			if os.IsNotExist(err) {
+			if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
 				return nil
 			}
 			if err != nil {
@@ -184,9 +202,10 @@ func (w *Watcher) recoverReplicaLocked(name string) error {
 		return err
 	}
 	path := filepath.Join(w.dir, filepath.FromSlash(name))
-	_, statErr := os.Lstat(path)
+	info, statErr := os.Lstat(path)
 	missing := os.IsNotExist(statErr) || errors.Is(statErr, syscall.ENOTDIR)
-	matches := meta.Deleted && missing
+	// Directories are implicit and are never removed by a file tombstone.
+	matches := meta.Deleted && (missing || statErr == nil && info.IsDir())
 	if !meta.Deleted && statErr == nil {
 		info, hash, err := fileops.Snapshot(path)
 		if err != nil {

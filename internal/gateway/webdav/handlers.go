@@ -19,6 +19,8 @@ import (
 // errUploadTooLarge is returned by the COPY copier when the configured upload
 // cap would be exceeded.
 var errUploadTooLarge = errors.New("upload exceeds maximum size")
+var errDestinationExists = errors.New("destination already exists")
+var errRecursiveReplacement = errors.New("destination is inside the source")
 
 // propEntry holds the properties for a single resource in a PROPFIND response.
 type propEntry struct {
@@ -419,7 +421,12 @@ func (g *Gateway) handleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := fileops.Commit(g.syncDir, []string{srcFull, dstFull}, func() error {
+	if err := fileops.CommitFrom(g.syncDir, []string{srcFull}, []string{srcFull, dstFull}, func() error {
+		exists, err := checkReplacementLocked(srcFull, dstFull, overwrite)
+		if err != nil {
+			return err
+		}
+		dstExists = exists
 		if fileops.BusyTreeLocked(g.syncDir, srcFull) || fileops.BusyTreeLocked(g.syncDir, dstFull) {
 			return fileops.ErrBusy
 		}
@@ -429,7 +436,8 @@ func (g *Gateway) handleMove(w http.ResponseWriter, r *http.Request) {
 		return errors.Join(fileops.SyncParents(filepath.Dir(srcFull), g.syncDir), fileops.SyncParents(filepath.Dir(dstFull), g.syncDir))
 	}); err != nil {
 		g.logger.Error("move failed", "from", srcRel, "to", dstRel, "error", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		status := replacementErrorStatus(err)
+		http.Error(w, http.StatusText(status), status)
 		return
 	}
 
@@ -505,7 +513,12 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cp := &copier{limit: g.config.MaxUploadBytes}
-	copyErr := fileops.Commit(g.syncDir, []string{dstFull}, func() error {
+	copyErr := fileops.CommitFrom(g.syncDir, []string{srcFull}, []string{dstFull}, func() error {
+		exists, err := checkReplacementLocked(srcFull, dstFull, overwrite)
+		if err != nil {
+			return err
+		}
+		dstExists = exists
 		if fileops.BusyTreeLocked(g.syncDir, dstFull) || fileops.BusyTreeLocked(g.syncDir, srcFull) {
 			return fileops.ErrBusy
 		}
@@ -519,13 +532,10 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 		}
 		return fileops.SyncParents(filepath.Dir(dstFull), g.syncDir)
 	})
-	if errors.Is(copyErr, errUploadTooLarge) {
-		http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
-		return
-	}
 	if copyErr != nil {
 		g.logger.Error("copy failed", "from", srcRel, "to", dstRel, "error", copyErr)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		status := replacementErrorStatus(copyErr)
+		http.Error(w, http.StatusText(status), status)
 		return
 	}
 
@@ -686,12 +696,44 @@ func parseOverwrite(h string) (overwrite bool, ok bool) {
 // It is used to reject COPY/MOVE whose destination is the source or a descendant
 // of the source, which would otherwise recurse without bound.
 func isSameOrUnder(path, dir string) bool {
-	absPath, err1 := filepath.Abs(path)
-	absDir, err2 := filepath.Abs(dir)
+	absPath, err1 := fileops.ResolvePath(path)
+	absDir, err2 := fileops.ResolvePath(dir)
 	if err1 != nil || err2 != nil {
-		return false
+		return true // cannot prove the operation is outside the source tree
 	}
 	return absPath == absDir || strings.HasPrefix(absPath, absDir+string(filepath.Separator))
+}
+
+// Recheck under the namespace lock: a concurrent request can create the
+// destination or replace an alias after the early HTTP precondition checks.
+func checkReplacementLocked(src, dst string, overwrite bool) (bool, error) {
+	if isSameOrUnder(dst, src) {
+		return false, errRecursiveReplacement
+	}
+	_, err := os.Lstat(dst)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !overwrite {
+		return true, errDestinationExists
+	}
+	return true, nil
+}
+
+func replacementErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, errDestinationExists):
+		return http.StatusPreconditionFailed
+	case errors.Is(err, errRecursiveReplacement):
+		return http.StatusForbidden
+	case errors.Is(err, errUploadTooLarge):
+		return http.StatusRequestEntityTooLarge
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // copier copies files/trees while enforcing an optional cumulative byte budget,
@@ -707,6 +749,9 @@ func (c *copier) copyFile(src, dst string) error {
 	si, err := os.Stat(src)
 	if err != nil {
 		return err
+	}
+	if !si.Mode().IsRegular() {
+		return fmt.Errorf("COPY source is not a regular file: %s", src)
 	}
 	if c.limit > 0 && c.copied+si.Size() > c.limit {
 		return errUploadTooLarge

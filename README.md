@@ -393,7 +393,7 @@ Connect and TLS establishment are limited to 10 seconds each, response headers t
 
 ### Conflict Resolution
 
-The greater per-path `clock` wins. A local mutation advances beyond the previous state, including overwrite, deletion, recreation, or a timestamp rollback. Incoming replication preserves that clock. Initial imported files start from their mtime; legacy database rows fall back to mtime. Equal clocks are resolved by mtime, then live-over-deleted state, then SHA256. The same ordering is used by polling, repairs, and reconciliation. Identical bytes can update their clock and timestamp without another download.
+The greater per-path `clock` wins. A local mutation advances beyond the previous state, including overwrite, deletion, recreation, or a timestamp rollback. Incoming replication preserves that clock. Initial local indexing starts from `max(1, mtime)`; legacy database rows fall back to mtime. Equal clocks are resolved by mtime, then live-over-deleted state, then SHA256. The same ordering is used by polling, repairs, and reconciliation. Identical bytes can update their clock and timestamp without another download.
 
 This is asynchronous last-writer-wins replication. Gateways acknowledge local filesystem and metadata completion, without waiting for a quorum. Clock skew can decide conflicts; concurrent edits do not keep both versions. A successful local write is not a zero-RPO cluster guarantee.
 
@@ -407,13 +407,17 @@ An incomplete or unreadable directory walk never triggers the scan's deletion pa
 
 Direct external filesystem writers do not acquire Birak's commit lock. Publish their files with atomic replacement and a changed mtime, and avoid concurrent external writes to names being changed through gateways or replication. Unexpected same-size/same-mtime checksum changes retain the last verified metadata, keep readiness false, and queue repair from peers. Without a healthy copy, the error remains visible; Birak does not guess which bytes are correct.
 
-COPY/MOVE overwrites have a local recovery journal. Startup restores an uncommitted replacement or finishes cleanup of a committed one before indexing. Backups are never swept as scratch files; an old backup without a journal blocks startup for explicit recovery. File-to-directory and directory-to-file replacements propagate, but multi-file operations become visible on peers one file at a time. Empty directories and arbitrary concurrent directory renames are outside the per-file convergence contract. Permissions are copied on download; a permission-only edit is not a replicated state change.
+COPY/MOVE and partial SFTP writes verify their existing source before creating a new version. A damaged base is rejected; a full upload can explicitly replace it. In-root directory aliases used by gateways index the physical path. A file symlink indexes its own name after verifying its target; PUT/DELETE of the link leave that target unchanged. WebDAV rechecks overwrite and subtree preconditions under the commit lock, including symlink aliases, and refuses to COPY special files such as FIFOs.
+
+COPY/MOVE overwrites have a local recovery journal. Startup restores an uncommitted replacement or finishes cleanup of a committed one before indexing. Backups are never swept as scratch files; an old backup without a journal blocks startup for explicit recovery. File-to-directory and directory-to-file replacements propagate, but multi-file operations become visible on peers one file at a time. Empty directories and arbitrary concurrent directory renames are outside the per-file convergence contract. Independent concurrent creation of a file `a` and a child `a/child` is a structural conflict: both sides retain their bytes and report queued repairs until an operator resolves the namespace. Local readiness alone does not imply that this queue is empty. Permissions are copied on download; a permission-only edit is not a replicated state change.
 
 Checksum scans and local COPY/staging work can hold the shared commit lock while reading large files. Benchmark scan intervals and file sizes on the intended storage; the correctness tests do not establish a throughput or latency SLA.
 
 ### Deletions
 
 A deletion creates a **tombstone** (`deleted=true`), including when a receiving node has never held that file. Tombstones are retained indefinitely. The old `sync.tombstone_ttl` setting remains accepted for configuration compatibility but does not trigger cleanup.
+
+A file tombstone does not delete a directory or its children. A regular-file ancestor also means the deleted descendant is already absent. Both cases preserve the tombstone and its clock, including recovery after restart, regardless of whether live files or deletions arrive first.
 
 A polling cursor acknowledges receipt, not successful application. It cannot safely authorize distributed tombstone GC. Retaining deletion history lets a node return after a long outage without a TTL-based reseeding deadline; metadata storage consequently grows with distinct deleted names. Manual deletion of tombstones or loss of every copy of the metadata can reintroduce old files.
 

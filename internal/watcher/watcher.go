@@ -90,7 +90,7 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 		integrity:         make(map[string]bool),
 	}
 	fileops.SetNotifier(dir, w.requestRescan)
-	fileops.SetHooks(dir, fileops.Hooks{Validate: w.prepareStorageLocked, Begin: w.beginCommitLocked, Finish: w.finishCommitLocked})
+	fileops.SetHooks(dir, fileops.Hooks{Validate: w.prepareStorageLocked, CheckSources: w.checkSourcesLocked, Begin: w.beginCommitLocked, Finish: w.finishCommitLocked})
 	return w
 }
 
@@ -475,6 +475,20 @@ func (w *Watcher) inspectFile(name string) (*FileEvent, error) {
 				return nil, fmt.Errorf("indexed file %q was replaced by an unsupported symlink", name)
 			}
 			return nil, nil
+		}
+		resolved, err := filepath.EvalSymlinks(fullPath)
+		if err != nil {
+			return nil, err
+		}
+		targets, err := w.relativePaths([]string{resolved})
+		if err != nil {
+			return nil, err
+		}
+		if targets[0] != name {
+			// An alias without history must not publish a known damaged target.
+			if err := w.refreshFileLocked(targets[0]); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if !info.Mode().IsRegular() {

@@ -25,13 +25,27 @@ type rootState struct {
 }
 
 var roots sync.Map
+var rootsMu sync.Mutex // binds alternate names to one stable controller
 
-func root(root string) *rootState {
-	abs, _ := filepath.Abs(root)
+func root(dir string) *rootState {
+	abs, _ := filepath.Abs(dir)
 	if v, ok := roots.Load(abs); ok {
 		return v.(*rootState)
 	}
-	v, _ := roots.LoadOrStore(abs, &rootState{writers: make(map[*os.File]*writer)})
+	rootsMu.Lock()
+	defer rootsMu.Unlock()
+	if v, ok := roots.Load(abs); ok {
+		return v.(*rootState)
+	}
+	real := canonical(abs)
+	v, ok := roots.Load(real)
+	if !ok {
+		v = &rootState{writers: make(map[*os.File]*writer)}
+		roots.Store(real, v)
+	}
+	// Keep an established spelling bound even if a symlink/mount is replaced.
+	// The watcher's sentinel check must still fence that path afterwards.
+	roots.Store(abs, v)
 	return v.(*rootState)
 }
 
@@ -63,9 +77,10 @@ func SetNotifier(dir string, notify func()) {
 // Hooks run under the root lock. The watcher owns validation and durable
 // indexing; fileops owns filesystem mutations. No callback reacquires Lock.
 type Hooks struct {
-	Validate func() error
-	Begin    func([]string) error
-	Finish   func([]string) error
+	Validate     func() error
+	CheckSources func([]string) error
+	Begin        func([]string) error
+	Finish       func([]string) error
 }
 
 func SetHooks(dir string, hooks Hooks) { unlock := Lock(dir); defer unlock(); root(dir).hooks = hooks }
@@ -76,12 +91,28 @@ func validateLocked(dir string) error {
 	return nil
 }
 func Commit(dir string, paths []string, fn func() error) error {
+	return CommitFrom(dir, nil, paths, fn)
+}
+
+// CommitFrom verifies existing inputs before granting write intent to outputs.
+// A damaged source must never become a trusted COPY/MOVE/partial upload.
+func CommitFrom(dir string, sources, paths []string, fn func() error) error {
 	unlock := Lock(dir)
 	defer unlock()
-	return commitLocked(dir, paths, fn)
+	return commitLocked(dir, sources, paths, fn)
 }
-func commitLocked(dir string, paths []string, fn func() error) error {
+func checkSourcesLocked(dir string, paths []string) error {
+	if fn := root(dir).hooks.CheckSources; fn != nil && len(paths) != 0 {
+		return fn(paths)
+	}
+	return nil
+}
+
+func commitLocked(dir string, sources, paths []string, fn func() error) error {
 	if err := validateLocked(dir); err != nil {
+		return err
+	}
+	if err := checkSourcesLocked(dir, sources); err != nil {
 		return err
 	}
 	h := root(dir).hooks
@@ -114,13 +145,31 @@ type writer struct {
 
 func canonical(path string) string {
 	path, _ = filepath.Abs(path)
-	if p, err := filepath.EvalSymlinks(path); err == nil {
-		path = p
-	} else if p, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
-		path = filepath.Join(p, filepath.Base(path))
+	if resolved, err := ResolvePath(path); err == nil {
+		return resolved
 	}
-	abs, _ := filepath.Abs(path)
-	return abs
+	return path
+}
+
+// ResolvePath resolves aliases through the nearest existing ancestor, retaining
+// missing components so new files and deleted trees use the same namespace.
+func ResolvePath(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	suffix := ""
+	for {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err == nil {
+			return filepath.Join(resolved, suffix), nil
+		}
+		if (!os.IsNotExist(err) && !errors.Is(err, syscall.ENOTDIR)) || path == filepath.Dir(path) {
+			return "", err
+		}
+		suffix = filepath.Join(filepath.Base(path), suffix)
+		path = filepath.Dir(path)
+	}
 }
 
 // BusyLocked checks both names and inode identity (including hard links).
@@ -157,7 +206,7 @@ func BusyTreeLocked(dir, path string) bool {
 }
 
 func Rename(dir, src, dest string) error {
-	return Commit(dir, []string{src, dest}, func() error {
+	return CommitFrom(dir, []string{src}, []string{src, dest}, func() error {
 		if BusyTreeLocked(dir, src) || BusyTreeLocked(dir, dest) {
 			return ErrBusy
 		}
@@ -245,6 +294,11 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 			return nil, nil, err
 		}
 		probe.Close()
+		if flag&os.O_TRUNC == 0 {
+			if err := checkSourcesLocked(dir, []string{dest, path}); err != nil {
+				return nil, nil, err
+			}
+		}
 		mode = info.Mode().Perm()
 	}
 	f, err := CreateTemp(filepath.Dir(dest), ".birak-tmp-*")
@@ -296,7 +350,7 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 			if closeErr != nil {
 				return
 			}
-			closeErr = commitLocked(dir, []string{dest, path}, func() error {
+			closeErr = commitLocked(dir, nil, []string{dest, path}, func() error {
 				// External namespace replacement must not turn an open handle into a lost update.
 				current, err := os.Stat(dest)
 				if info != nil && (err != nil || !same(info, current)) {
@@ -440,4 +494,27 @@ func Publish(root, scratch, dest string) error {
 		}
 		return SyncParents(filepath.Dir(dest), root)
 	})
+}
+
+// RemoveReplicaFile removes only a file generation. An implicit directory or a
+// regular-file ancestor means this file is already absent, not a failed unlink.
+// Caller holds the namespace lock and has refreshed/compared the file state.
+func RemoveReplicaFile(path string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return nil
+	}
+	if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("cannot remove unsupported file type: %s", path)
+	}
+	if err = os.Remove(path); os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		return nil
+	}
+	return err
 }

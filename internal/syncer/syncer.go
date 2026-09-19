@@ -1058,35 +1058,18 @@ func (s *Syncer) applyDeletion(meta store.FileMeta) error {
 	if err := s.store.StageReplica(meta); err != nil {
 		return err
 	}
-	// Remove file first (ignore if already gone).
-	if err := os.Remove(destPath); err != nil && !os.IsNotExist(err) {
+	// A file tombstone says nothing about implicit directories at that name.
+	// Children can arrive first in a concurrent batch, or already exist locally.
+	if err := fileops.RemoveReplicaFile(destPath); err != nil {
 		return fmt.Errorf("remove %s: %w", meta.Name, err)
 	}
-
-	// Persist the unlink before recording deletion. An already missing parent
-	// is harmless: find the surviving ancestor and flush it before the store.
-	parent := filepath.Dir(destPath)
-	for {
-		if _, err := os.Stat(parent); err == nil {
-			break
-		} else if !os.IsNotExist(err) {
-			return err
-		}
-		if parent == s.syncDir {
-			return fmt.Errorf("sync root disappeared")
-		}
-		parent = filepath.Dir(parent)
-	}
-	if err := fileops.SyncParents(parent, s.syncDir); err != nil {
+	if err := fileops.SyncSurvivingParent(destPath, s.syncDir); err != nil {
 		return err
 	}
 	watcher.CleanEmptyParentsLocked(destPath, s.syncDir, s.ignorePatterns, s.logger)
 
-	// Update store AFTER disk removal. Same reasoning as downloadAndApply:
-	// if PutFile fails after the file is already removed, the periodic scan
-	// will detect the deletion and create the store entry (self-healing).
-	// The reverse (PutFile first, then Remove fails) would leave the store
-	// saying "deleted" while the file still exists on disk.
+	// Filesystem first; the durable intent restores the source clock if SQLite
+	// fails here or the process stops before the metadata commit.
 	if _, err := s.store.PutRemote(meta); err != nil {
 		return fmt.Errorf("mark deleted in store %s: %w", meta.Name, err)
 	}

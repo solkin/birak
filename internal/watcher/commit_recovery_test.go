@@ -134,6 +134,35 @@ func TestReplicaIntentRetainsRemoteClock(t *testing.T) {
 		}
 	}
 }
+
+func TestReplicaDeletionIntentBesideDirectory(t *testing.T) {
+	w := auditWatcher(t)
+	path := filepath.Join(w.dir, "file")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "child"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta := store.FileMeta{Name: "file", Deleted: true, ModTime: 100, Clock: 500}
+	if err := w.store.StageReplica(meta); err != nil {
+		t.Fatal(err)
+	}
+	restarted := New(w.dir, w.store, w.logger, time.Millisecond, time.Hour, nil)
+	if err := restarted.Refresh("file"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := w.store.GetFile("file")
+	if err != nil || got == nil || store.CompareState(got, &meta) != 0 {
+		t.Fatalf("lost directory-adjacent tombstone on recovery: %+v %v", got, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(path, "child")); err != nil || string(body) != "keep" {
+		t.Fatalf("child changed: %q %v", body, err)
+	}
+	if pending, err := w.store.ReplicaIntent("file"); err != nil || pending != nil {
+		t.Fatalf("intent not cleared: %+v %v", pending, err)
+	}
+}
 func TestGatewayRefusesMutationWhenMetadataUnavailable(t *testing.T) {
 	w := auditWatcher(t)
 	path := filepath.Join(w.dir, "file")

@@ -351,7 +351,9 @@ func (s *Store) put(meta FileMeta, local bool) (int64, error) {
 	}
 	defer tx.Rollback()
 	if local {
-		meta.Clock = max(meta.Clock, meta.ModTime)
+		// Zero means a legacy row: its clock falls back to mtime. New local
+		// clocks must stay positive even for files dated before the Unix epoch.
+		meta.Clock = max(1, meta.Clock, meta.ModTime)
 		var previous int64
 		err := tx.QueryRow("SELECT CASE WHEN clock=0 THEN mod_time ELSE clock END FROM files WHERE name=?", name).Scan(&previous)
 		if err != nil && err != sql.ErrNoRows {
