@@ -102,8 +102,7 @@ func (s *Store) ClearReplicaIntent(name string) error {
 }
 
 func (s *Store) ListSubtree(path string) ([]FileMeta, error) {
-	prefix := path + "/"
-	rows, err := s.db.Query("SELECT "+fileColumns+" FROM files WHERE name=? OR substr(name,1,?)=?", path, len(prefix), prefix)
+	rows, err := s.db.Query("SELECT "+fileColumns+" FROM files WHERE name=? OR (name>=? AND name<?)", path, path+"/", path+"0")
 	if err != nil {
 		return nil, err
 	}

@@ -31,6 +31,10 @@ type FileMeta struct {
 	Deleted bool   `json:"deleted"`
 	Version int64  `json:"version"`
 	Clock   int64  `json:"clock"` // per-path logical time; independent of filesystem mtime
+	// A namespace tombstone carries the winning live state's clock, mtime,
+	// hash and name. It must not invent a clock that can defeat a newer file.
+	SupersededBy string `json:"superseded_by,omitempty"`
+	ConflictOf   string `json:"conflict_of,omitempty"` // original name of a preserved copy
 
 	// DeletedAt is the local wall-clock time at which this node recorded the
 	// deletion. It is node-local bookkeeping for tombstone retention and is
@@ -208,6 +212,8 @@ func (s *Store) migrate() error {
 	}
 	for _, column := range []struct{ table, name, definition string }{
 		{"files", "clock", "INTEGER NOT NULL DEFAULT 0"},
+		{"files", "superseded_by", "TEXT NOT NULL DEFAULT ''"},
+		{"files", "conflict_of", "TEXT NOT NULL DEFAULT ''"},
 		{"repair_queue", "metadata", "TEXT NOT NULL DEFAULT ''"},
 		{"repair_queue", "revision", "INTEGER NOT NULL DEFAULT 1"},
 		{"peer_acks", "epoch", "TEXT NOT NULL DEFAULT ''"},
@@ -354,16 +360,15 @@ func (s *Store) put(meta FileMeta, local bool) (int64, error) {
 		// Zero means a legacy row: its clock falls back to mtime. New local
 		// clocks must stay positive even for files dated before the Unix epoch.
 		meta.Clock = max(1, meta.Clock, meta.ModTime)
-		var previous int64
-		err := tx.QueryRow("SELECT CASE WHEN clock=0 THEN mod_time ELSE clock END FROM files WHERE name=?", name).Scan(&previous)
-		if err != nil && err != sql.ErrNoRows {
+		previous, err := namespaceClock(tx, name)
+		if err != nil {
 			return 0, err
 		}
-		if err == nil {
-			if previous == math.MaxInt64 {
+		if previous.Valid {
+			if previous.Int64 == math.MaxInt64 {
 				return 0, fmt.Errorf("conflict clock exhausted for %q", name)
 			}
-			meta.Clock = max(meta.Clock, previous+1)
+			meta.Clock = max(meta.Clock, previous.Int64+1)
 		}
 	}
 	var ver int64
@@ -384,8 +389,8 @@ func (s *Store) put(meta FileMeta, local bool) (int64, error) {
 	}
 
 	_, execErr := tx.Exec(`
-		INSERT INTO files (name, mod_time, size, hash, deleted, version, deleted_at, clock)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO files (name, mod_time, size, hash, deleted, version, deleted_at, clock, superseded_by, conflict_of)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			mod_time   = excluded.mod_time,
 			size       = excluded.size,
@@ -393,8 +398,10 @@ func (s *Store) put(meta FileMeta, local bool) (int64, error) {
 			deleted    = excluded.deleted,
 			version    = excluded.version,
 			deleted_at = excluded.deleted_at,
- clock = excluded.clock
-	`, name, modTime, size, hash, deletedInt, ver, deletedAt, meta.Clock)
+ clock = excluded.clock,
+ superseded_by = excluded.superseded_by,
+ conflict_of = excluded.conflict_of
+	`, name, modTime, size, hash, deletedInt, ver, deletedAt, meta.Clock, meta.SupersededBy, meta.ConflictOf)
 	if execErr != nil {
 		// Roll back the version counter on failure so versions stay gapless.
 		return 0, fmt.Errorf("upsert file %q: %w", name, execErr)
@@ -411,12 +418,12 @@ func (s *Store) put(meta FileMeta, local bool) (int64, error) {
 	return ver, nil
 }
 
-const fileColumns = "name, mod_time, size, hash, deleted, version, deleted_at, clock"
+const fileColumns = "name, mod_time, size, hash, deleted, version, deleted_at, clock, superseded_by, conflict_of"
 
 func scanFile(sc interface{ Scan(...any) error }) (FileMeta, error) {
 	var f FileMeta
 	var deleted int
-	err := sc.Scan(&f.Name, &f.ModTime, &f.Size, &f.Hash, &deleted, &f.Version, &f.DeletedAt, &f.Clock)
+	err := sc.Scan(&f.Name, &f.ModTime, &f.Size, &f.Hash, &deleted, &f.Version, &f.DeletedAt, &f.Clock, &f.SupersededBy, &f.ConflictOf)
 	f.Deleted = deleted != 0
 	return f, err
 }
@@ -683,16 +690,27 @@ func CompareState(a, b *FileMeta) int {
 	if a.ModTime > b.ModTime {
 		return 1
 	}
-	if a.Deleted != b.Deleted {
-		if a.Deleted {
+	aLive, bLive := !a.Deleted || a.SupersededBy != "", !b.Deleted || b.SupersededBy != ""
+	if aLive != bLive {
+		if !aLive {
 			return -1
 		}
 		return 1
 	}
-	if a.Deleted {
+	if !aLive {
 		return 0
 	}
-	return strings.Compare(a.Hash, b.Hash)
+	if c := strings.Compare(a.Hash, b.Hash); c != 0 {
+		return c
+	}
+	aName, bName := a.Name, b.Name
+	if a.SupersededBy != "" {
+		aName = a.SupersededBy
+	}
+	if b.SupersededBy != "" {
+		bName = b.SupersededBy
+	}
+	return strings.Compare(aName, bName)
 }
 
 // EnqueueChange retains the complete winning state, so even a deletion purged

@@ -242,6 +242,18 @@ func TestTreeReplacementReplicatesBothNamespaceDirections(t *testing.T) {
 				if err != nil || old == nil || !old.Deleted {
 					t.Fatalf("obsolete destination not indexed at acknowledgement: %+v %v", old, err)
 				}
+				newName := "dst"
+				if sourceDirectory {
+					newName = "dst/new"
+				}
+				created, err := st.GetFile(newName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				observed, err := remoteStore.GetFile(targetName)
+				if err != nil || created == nil || observed == nil || created.StateClock() <= observed.StateClock() {
+					t.Fatalf("old-mtime replacement did not supersede the observed namespace: created=%+v previous=%+v error=%v", created, observed, err)
+				}
 				peer := httptest.NewServer(server.New(st, root, "source", nil, server.Config{}, logger).Handler())
 				defer peer.Close()
 				syn := syncer.New(remoteStore, remoteWatcher, peerRoot, "target", []string{peer.URL}, nil, logger, syncer.Options{PollInterval: 5 * time.Millisecond, RepairInterval: 10 * time.Millisecond, BatchLimit: 100, MaxConcurrentDownloads: 3})

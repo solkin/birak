@@ -19,7 +19,7 @@ import (
 // of silently hiding changes forever.
 const (
 	HeaderProtocol  = "X-Birak-Protocol"
-	ProtocolVersion = "2"
+	ProtocolVersion = "3"
 	// HeaderEpoch carries the responding node's process incarnation.
 	HeaderEpoch = "X-Birak-Epoch"
 	// HeaderMaxVersion carries the responding node's highest assigned version.

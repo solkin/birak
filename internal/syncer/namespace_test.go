@@ -139,41 +139,33 @@ func TestFileTombstoneBelowRegularAncestorIsAlreadyAbsent(t *testing.T) {
 	}
 }
 
-// Independent live parent/child states are a structural conflict, not a file
-// overwrite. Retrying must preserve both sides and expose unfinished repair.
-func TestConcurrentFileDirectoryConflictPreservesDataAndStaysVisible(t *testing.T) {
-	parent, _ := auditSyncer(t)
-	child, _ := auditSyncer(t)
-	auditIndex(t, parent, auditMeta("a", "parent bytes", 100), "parent bytes")
-	auditIndex(t, child, auditMeta("a/child", "child bytes", 200), "child bytes")
-	parentHTTP := httptest.NewServer(server.New(parent.store, parent.syncDir, "parent-node", nil, server.Config{}, parent.logger).Handler())
-	defer parentHTTP.Close()
-	childHTTP := httptest.NewServer(server.New(child.store, child.syncDir, "child-node", nil, server.Config{}, child.logger).Handler())
-	defer childHTTP.Close()
-	for _, tc := range []struct {
-		local, remote   *Syncer
-		url, name, body string
-	}{
-		{parent, child, childHTTP.URL, "a", "parent bytes"},
-		{child, parent, parentHTTP.URL, "a/child", "child bytes"},
-	} {
-		changes, err := tc.remote.store.ListManifest("", 10)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if applied, err := tc.local.applyBatch(context.Background(), tc.url, changes); err != nil || applied != 0 {
-			t.Fatalf("conflict falsely applied: %d %v", applied, err)
-		}
-		items, err := tc.local.store.DueRepairs(tc.url, 10)
-		if err != nil || len(items) != 1 {
-			t.Fatalf("conflict not queued: %+v %v", items, err)
-		}
-		tc.local.repairOne(context.Background(), tc.url, items[0])
-		if stats, err := tc.local.store.RepairQueueStats(); err != nil || stats.Total != 1 {
-			t.Fatalf("unresolved conflict disappeared: %+v %v", stats, err)
-		}
-		if body, err := os.ReadFile(filepath.Join(tc.local.syncDir, tc.name)); err != nil || string(body) != tc.body {
-			t.Fatalf("conflict destroyed data: %q %v", body, err)
-		}
+// Structural conflicts converge and keep the displaced generation as a normal
+// replicated file, including on a third node that never saw the original bytes.
+func TestConcurrentFileDirectoryConflictConvergesWithoutDataLoss(t *testing.T) {
+	for _, parentWins := range []bool{false, true} {
+		t.Run(fmt.Sprint(parentWins), func(t *testing.T) {
+			nodes, peers := namespaceNodes(t, 3)
+			parentTime, childTime := int64(100), int64(200)
+			if parentWins {
+				parentTime, childTime = childTime, parentTime
+			}
+			parent := auditMeta("a", "parent bytes", parentTime)
+			child := auditMeta("a/child", "child bytes", childTime)
+			auditIndex(t, nodes[0], parent, "parent bytes")
+			auditIndex(t, nodes[1], child, "child bytes")
+			convergeNamespace(t, nodes, peers)
+			loser, winner, loserBody, winnerBody := parent, child, "parent bytes", "child bytes"
+			if parentWins {
+				loser, winner, loserBody, winnerBody = child, parent, "child bytes", "parent bytes"
+			}
+			for _, node := range nodes {
+				assertNamespaceBytes(t, node, winner.Name, winnerBody)
+				assertNamespaceBytes(t, node, store.ConflictCopyName(loser.Name, loser.Hash), loserBody)
+				gone, err := node.store.GetFile(loser.Name)
+				if err != nil || gone == nil || !gone.Deleted || gone.SupersededBy != winner.Name {
+					t.Fatalf("unresolved loser: %+v %v", gone, err)
+				}
+			}
+		})
 	}
 }

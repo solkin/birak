@@ -550,8 +550,11 @@ func (w *Watcher) setError(err error) {
 func (w *Watcher) CheckStorage() error {
 	unlock := fileops.Lock(w.dir)
 	defer unlock()
-	return w.prepareStorageLocked()
+	return w.CheckStorageLocked()
 }
+
+// CheckStorageLocked validates recovery/storage while the caller holds Lock.
+func (w *Watcher) CheckStorageLocked() error { return w.prepareStorageLocked() }
 
 // A persisted sentinel binds this metadata database to its data volume. A
 // missing/remounted root after restart must fail closed, not delete the cluster.

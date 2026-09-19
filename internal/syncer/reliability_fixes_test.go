@@ -64,7 +64,7 @@ func TestIntegrityRepairStartsOnInitialScan(t *testing.T) {
 	t.Fatalf("initial quarantine blocked recovery: %q stats=%+v", body, syn.PeerStats())
 }
 func TestProtocolMismatchDoesNotAdvanceCursor(t *testing.T) {
-	for _, version := range []string{"", "1", "future"} {
+	for _, version := range []string{"", "1", "2", "future"} {
 		t.Run("version="+version, func(t *testing.T) {
 			s, _ := auditSyncer(t)
 			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

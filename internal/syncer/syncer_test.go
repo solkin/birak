@@ -53,7 +53,7 @@ func TestSafeLocalPathRejectsPeerTraversalAndProtectedTargets(t *testing.T) {
 
 	// applyDeletion must validate before touching disk (or its watcher field), so
 	// even hostile metadata cannot remove a target outside syncDir.
-	if err := s.applyDeletion(store.FileMeta{Name: "outside-alias", Deleted: true}); err == nil {
+	if err := s.applyDeletion(context.Background(), store.FileMeta{Name: "outside-alias", Deleted: true}); err == nil {
 		t.Fatal("deletion through an external symlink was accepted")
 	}
 	if got, err := os.ReadFile(outside); err != nil || string(got) != "keep" {

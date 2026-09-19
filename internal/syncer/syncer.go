@@ -105,6 +105,9 @@ type Syncer struct {
 
 	statsMu sync.Mutex
 	stats   map[string]*peerStat
+
+	// Unexported checkpoint for process-boundary regression tests.
+	namespaceCheckpoint func(step, name string) error
 }
 
 // New creates a new Syncer.
@@ -550,7 +553,7 @@ func (s *Syncer) applyChange(ctx context.Context, peerURL string, change store.F
 
 	if change.Deleted {
 		s.logger.Info("applying remote deletion", "name", change.Name, "peer", peerURL)
-		return s.applyDeletion(change)
+		return s.applyDeletion(ctx, change)
 	}
 	return s.downloadAndApply(ctx, peerURL, change)
 }
@@ -565,6 +568,22 @@ func (s *Syncer) validateChange(change store.FileMeta) error {
 	}
 	if !change.Deleted && (change.Size < 0 || change.Size == math.MaxInt64 || !isSHA256Hex(change.Hash)) {
 		return fmt.Errorf("malformed metadata (size=%d hash=%q)", change.Size, change.Hash)
+	}
+	if change.SupersededBy != "" {
+		if !change.Deleted || change.Size != 0 || !isSHA256Hex(change.Hash) || !store.NamespaceConflict(change.Name, change.SupersededBy) {
+			return fmt.Errorf("malformed namespace tombstone for %s", change.Name)
+		}
+		if _, err := s.safeLocalPath(change.SupersededBy); err != nil {
+			return err
+		}
+	}
+	if change.ConflictOf != "" {
+		if change.Deleted || change.Name != store.ConflictCopyName(change.ConflictOf, change.Hash) {
+			return fmt.Errorf("malformed conflict copy for %s", change.Name)
+		}
+		if _, err := s.safeLocalPath(change.ConflictOf); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -886,16 +905,9 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		return fmt.Errorf("download %s: status %d", meta.Name, resp.StatusCode)
 	}
 
-	// Ensure parent directory exists.
+	// Stage without changing a namespace that may be blocked by a file.
 	destDir := filepath.Dir(destPath)
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return fmt.Errorf("create parent dir for %s: %w", meta.Name, err)
-	}
-
-	// Write to temp file with a unique name (random suffix) to prevent
-	// collisions when multiple goroutines download the same file from
-	// different peers simultaneously.
-	tmpFile, err := fileops.CreateTemp(destDir, ".birak-tmp-"+filepath.Base(meta.Name)+"-*")
+	tmpFile, err := s.replicaTemp(destPath)
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
@@ -993,6 +1005,16 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		return err
 	}
 
+	apply, err := s.settleNamespaceLocked(ctx, meta, tmpPath)
+	if err != nil || !apply {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return err
+	}
 	if err := s.store.StageReplica(meta); err != nil {
 		return err
 	}
@@ -1007,6 +1029,9 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	// missing" and broadcast a deletion, destroying the file on every peer.
 	if err := fileops.SyncParents(destDir, s.syncDir); err != nil {
 		return fmt.Errorf("persist replica directory: %w", err)
+	}
+	if err := s.namespaceStep("published", meta.Name); err != nil {
+		return err
 	}
 
 	// Update local store AFTER rename. This ordering is critical: if PutFile
@@ -1030,7 +1055,7 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 
 // applyDeletion removes a file locally and marks it as deleted in the store.
 // The caller holds the per-path lock.
-func (s *Syncer) applyDeletion(meta store.FileMeta) error {
+func (s *Syncer) applyDeletion(ctx context.Context, meta store.FileMeta) error {
 	destPath, err := s.safeLocalPath(meta.Name)
 	if err != nil {
 		return err
@@ -1055,8 +1080,42 @@ func (s *Syncer) applyDeletion(meta store.FileMeta) error {
 		return err
 	}
 
+	return s.commitDeletionLocked(ctx, meta, destPath)
+}
+
+// Caller holds the namespace lock. Recheck each displaced generation and make
+// its conflict copy durable before staging any destructive operation.
+func (s *Syncer) commitDeletionLocked(ctx context.Context, meta store.FileMeta, destPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if meta.SupersededBy != "" {
+		if err := s.watcher.RefreshLocked(meta.Name); err != nil {
+			return err
+		}
+		local, err := s.store.GetFile(meta.Name)
+		if err != nil {
+			return err
+		}
+		if !remoteWins(local, meta) {
+			return nil
+		}
+		if local != nil && !local.Deleted {
+			if err := s.preserveConflictLocked(ctx, *local, destPath); err != nil {
+				return err
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := s.store.StageReplica(meta); err != nil {
 		return err
+	}
+	if meta.SupersededBy != "" {
+		if err := s.namespaceStep("delete-intent", meta.Name); err != nil {
+			return err
+		}
 	}
 	// A file tombstone says nothing about implicit directories at that name.
 	// Children can arrive first in a concurrent batch, or already exist locally.
@@ -1066,12 +1125,24 @@ func (s *Syncer) applyDeletion(meta store.FileMeta) error {
 	if err := fileops.SyncSurvivingParent(destPath, s.syncDir); err != nil {
 		return err
 	}
-	watcher.CleanEmptyParentsLocked(destPath, s.syncDir, s.ignorePatterns, s.logger)
+	if meta.SupersededBy == "" {
+		watcher.CleanEmptyParentsLocked(destPath, s.syncDir, s.ignorePatterns, s.logger)
+	}
+	if meta.SupersededBy != "" {
+		if err := s.namespaceStep("unlinked", meta.Name); err != nil {
+			return err
+		}
+	}
 
 	// Filesystem first; the durable intent restores the source clock if SQLite
 	// fails here or the process stops before the metadata commit.
 	if _, err := s.store.PutRemote(meta); err != nil {
 		return fmt.Errorf("mark deleted in store %s: %w", meta.Name, err)
+	}
+	if meta.SupersededBy != "" {
+		if err := s.namespaceStep("resolved", meta.Name); err != nil {
+			return err
+		}
 	}
 
 	s.logger.Info("file deletion synced", "name", meta.Name)
