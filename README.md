@@ -535,3 +535,11 @@ go test -v ./internal/gateway/sftp/
 # Integration tests only (spins up real nodes)
 go test -v -timeout 120s -run TestIntegration
 ```
+
+### Upload limit defaults
+
+Omitting `multipart.max_active_uploads` limits the server to 10,000 staged
+uploads. Explicit `0` disables this cap in either YAML or the environment;
+environment values override YAML. Negative YAML upload limits are rejected.
+`max_upload_bytes: 0` leaves S3, WebDAV, and SFTP uploads unlimited; the HTTP
+browser retains its 1 GiB default request limit.
