@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"syscall"
 
 	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/store"
@@ -276,25 +277,35 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if info.IsDir() {
-		http.Error(w, "not a file", http.StatusBadRequest)
+	if !info.Mode().IsRegular() {
+		http.Error(w, "not a regular file", http.StatusBadRequest)
 		return
 	}
-
-	s.logger.Debug("serving file", "name", cleaned, "size", info.Size())
 
 	// Open the file ourselves and use http.ServeContent instead of
 	// http.ServeFile. ServeFile has built-in behaviour that redirects any
 	// URL ending with "/index.html" to "./" (301), which causes the sync
 	// client to follow the redirect and hit the directory — returning 400.
 	// ServeContent has no such redirect logic and serves the bytes as-is.
-	f, err := os.Open(fullPath)
+	// Nonblocking open prevents a file replaced by a FIFO between Stat and
+	// Open from stranding a handler after its client has already disconnected.
+	f, err := os.OpenFile(fullPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		s.logger.Error("open file failed", "name", cleaned, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
+	info, err = f.Stat()
+	if err != nil {
+		http.Error(w, "stat open file failed", http.StatusInternalServerError)
+		return
+	}
+	if !info.Mode().IsRegular() {
+		http.Error(w, "not a regular file", http.StatusBadRequest)
+		return
+	}
+	s.logger.Debug("serving file", "name", cleaned, "size", info.Size())
 
 	// Advertise the source mode so the replica does not inherit the 0600 of the
 	// downloader's temp file, which would make it unreadable to other UIDs.

@@ -21,9 +21,15 @@ import (
 
 // Staging uses the nearest existing directory, on the destination filesystem.
 // It does not create a directory over a conflicting file before verification.
-func (s *Syncer) replicaTemp(dest string) (*os.File, error) {
+func (s *Syncer) replicaTemp(name string) (*os.File, error) {
 	unlock := fileops.Lock(s.syncDir)
 	defer unlock()
+	// Response headers can arrive long after the original path check. Resolve
+	// again under the namespace lock before creating anything on disk.
+	dest, err := s.safeLocalPath(name)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.watcher.CheckStorageLocked(); err != nil {
 		return nil, err
 	}

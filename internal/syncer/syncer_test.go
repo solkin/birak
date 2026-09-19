@@ -43,6 +43,9 @@ func TestSafeLocalPathRejectsPeerTraversalAndProtectedTargets(t *testing.T) {
 		"/absolute.txt",
 		"./rewritten.txt",
 		".birak/multipart/upload.json",
+		".birak-tmp-parent/child",
+		"folder/.birak-bak-parent/child",
+		"invalid\x00name",
 		"object.tmp",
 		"outside-alias",
 	} {

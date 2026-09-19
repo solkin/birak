@@ -387,9 +387,11 @@ sftp> rm old-file.txt
 5. The cursor advances only when every operation has succeeded or its complete state has been persisted in the **repair queue**. Cancellation or a queue write failure prevents advancement.
 6. A new node starts at `since=0`, receiving both live files and deletion history.
 
-Repairs retry with exponential backoff. A queued deletion survives loss of the source's metadata and can be applied while that source is offline. A persistent permission, disk, or connectivity failure stays visible in `/status`. **Full reconciliation** compares peer manifests every `reconcile_interval`; `0` disables it.
+Repairs retry with exponential backoff. A queued deletion survives loss of the source's metadata and can be applied while that source is offline. A persistent permission, disk, or connectivity failure stays visible in `/status`. A valid peer name blocked by a local symlink also remains queued until the obstruction is resolved; malformed or misrouted `/meta` replies cannot erase accepted work. Explicitly ignored names are skipped. **Full reconciliation** compares peer manifests every `reconcile_interval`; `0` disables it.
 
 Connect and TLS establishment are limited to 10 seconds each, response headers to 15 seconds, and inactivity during a file body to 60 seconds. Large transfers have no short overall timeout while bytes continue arriving.
+
+The peer file endpoint serves regular files only. Pipes and other special files are rejected without waiting for a writer.
 
 ### Conflict Resolution
 
@@ -567,6 +569,11 @@ See the [protocol parity contract](docs/protocol-parity.md) for shared behavior,
 intentional differences, and the rules for porting protocol fixes.
 
 ### Running Tests
+
+The [repair validation and disk-full review](docs/audits/replication-repair-validation.md)
+covers blocked local paths, malformed metadata replies, special-file requests,
+and recovery after real ENOSPC on a bounded Linux tmpfs. The disk-full test is
+opt-in; the report includes its container command.
 
 The [second replication review](docs/audits/replication-second-review.md) records
 the reproduced failures before this round. The [follow-up fixes and validation](docs/audits/replication-followup-fixes.md)

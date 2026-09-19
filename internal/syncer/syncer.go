@@ -507,6 +507,12 @@ func (s *Syncer) applyChange(ctx context.Context, peerURL string, change store.F
 	unlock := s.paths.lock(change.Name)
 	defer unlock()
 	commitUnlock := fileops.Lock(s.syncDir)
+	// A valid peer name may currently be blocked by a local alias or storage
+	// condition. Keep that failure in repair; do not classify it as bad input.
+	if _, err := s.safeLocalPath(change.Name); err != nil {
+		commitUnlock()
+		return err
+	}
 	refreshErr := s.watcher.RefreshLocked(change.Name)
 	damaged := errors.Is(refreshErr, watcher.ErrIntegrity)
 	if refreshErr != nil && !damaged {
@@ -558,12 +564,23 @@ func (s *Syncer) applyChange(ctx context.Context, peerURL string, change store.F
 	return s.downloadAndApply(ctx, peerURL, change)
 }
 
-// validateChange rejects peer metadata that could never be applied safely.
+// validateChange is deliberately independent of the local filesystem. Invalid
+// wire data and configured exclusions can be skipped, but a temporarily unsafe
+// destination must stay in the durable repair queue.
 func (s *Syncer) validateChange(change store.FileMeta) error {
-	// Peer metadata is untrusted input. Resolve it with the same path policy as
-	// local gateways and require the canonical relative name to be unchanged;
-	// otherwise names such as a/../../outside could escape after filepath.Join.
-	if _, err := s.safeLocalPath(change.Name); err != nil {
+	if err := validateMetadata(change); err != nil {
+		return err
+	}
+	for _, name := range []string{change.Name, change.SupersededBy, change.ConflictOf} {
+		if name != "" && watcher.ShouldIgnore(name, s.ignorePatterns) {
+			return fmt.Errorf("ignored sync path %q", name)
+		}
+	}
+	return nil
+}
+
+func validateMetadata(change store.FileMeta) error {
+	if err := validateSyncName(change.Name); err != nil {
 		return err
 	}
 	if !change.Deleted && (change.Size < 0 || change.Size == math.MaxInt64 || !isSHA256Hex(change.Hash)) {
@@ -573,7 +590,7 @@ func (s *Syncer) validateChange(change store.FileMeta) error {
 		if !change.Deleted || change.Size != 0 || !isSHA256Hex(change.Hash) || !store.NamespaceConflict(change.Name, change.SupersededBy) {
 			return fmt.Errorf("malformed namespace tombstone for %s", change.Name)
 		}
-		if _, err := s.safeLocalPath(change.SupersededBy); err != nil {
+		if err := validateSyncName(change.SupersededBy); err != nil {
 			return err
 		}
 	}
@@ -581,8 +598,23 @@ func (s *Syncer) validateChange(change store.FileMeta) error {
 		if change.Deleted || change.Name != store.ConflictCopyName(change.ConflictOf, change.Hash) {
 			return fmt.Errorf("malformed conflict copy for %s", change.Name)
 		}
-		if _, err := s.safeLocalPath(change.ConflictOf); err != nil {
+		if err := validateSyncName(change.ConflictOf); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func validateSyncName(name string) error {
+	if name == "." || !filepath.IsLocal(name) || filepath.ToSlash(filepath.Clean(name)) != name || strings.ContainsRune(name, 0) {
+		return fmt.Errorf("non-canonical sync path %q", name)
+	}
+	if watcher.ShouldIgnore(name, nil) {
+		return fmt.Errorf("reserved sync path %q", name)
+	}
+	for _, part := range strings.Split(name, "/") {
+		if gateway.IsScratchFile(part) {
+			return fmt.Errorf("reserved sync path %q", name)
 		}
 	}
 	return nil
@@ -816,8 +848,14 @@ func (s *Syncer) fetchMeta(ctx context.Context, peerURL, name string) (*store.Fi
 	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
 		return nil, fmt.Errorf("decode meta for %s: %w", name, err)
 	}
-	// Trust the requested name over whatever the peer echoed back.
-	meta.Name = name
+	// A malformed or misrouted reply must not supersede durable accepted work.
+	// In particular, applyChange's skip policy is not proof of repair success.
+	if meta.Name != name {
+		return nil, fmt.Errorf("meta for %s returned a different name %q", name, meta.Name)
+	}
+	if err := validateMetadata(meta); err != nil {
+		return nil, fmt.Errorf("meta for %s: %w", name, err)
+	}
 	return &meta, nil
 }
 
@@ -907,7 +945,7 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 
 	// Stage without changing a namespace that may be blocked by a file.
 	destDir := filepath.Dir(destPath)
-	tmpFile, err := s.replicaTemp(destPath)
+	tmpFile, err := s.replicaTemp(meta.Name)
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
@@ -987,6 +1025,12 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Validate before reading local bytes: an ancestor may have been moved
+	// while the download was in progress.
+	destPath, err = s.safeLocalPath(meta.Name)
+	if err != nil {
+		return err
+	}
 	refreshErr := s.watcher.RefreshLocked(meta.Name)
 	damaged := errors.Is(refreshErr, watcher.ErrIntegrity)
 	if refreshErr != nil && !damaged {
@@ -999,12 +1043,6 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	if !remoteWins(current, meta) && !(damaged && store.CompareState(&meta, current) == 0) {
 		return nil
 	}
-	// Validate again after waiting: an ancestor may have been moved meanwhile.
-	destPath, err = s.safeLocalPath(meta.Name)
-	if err != nil {
-		return err
-	}
-
 	apply, err := s.settleNamespaceLocked(ctx, meta, tmpPath)
 	if err != nil || !apply {
 		return err
@@ -1056,13 +1094,13 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 // applyDeletion removes a file locally and marks it as deleted in the store.
 // The caller holds the per-path lock.
 func (s *Syncer) applyDeletion(ctx context.Context, meta store.FileMeta) error {
+	unlock := fileops.Lock(s.syncDir)
+	defer unlock()
 	destPath, err := s.safeLocalPath(meta.Name)
 	if err != nil {
 		return err
 	}
 
-	unlock := fileops.Lock(s.syncDir)
-	defer unlock()
 	refreshErr := s.watcher.RefreshLocked(meta.Name)
 	damaged := errors.Is(refreshErr, watcher.ErrIntegrity)
 	if refreshErr != nil && !damaged {
@@ -1075,11 +1113,6 @@ func (s *Syncer) applyDeletion(ctx context.Context, meta store.FileMeta) error {
 	if !remoteWins(local, meta) {
 		return nil
 	}
-	destPath, err = s.safeLocalPath(meta.Name)
-	if err != nil {
-		return err
-	}
-
 	return s.commitDeletionLocked(ctx, meta, destPath)
 }
 
@@ -1154,6 +1187,9 @@ func (s *Syncer) commitDeletionLocked(ctx context.Context, meta store.FileMeta, 
 // during cleaning signals malformed or traversal-oriented peer metadata.
 func (s *Syncer) safeLocalPath(name string) (string, error) {
 	normalized := filepath.ToSlash(name)
+	if err := validateSyncName(normalized); err != nil {
+		return "", err
+	}
 	rel, full, err := gateway.SafePath(s.syncDir, normalized, s.ignorePatterns)
 	if err != nil {
 		return "", fmt.Errorf("unsafe sync path %q: %w", name, err)
