@@ -167,6 +167,12 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 	// Split into bucket and key.
 	bucket, key, _ := strings.Cut(path, "/")
 
+	g.routeBucketOrObject(w, r, bucket, key)
+}
+
+// routeBucketOrObject handles all bucket-level and object-level operations.
+// Used by both path-style and virtual-hosted-style routing.
+func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	if gateway.IsScratchFile(bucket) {
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
@@ -178,12 +184,6 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	g.routeBucketOrObject(w, r, bucket, key)
-}
-
-// routeBucketOrObject handles all bucket-level and object-level operations.
-// Used by both path-style and virtual-hosted-style routing.
-func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	if key == "" {
 		// Check for sub-resource queries before bucket-level operations.
 		query := r.URL.Query()
@@ -236,7 +236,7 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	// Check ignore patterns on key.
-	if watcher.ShouldIgnore(key, g.ignorePatterns) {
+	if watcher.ShouldIgnore(bucket+"/"+key, g.ignorePatterns) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
 		return
 	}

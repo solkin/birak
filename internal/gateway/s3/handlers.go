@@ -250,7 +250,7 @@ func (g *Gateway) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 
 	var buckets []BucketInfo
 	for _, entry := range entries {
-		if !entry.IsDir() || gateway.IsReserved(entry.Name()) {
+		if !entry.IsDir() || gateway.IsReserved(entry.Name()) || gateway.IsScratchFile(entry.Name()) {
 			continue
 		}
 		if watcher.ShouldIgnore(entry.Name(), g.ignorePatterns) {
@@ -511,8 +511,21 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string) ([]ObjectInfo, []
 		relPath, _ := filepath.Rel(bp, path)
 		key := filepath.ToSlash(relPath)
 
+		// A backup can be an entire directory during WebDAV COPY/MOVE. Prune
+		// scratch directories before walking children or collecting prefixes.
+		if gateway.IsScratchFile(fi.Name()) {
+			if fi.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
 		// Skip ignored files/dirs.
-		if watcher.ShouldIgnore(key, g.ignorePatterns) {
+		rootRel, relErr := filepath.Rel(g.syncDir, path)
+		if relErr != nil {
+			return relErr
+		}
+		if watcher.ShouldIgnore(filepath.ToSlash(rootRel), g.ignorePatterns) {
 			if fi.IsDir() {
 				return filepath.SkipDir
 			}
@@ -531,10 +544,6 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string) ([]ObjectInfo, []
 				g.logger.Warn("list objects: skipping symlink outside bucket", "path", path)
 				return nil
 			}
-			rootRel, relErr := filepath.Rel(g.syncDir, path)
-			if relErr != nil {
-				return nil
-			}
 			if _, _, safeErr := gateway.SafePath(g.syncDir, filepath.ToSlash(rootRel), g.ignorePatterns); safeErr != nil {
 				g.logger.Warn("list objects: skipping unsafe symlink", "path", path, "error", safeErr)
 				return nil
@@ -544,13 +553,6 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string) ([]ObjectInfo, []
 				return nil
 			}
 			fi = resolvedInfo
-		}
-
-		// A scratch file is a write in flight, not an object: listing it would
-		// advertise a key that disappears the moment the write is renamed into
-		// place.
-		if gateway.IsScratchFile(fi.Name()) {
-			return nil
 		}
 
 		if prefix != "" && !strings.HasPrefix(key, prefix) {
