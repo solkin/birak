@@ -132,7 +132,7 @@ ignore:
   - ".DS_Store"
   - "Thumbs.db"
   - "*.swp"
-max_upload_bytes: 1073741824   # 1 GiB cap per upload; 0 = unlimited
+max_upload_bytes: 1073741824   # 1 GiB cap per upload; 0 = unlimited except HTTP UI (1 GiB default)
 multipart:                    # S3 multipart upload limits and retention
   min_part_bytes: 5242880     # 5 MiB — minimum size of every part but the last
   max_part_bytes: 5368709120  # 5 GiB — maximum size of a single part
@@ -199,7 +199,7 @@ export BIRAK_HTTP_ENABLED=true
 | `peers` | `BIRAK_PEERS` | `[]` | Peer URLs (comma-separated in env) |
 | `ignore` | `BIRAK_IGNORE` | `[]` | Ignore patterns (comma-separated in env) |
 | `cluster_secret` | `BIRAK_CLUSTER_SECRET` | _(empty)_ | Shared secret required on peer-to-peer requests; empty leaves the sync API open |
-| `max_upload_bytes` | `BIRAK_MAX_UPLOAD_BYTES` | `0` | Max single-upload size in bytes across all gateways (0 = unlimited) |
+| `max_upload_bytes` | `BIRAK_MAX_UPLOAD_BYTES` | `0` | Max upload bytes; 0 = unlimited for S3/WebDAV/SFTP, 1 GiB default for HTTP UI |
 | `multipart.min_part_bytes` | `BIRAK_MULTIPART_MIN_PART_BYTES` | `5242880` | Minimum size of every multipart part but the last |
 | `multipart.max_part_bytes` | `BIRAK_MULTIPART_MAX_PART_BYTES` | `5368709120` | Maximum size of a single multipart part |
 | `multipart.max_parts` | `BIRAK_MULTIPART_MAX_PARTS` | `10000` | Highest accepted part number |
@@ -233,6 +233,14 @@ export BIRAK_HTTP_ENABLED=true
 | `gateways.sftp.username` | `BIRAK_SFTP_USERNAME` | _(empty)_ | SFTP username |
 | `gateways.sftp.password` | `BIRAK_SFTP_PASSWORD` | _(empty)_ | SFTP password |
 | `gateways.sftp.host_key_path` | `BIRAK_SFTP_HOST_KEY_PATH` | _(auto)_ | Path to SSH host key (auto-generated if empty) |
+
+### Upload limit defaults
+
+Omitting `multipart.max_active_uploads` limits the server to 10,000 staged
+uploads. Explicit `0` disables this cap in either YAML or the environment;
+environment values override YAML. Negative YAML upload limits are rejected.
+`max_upload_bytes: 0` leaves S3, WebDAV, and SFTP uploads unlimited; the HTTP
+browser retains its 1 GiB default request limit.
 
 ## Access Protocols
 
@@ -339,7 +347,7 @@ Standard WebDAV protocol. Compatible with macOS Finder, Windows Explorer, Linux 
 | `MKCOL` | Create directory |
 | `MOVE` | Move / rename |
 | `COPY` | Copy file or directory |
-| `LOCK` / `UNLOCK` | Stub (fake token for client compatibility) |
+| `LOCK` / `UNLOCK` | In-memory exclusive write locks, enforced by this WebDAV gateway |
 
 **Connecting:**
 
@@ -519,6 +527,9 @@ birak/
   integration_test.go             — multi-node integration tests
 ```
 
+See the [protocol parity contract](docs/protocol-parity.md) for shared behavior,
+intentional differences, and the rules for porting protocol fixes.
+
 ### Running Tests
 
 ```bash
@@ -535,11 +546,3 @@ go test -v ./internal/gateway/sftp/
 # Integration tests only (spins up real nodes)
 go test -v -timeout 120s -run TestIntegration
 ```
-
-### Upload limit defaults
-
-Omitting `multipart.max_active_uploads` limits the server to 10,000 staged
-uploads. Explicit `0` disables this cap in either YAML or the environment;
-environment values override YAML. Negative YAML upload limits are rejected.
-`max_upload_bytes: 0` leaves S3, WebDAV, and SFTP uploads unlimited; the HTTP
-browser retains its 1 GiB default request limit.
