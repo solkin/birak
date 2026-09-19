@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/watcher"
 )
@@ -325,7 +326,7 @@ func (g *Gateway) handleCreateBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	if err := os.Mkdir(bp, 0o755); err != nil {
+	if err := fileops.Mkdir(g.syncDir, bp, 0o755, false); err != nil {
 		g.logger.Error("create bucket failed", "bucket", bucket, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to create bucket")
 		return
@@ -390,7 +391,7 @@ func (g *Gateway) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 		os.Remove(filepath.Join(bp, e.Name()))
 	}
 
-	if err := os.Remove(bp); err != nil {
+	if err := fileops.Remove(g.syncDir, bp, false); err != nil {
 		g.logger.Error("delete bucket failed", "bucket", bucket, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to delete bucket")
 		return
@@ -901,19 +902,20 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 
 	// Create parent directories if needed.
 	dir := filepath.Dir(op)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := fileops.Mkdir(g.syncDir, dir, 0o755, true); err != nil {
 		g.logger.Error("put object: mkdir failed", "bucket", bucket, "key", key, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to create directories")
 		return
 	}
 
 	// Write to temp file, then rename (atomic write).
-	tmpFile, err := os.CreateTemp(dir, ".birak-tmp-*")
+	tmpFile, err := fileops.CreateTemp(dir, ".birak-tmp-*")
 	if err != nil {
 		g.logger.Error("put object: create temp failed", "bucket", bucket, "key", key, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to create temp file")
 		return
 	}
+	defer fileops.ReleaseTemp(tmpFile)
 	tmpPath := tmpFile.Name()
 
 	writers := []io.Writer{tmpFile}
@@ -955,7 +957,7 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 
 	// Rename temp file to final path.
-	if err := os.Rename(tmpPath, op); err != nil {
+	if err := fileops.Publish(g.syncDir, tmpPath, op); err != nil {
 		os.Remove(tmpPath)
 		g.logger.Error("put object: rename failed", "bucket", bucket, "key", key, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to finalize object")
@@ -997,7 +999,7 @@ func (g *Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, buc
 	// in S3, and a key that resolves to a directory must not be removed via the
 	// object API (os.Remove on a non-empty directory would otherwise return 500).
 	if info, err := os.Stat(op); err == nil && !info.IsDir() {
-		if rmErr := os.Remove(op); rmErr != nil && !os.IsNotExist(rmErr) {
+		if rmErr := fileops.Remove(g.syncDir, op, false); rmErr != nil && !os.IsNotExist(rmErr) {
 			g.logger.Error("delete object failed", "bucket", bucket, "key", key, "error", rmErr)
 			writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to delete object")
 			return

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/watcher"
 
@@ -23,10 +24,12 @@ import (
 const maxHandlesPerSession = 1024
 
 type handleEntry struct {
-	path  string
-	file  *os.File // regular-file handle (SSH_FXP_OPEN)
-	dir   *os.File // directory handle (SSH_FXP_OPENDIR), read incrementally
-	isDir bool
+	path        string
+	file        *os.File // regular-file handle (SSH_FXP_OPEN)
+	dir         *os.File // directory handle (SSH_FXP_OPENDIR), read incrementally
+	closeWriter func() error
+	appendMode  bool
+	isDir       bool
 }
 
 type session struct {
@@ -385,13 +388,19 @@ func (s *session) handleOpen(payload []byte) {
 	// Create parent directories for new files.
 	if pflags&sshFxfCreat != 0 {
 		dir := filepath.Dir(fullPath)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := fileops.Mkdir(s.g.syncDir, dir, 0o755, true); err != nil {
 			s.sendStatus(id, sshFxFailure, "mkdir failed")
 			return
 		}
 	}
 
-	f, err := os.OpenFile(fullPath, flag, 0o644)
+	var f *os.File
+	var closeWriter func() error
+	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0 {
+		f, closeWriter, err = fileops.OpenWriter(s.g.syncDir, fullPath, flag, 0o644)
+	} else {
+		f, err = os.OpenFile(fullPath, flag, 0o644)
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.sendStatus(id, sshFxNoSuchFile, "no such file")
@@ -403,9 +412,13 @@ func (s *session) handleOpen(payload []byte) {
 		return
 	}
 
-	handle, ok := s.addHandle(&handleEntry{path: fullPath, file: f})
+	handle, ok := s.addHandle(&handleEntry{path: fullPath, file: f, closeWriter: closeWriter, appendMode: flag&os.O_APPEND != 0})
 	if !ok {
-		f.Close()
+		if closeWriter != nil {
+			fileops.AbortWriter(s.g.syncDir, f)
+		} else {
+			f.Close()
+		}
 		s.sendStatus(id, sshFxFailure, "too many open handles")
 		return
 	}
@@ -507,6 +520,14 @@ func (s *session) handleWrite(payload []byte) {
 		return
 	}
 
+	if entry.appendMode {
+		info, err := entry.file.Stat()
+		if err != nil {
+			s.sendStatus(id, sshFxFailure, err.Error())
+			return
+		}
+		offset = uint64(info.Size())
+	}
 	// Enforce the configured per-file upload cap: reject any write whose end offset
 	// would push the file past the limit (the same bound the other gateways apply).
 	if max := s.g.config.MaxUploadBytes; max > 0 && int64(offset)+int64(len(data)) > max {
@@ -514,7 +535,7 @@ func (s *session) handleWrite(payload []byte) {
 		return
 	}
 
-	_, err = entry.file.WriteAt([]byte(data), int64(offset))
+	err = fileops.Do(s.g.syncDir, func() error { _, err := entry.file.WriteAt([]byte(data), int64(offset)); return err })
 	if err != nil {
 		s.sendStatus(id, sshFxFailure, "write error")
 		return
@@ -552,7 +573,11 @@ func (s *session) handleClose(payload []byte) {
 	if entry.file != nil {
 		// Report a Close error (e.g. a deferred write/flush failure) instead of
 		// claiming success — otherwise a truncated upload looks like it succeeded.
-		if err := entry.file.Close(); err != nil {
+		closeFile := entry.file.Close
+		if entry.closeWriter != nil {
+			closeFile = entry.closeWriter
+		}
+		if err := closeFile(); err != nil {
 			s.sendStatus(id, sshFxFailure, err.Error())
 			return
 		}
@@ -587,7 +612,7 @@ func (s *session) handleRemove(payload []byte) {
 		return
 	}
 
-	if err := os.Remove(fullPath); err != nil {
+	if err := fileops.Remove(s.g.syncDir, fullPath, false); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -614,7 +639,7 @@ func (s *session) handleMkdir(payload []byte) {
 		return
 	}
 
-	if err := os.Mkdir(fullPath, 0o755); err != nil {
+	if err := fileops.Mkdir(s.g.syncDir, fullPath, 0o755, false); err != nil {
 		if os.IsExist(err) {
 			s.sendStatus(id, sshFxFailure, "already exists")
 		} else {
@@ -651,7 +676,7 @@ func (s *session) handleRmdir(payload []byte) {
 		return
 	}
 
-	if err := os.Remove(fullPath); err != nil {
+	if err := fileops.Remove(s.g.syncDir, fullPath, false); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -688,7 +713,7 @@ func (s *session) handleRename(payload []byte) {
 		return
 	}
 
-	if err := os.Rename(oldFull, newFull); err != nil {
+	if err := fileops.Rename(s.g.syncDir, oldFull, newFull); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -723,7 +748,12 @@ func (s *session) handleSetstat(payload []byte) {
 		s.sendStatus(id, sshFxPermissionDenied, "access denied")
 		return
 	}
-	if err := applyAttrs(attrs, full, nil); err != nil {
+	if err := fileops.Commit(s.g.syncDir, []string{full}, func() error {
+		if fileops.BusyLocked(s.g.syncDir, full) {
+			return fileops.ErrBusy
+		}
+		return applyAttrs(attrs, full, nil)
+	}); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -755,7 +785,18 @@ func (s *session) handleFsetstat(payload []byte) {
 		s.sendStatus(id, sshFxFailure, "invalid handle")
 		return
 	}
-	if err := applyAttrs(attrs, entry.path, entry.file); err != nil {
+	apply := func() error { return applyAttrs(attrs, entry.path, entry.file) }
+	if entry.closeWriter != nil {
+		err = fileops.Do(s.g.syncDir, apply)
+	} else {
+		err = fileops.Commit(s.g.syncDir, []string{entry.path}, func() error {
+			if fileops.BusyLocked(s.g.syncDir, entry.path) {
+				return fileops.ErrBusy
+			}
+			return apply()
+		})
+	}
+	if err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -785,7 +826,10 @@ func applyAttrs(a fileAttrs, path string, f *os.File) error {
 		}
 	}
 	if a.hasTimes {
-		// *os.File has no Chtimes; times are always applied by path.
+		// Writable handles name their staging file until CLOSE.
+		if f != nil {
+			path = f.Name()
+		}
 		if err := os.Chtimes(path, time.Unix(int64(a.atime), 0), time.Unix(int64(a.mtime), 0)); err != nil {
 			return err
 		}
@@ -845,7 +889,7 @@ func (s *session) handlePosixRename(id uint32, rest []byte) {
 		return
 	}
 
-	if err := os.Rename(oldFull, newFull); err != nil {
+	if err := fileops.Rename(s.g.syncDir, oldFull, newFull); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -887,7 +931,11 @@ func (s *session) closeAllHandles() {
 	defer s.mu.Unlock()
 	for _, entry := range s.handles {
 		if entry.file != nil {
-			entry.file.Close()
+			if entry.closeWriter != nil {
+				fileops.AbortWriter(s.g.syncDir, entry.file)
+			} else {
+				entry.file.Close()
+			}
 		}
 		if entry.dir != nil {
 			entry.dir.Close()

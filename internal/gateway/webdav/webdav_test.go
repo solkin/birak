@@ -913,7 +913,7 @@ func TestStageReplace_RestoresOriginalOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Name() != "target.txt" {
+	if len(entries) != 2 || entries[0].Name() != ".birak" || entries[1].Name() != "target.txt" {
 		t.Fatalf("expected only restored target, got %v", entries)
 	}
 }

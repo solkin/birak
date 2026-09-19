@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/watcher"
 )
 
@@ -115,8 +116,9 @@ func IsScratchFile(name string) bool {
 	return strings.HasPrefix(name, tempFilePrefix) || strings.HasPrefix(name, backupFilePrefix)
 }
 
-// SweepTempFiles removes stale atomic-write scratch files (".birak-tmp-*" and
-// ".birak-bak-*") left under rootDir by a process that died between creating a temp
+// SweepTempFiles removes stale atomic-write scratch files (".birak-tmp-*").
+// Backups belong to recovery journals and must never be swept.
+// Scratch files can be left by a process that died between creating a temp
 // file and renaming it into place.
 //
 // Only files last modified more than maxAge ago are removed, so the sweep can run
@@ -124,12 +126,20 @@ func IsScratchFile(name string) bool {
 // streaming. Pass maxAge <= 0 to remove every scratch file regardless of age —
 // correct at startup, when no upload can be in flight.
 func SweepTempFiles(rootDir string, maxAge time.Duration, logger *slog.Logger) {
+	unlock := fileops.Lock(rootDir)
+	defer unlock()
 	cutoff := time.Now().Add(-maxAge)
 	filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
 			return nil
 		}
-		if !IsScratchFile(d.Name()) {
+		if d.IsDir() {
+			if strings.HasPrefix(d.Name(), backupFilePrefix) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasPrefix(d.Name(), tempFilePrefix) || fileops.ScratchActive(path) {
 			return nil
 		}
 		if maxAge > 0 {

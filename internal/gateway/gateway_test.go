@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"github.com/birak/birak/internal/fileops"
 	"io"
 	"log/slog"
 	"net/http"
@@ -276,8 +277,8 @@ func TestSweepTempFiles(t *testing.T) {
 	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
 		t.Errorf("stale .birak-tmp file should be removed")
 	}
-	if _, err := os.Stat(bak); !os.IsNotExist(err) {
-		t.Errorf("stale .birak-bak file should be removed")
+	if _, err := os.Stat(bak); err != nil {
+		t.Errorf("recovery backup must survive cleanup: %v", err)
 	}
 }
 
@@ -320,7 +321,7 @@ func TestSweepTempFiles_AgeThreshold(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	fresh := filepath.Join(root, ".birak-tmp-active")
-	stale := filepath.Join(root, ".birak-bak-orphan")
+	stale := filepath.Join(root, ".birak-tmp-orphan")
 	keep := filepath.Join(root, "regular.txt")
 	for _, p := range []string{fresh, stale, keep} {
 		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
@@ -375,5 +376,26 @@ func TestSafePath_ScratchNamespaceIsReserved(t *testing.T) {
 		if _, _, err := SafePath("/data", p, nil); err != nil {
 			t.Fatalf("SafePath(%q): %v", p, err)
 		}
+	}
+}
+
+func TestSweepPreservesActiveWriterWithOldTimestamp(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "file")
+	f, closeWriter, err := fileops.OpenWriter(root, path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fileops.AbortWriter(root, f)
+	f.WriteString("upload")
+	past := time.Now().Add(-48 * time.Hour)
+	os.Chtimes(f.Name(), past, past)
+	SweepTempFiles(root, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err = closeWriter(); err != nil {
+		t.Fatalf("janitor removed an active upload: %v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil || string(body) != "upload" {
+		t.Fatalf("publication: %q %v", body, err)
 	}
 }

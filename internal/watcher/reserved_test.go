@@ -49,14 +49,7 @@ func TestPeriodicScanDoesNotIndexReservedMultipartState(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	onChange := func(events []FileEvent) {
-		for _, event := range events {
-			if _, err := st.PutFile(event.Name, event.ModTime, event.Size, event.Hash, event.Deleted); err != nil {
-				t.Errorf("put file %q: %v", event.Name, err)
-			}
-		}
-	}
-	w := New(root, st, logger, time.Millisecond, time.Hour, nil, onChange)
+	w := New(root, st, logger, time.Millisecond, time.Hour, nil)
 	w.periodicScan(context.Background())
 
 	if got, err := st.GetFile("bucket/object.txt"); err != nil || got == nil || got.Deleted {

@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"github.com/birak/birak/internal/fileops"
 	"golang.org/x/crypto/ssh"
 	"io"
 	"os"
@@ -470,5 +471,54 @@ func TestSubsystemMalformedPayload_NoPanic(t *testing.T) {
 	}
 	if pktType != sshFxpName {
 		t.Fatalf("expected NAME reply after malformed request, got %d", pktType)
+	}
+}
+
+func TestAppendCommitsAtClose(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "file")
+	os.WriteFile(path, []byte("old"), 0o600)
+	addr := testGateway(t, root, nil, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+	handle := sftpOpenFile(t, ch, 1, "/file", sshFxfWrite|sshFxfAppend)
+	sftpWriteFile(t, ch, 2, handle, 0, []byte("+new"))
+	body, _ := os.ReadFile(path)
+	if string(body) != "old" {
+		t.Fatalf("write published before CLOSE: %q", body)
+	}
+	sftpClose(t, ch, 3, handle)
+	body, _ = os.ReadFile(path)
+	if string(body) != "old+new" {
+		t.Fatalf("append: %q", body)
+	}
+}
+
+func TestDisconnectAbortsStagedUpload(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "file")
+	os.WriteFile(path, []byte("acknowledged"), 0o600)
+	addr := testGateway(t, root, nil, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+	handle := sftpOpenFile(t, ch, 1, "/file", sshFxfWrite|sshFxfTrunc)
+	sftpWriteFile(t, ch, 2, handle, 0, []byte("partial"))
+	ch.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		unlock := fileops.Lock(root)
+		busy := fileops.BusyLocked(root, path)
+		unlock()
+		if !busy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("disconnected writer was not released")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil || string(body) != "acknowledged" {
+		t.Fatalf("disconnect published partial upload: %q %v", body, err)
 	}
 }

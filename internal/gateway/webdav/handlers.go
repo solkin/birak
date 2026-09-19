@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/watcher"
 )
@@ -229,7 +230,7 @@ func (g *Gateway) handlePut(w http.ResponseWriter, r *http.Request) {
 
 	// Create parent directories.
 	dir := filepath.Dir(fullPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := fileops.Mkdir(g.syncDir, dir, 0o755, true); err != nil {
 		g.logger.Error("put mkdir failed", "path", relName, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
@@ -240,12 +241,13 @@ func (g *Gateway) handlePut(w http.ResponseWriter, r *http.Request) {
 	isNew := os.IsNotExist(statErr)
 
 	// Write to temp file, then rename.
-	tmpFile, err := os.CreateTemp(dir, ".birak-tmp-*")
+	tmpFile, err := fileops.CreateTemp(dir, ".birak-tmp-*")
 	if err != nil {
 		g.logger.Error("put create temp failed", "path", relName, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	defer fileops.ReleaseTemp(tmpFile)
 	tmpPath := tmpFile.Name()
 
 	if _, err := io.Copy(tmpFile, r.Body); err != nil {
@@ -262,7 +264,7 @@ func (g *Gateway) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 	tmpFile.Close()
 
-	if err := os.Rename(tmpPath, fullPath); err != nil {
+	if err := fileops.Publish(g.syncDir, tmpPath, fullPath); err != nil {
 		os.Remove(tmpPath)
 		g.logger.Error("put rename failed", "path", relName, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -301,13 +303,13 @@ func (g *Gateway) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if info.IsDir() {
-		if err := os.RemoveAll(fullPath); err != nil {
+		if err := fileops.Remove(g.syncDir, fullPath, true); err != nil {
 			g.logger.Error("delete dir failed", "path", relName, "error", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
 	} else {
-		if err := os.Remove(fullPath); err != nil {
+		if err := fileops.Remove(g.syncDir, fullPath, false); err != nil {
 			g.logger.Error("delete file failed", "path", relName, "error", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
@@ -353,7 +355,7 @@ func (g *Gateway) handleMkcol(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := os.Mkdir(fullPath, 0o755); err != nil {
+	if err := fileops.Mkdir(g.syncDir, fullPath, 0o755, false); err != nil {
 		g.logger.Error("mkcol failed", "path", relName, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
@@ -412,12 +414,20 @@ func (g *Gateway) handleMove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Ensure parent of destination exists.
-	if err := os.MkdirAll(filepath.Dir(dstFull), 0o755); err != nil {
+	if err := fileops.Mkdir(g.syncDir, filepath.Dir(dstFull), 0o755, true); err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	if err := stageReplace(dstFull, func() error { return os.Rename(srcFull, dstFull) }); err != nil {
+	if err := fileops.Commit(g.syncDir, []string{srcFull, dstFull}, func() error {
+		if fileops.BusyTreeLocked(g.syncDir, srcFull) || fileops.BusyTreeLocked(g.syncDir, dstFull) {
+			return fileops.ErrBusy
+		}
+		if err := fileops.ReplaceLocked(g.syncDir, srcFull, dstFull, func() error { return os.Rename(srcFull, dstFull) }); err != nil {
+			return err
+		}
+		return errors.Join(fileops.SyncParents(filepath.Dir(srcFull), g.syncDir), fileops.SyncParents(filepath.Dir(dstFull), g.syncDir))
+	}); err != nil {
 		g.logger.Error("move failed", "from", srcRel, "to", dstRel, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
@@ -489,17 +499,25 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Ensure parent of destination exists.
-	if err := os.MkdirAll(filepath.Dir(dstFull), 0o755); err != nil {
+	if err := fileops.Mkdir(g.syncDir, filepath.Dir(dstFull), 0o755, true); err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
 	cp := &copier{limit: g.config.MaxUploadBytes}
-	copyErr := stageReplace(dstFull, func() error {
-		if srcInfo.IsDir() {
-			return cp.copyDir(srcFull, dstFull)
+	copyErr := fileops.Commit(g.syncDir, []string{dstFull}, func() error {
+		if fileops.BusyTreeLocked(g.syncDir, dstFull) || fileops.BusyTreeLocked(g.syncDir, srcFull) {
+			return fileops.ErrBusy
 		}
-		return cp.copyFile(srcFull, dstFull)
+		if err := fileops.ReplaceLocked(g.syncDir, "", dstFull, func() error {
+			if srcInfo.IsDir() {
+				return cp.copyDir(srcFull, dstFull)
+			}
+			return cp.copyFile(srcFull, dstFull)
+		}); err != nil {
+			return err
+		}
+		return fileops.SyncParents(filepath.Dir(dstFull), g.syncDir)
 	})
 	if errors.Is(copyErr, errUploadTooLarge) {
 		http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
@@ -701,10 +719,11 @@ func (c *copier) copyFile(src, dst string) error {
 	defer sf.Close()
 
 	dir := filepath.Dir(dst)
-	tmpFile, err := os.CreateTemp(dir, ".birak-tmp-*")
+	tmpFile, err := fileops.CreateTemp(dir, ".birak-tmp-*")
 	if err != nil {
 		return err
 	}
+	defer fileops.ReleaseTemp(tmpFile)
 	tmpPath := tmpFile.Name()
 
 	if _, err := io.Copy(tmpFile, sf); err != nil {
@@ -712,12 +731,21 @@ func (c *copier) copyFile(src, dst string) error {
 		os.Remove(tmpPath)
 		return err
 	}
-	tmpFile.Close()
-
-	os.Chtimes(tmpPath, si.ModTime(), si.ModTime())
+	if err := os.Chtimes(tmpPath, si.ModTime(), si.ModTime()); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := errors.Join(tmpFile.Sync(), tmpFile.Close()); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
 
 	if err := os.Rename(tmpPath, dst); err != nil {
 		os.Remove(tmpPath)
+		return err
+	}
+	if err := fileops.SyncDir(filepath.Dir(dst)); err != nil {
 		return err
 	}
 	c.copied += si.Size()
@@ -762,49 +790,10 @@ func (c *copier) copyDir(src, dst string) error {
 		}
 	}
 
-	return nil
+	return errors.Join(fileops.SyncDir(dst), fileops.SyncDir(filepath.Dir(dst)))
 }
 
-// stageReplace runs op, which must create dst, without destroying a pre-existing
-// dst until op succeeds. If dst exists it is first moved aside to a temporary
-// sibling; on success the backup is removed, and on failure the partial result
-// is discarded and the original restored. This keeps overwrite non-destructive
-// even when op fails partway (e.g. a cross-device rename or a mid-tree copy error).
+// stageReplace is also used by the replacement fault-injection tests.
 func stageReplace(dst string, op func() error) error {
-	if _, err := os.Lstat(dst); err != nil {
-		// dst does not exist — nothing to preserve, run op directly.
-		return op()
-	}
-
-	backup, err := reserveSiblingName(dst)
-	if err != nil {
-		return err
-	}
-	if err := os.Rename(dst, backup); err != nil {
-		return err
-	}
-
-	if err := op(); err != nil {
-		os.RemoveAll(dst)      // discard any partial result
-		os.Rename(backup, dst) // restore the original
-		return err
-	}
-
-	os.RemoveAll(backup)
-	return nil
-}
-
-// reserveSiblingName returns an unused path in dst's directory suitable for a
-// temporary backup, by briefly creating and removing a temp file to claim a name.
-func reserveSiblingName(dst string) (string, error) {
-	f, err := os.CreateTemp(filepath.Dir(dst), ".birak-bak-*")
-	if err != nil {
-		return "", err
-	}
-	name := f.Name()
-	f.Close()
-	if err := os.Remove(name); err != nil {
-		return "", err
-	}
-	return name, nil
+	return fileops.ReplaceLocked(filepath.Dir(dst), "", dst, op)
 }

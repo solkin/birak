@@ -147,7 +147,10 @@ func (p *scriptedPeer) start(t *testing.T) string {
 		w.Write([]byte(body))
 	})
 
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(server.HeaderProtocol, server.ProtocolVersion)
+		mux.ServeHTTP(w, r)
+	})}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
 	p.url = "http://" + ln.Addr().String()
@@ -171,12 +174,7 @@ func startSyncer(t *testing.T, peers []string) (*store.Store, string) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	onChange := func(events []watcher.FileEvent) {
-		for _, ev := range events {
-			st.PutFile(ev.Name, ev.ModTime, ev.Size, ev.Hash, ev.Deleted)
-		}
-	}
-	w := watcher.New(syncDir, st, logger, 100*time.Millisecond, 30*time.Second, defaultTestIgnore, onChange)
+	w := watcher.New(syncDir, st, logger, 100*time.Millisecond, 30*time.Second, defaultTestIgnore)
 	syn := syncer.New(st, w, syncDir, "local", peers, defaultTestIgnore, logger, syncer.Options{
 		PollInterval:           200 * time.Millisecond,
 		BatchLimit:             1000,

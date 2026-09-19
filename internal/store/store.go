@@ -1,9 +1,11 @@
 package store
 
 import (
+	"cmp"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -15,8 +17,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// NoAckGate disables the peer-acknowledgement gate in PurgeTombstones. Pass it
-// when no peer is configured and tombstones only have to satisfy the TTL.
+// NoAckGate disables the version filter in the low-level PurgeTombstones helper.
+// The daemon never purges tombstones: a stream cursor is not an application ACK.
 const NoAckGate = int64(math.MaxInt64)
 
 // FileMeta represents a file entry in the store. It doubles as the wire format
@@ -28,6 +30,7 @@ type FileMeta struct {
 	Hash    string `json:"hash"` // SHA256 hex
 	Deleted bool   `json:"deleted"`
 	Version int64  `json:"version"`
+	Clock   int64  `json:"clock"` // per-path logical time; independent of filesystem mtime
 
 	// DeletedAt is the local wall-clock time at which this node recorded the
 	// deletion. It is node-local bookkeeping for tombstone retention and is
@@ -39,10 +42,8 @@ type FileMeta struct {
 type PeerState struct {
 	// Version is the highest peer version successfully consumed.
 	Version int64
-	// Epoch identifies the peer's database incarnation. A peer that lost or
-	// restored its meta directory comes back with a different epoch, which
-	// invalidates Version — the peer restarts numbering from 1 and a stale
-	// cursor would silently hide every one of its changes forever.
+	// Epoch identifies the peer's process incarnation. Every restart invalidates
+	// Version, including a restart against a restored metadata backup.
 	Epoch string
 }
 
@@ -56,6 +57,8 @@ type RepairItem struct {
 	Attempts  int
 	FirstSeen int64
 	LastError string
+	Revision  int64
+	Meta      *FileMeta
 }
 
 // RepairStats summarizes the repair queue for /status.
@@ -72,6 +75,7 @@ type Store struct {
 	logger        *slog.Logger
 	cachedNextVer int64 // next version to assign, protected by mu
 	epoch         string
+	incarnation   string
 }
 
 // New creates a new Store, initializing the database schema.
@@ -82,7 +86,7 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	// invariants, which is what lets the pool hold more than one connection.
 	dsn := "file:" + url.PathEscape(dbPath) +
 		"?_pragma=journal_mode(WAL)" +
-		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=synchronous(FULL)" +
 		"&_pragma=busy_timeout(10000)" +
 		"&_pragma=cache_size(-64000)"
 
@@ -105,19 +109,20 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
-	// Initialize the cached version counter from the current max version.
-	// This is the only time we scan MAX(version); afterwards the counter
-	// is maintained in-memory and incremented atomically with each PutFile.
-	var maxVer sql.NullInt64
-	if err := db.QueryRow("SELECT MAX(version) FROM files").Scan(&maxVer); err != nil {
+	// Migrate legacy databases from MAX(version), retaining any higher persisted
+	// high-water mark. PutFile commits the counter and file state together.
+	var maxVer int64
+	if _, err := db.Exec(`INSERT INTO node_meta(key, value)
+		VALUES ('last_version', (SELECT COALESCE(MAX(version), 0) FROM files))
+		ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(node_meta.value AS INTEGER), CAST(excluded.value AS INTEGER))`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate version counter: %w", err)
+	}
+	if err := db.QueryRow("SELECT CAST(value AS INTEGER) FROM node_meta WHERE key = 'last_version'").Scan(&maxVer); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init version counter: %w", err)
 	}
-	if maxVer.Valid {
-		s.cachedNextVer = maxVer.Int64 + 1
-	} else {
-		s.cachedNextVer = 1
-	}
+	s.cachedNextVer = maxVer + 1
 
 	epoch, err := s.loadOrCreateEpoch()
 	if err != nil {
@@ -125,6 +130,15 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 		return nil, fmt.Errorf("init epoch: %w", err)
 	}
 	s.epoch = epoch
+	// A process incarnation also invalidates cursors after a restored database
+	// has already caught up with its former high-water mark. Replaying on restart
+	// is deliberate; hash/version comparisons make it idempotent.
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		db.Close()
+		return nil, err
+	}
+	s.incarnation = epoch + "-" + hex.EncodeToString(buf)
 
 	return s, nil
 }
@@ -143,7 +157,9 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_files_deleted_name ON files(deleted, name);
 	CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
 
-	CREATE TABLE IF NOT EXISTS cursors (
+	CREATE TABLE IF NOT EXISTS local_intents (path TEXT PRIMARY KEY);
+ CREATE TABLE IF NOT EXISTS replica_intents (name TEXT PRIMARY KEY, metadata TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS cursors (
 		peer_id  TEXT PRIMARY KEY,
 		last_ver INTEGER NOT NULL DEFAULT 0
 	);
@@ -171,9 +187,8 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_repair_due ON repair_queue(peer_id, next_attempt);
 
 	-- How far each peer has consumed OUR change stream, learned from the
-	-- "since" parameter of its polls. Tombstones may only be purged once every
-	-- live peer has moved past them, otherwise a deletion can be lost and the
-	-- file resurrected by the next full reconciliation.
+	-- "since" parameter of its polls. This is diagnostic consumption progress,
+	-- not proof of application, and never authorizes automatic tombstone GC.
 	CREATE TABLE IF NOT EXISTS peer_acks (
 		peer_id       TEXT PRIMARY KEY,
 		acked_version INTEGER NOT NULL,
@@ -191,7 +206,23 @@ func (s *Store) migrate() error {
 	if err := s.addColumnIfMissing("cursors", "epoch", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	for _, column := range []struct{ table, name, definition string }{
+		{"files", "clock", "INTEGER NOT NULL DEFAULT 0"},
+		{"repair_queue", "metadata", "TEXT NOT NULL DEFAULT ''"},
+		{"repair_queue", "revision", "INTEGER NOT NULL DEFAULT 1"},
+		{"peer_acks", "epoch", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.addColumnIfMissing(column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
 
+	// Repair generations must survive deletion/reinsertion, not just UPSERT.
+	if _, err := s.db.Exec(`INSERT INTO node_meta(key,value)
+ VALUES ('repair_revision', (SELECT COALESCE(MAX(revision),0) FROM repair_queue))
+ ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(node_meta.value AS INTEGER),CAST(excluded.value AS INTEGER))`); err != nil {
+		return err
+	}
 	// Tombstones written before deleted_at existed carry 0, which would either
 	// pin them forever or expose them to an immediate purge. Age them from now.
 	if _, err := s.db.Exec(
@@ -272,6 +303,26 @@ func (s *Store) Epoch() string {
 	return s.epoch
 }
 
+// Incarnation changes on every open, including when a backup is restored.
+func (s *Store) Incarnation() string { return s.incarnation }
+
+// NodeValue and SetNodeValue store node-local recovery state.
+func (s *Store) NodeValue(key string) (string, error) {
+	var value string
+	err := s.db.QueryRow("SELECT value FROM node_meta WHERE key = ?", key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, err
+}
+
+func (s *Store) SetNodeValue(key, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("INSERT INTO node_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, value)
+	return err
+}
+
 // Close closes the database connection.
 func (s *Store) Close() error {
 	return s.db.Close()
@@ -280,11 +331,44 @@ func (s *Store) Close() error {
 // PutFile inserts or updates a file entry with a new version.
 // Returns the assigned version number.
 func (s *Store) PutFile(name string, modTime int64, size int64, hash string, deleted bool) (int64, error) {
+	return s.put(FileMeta{Name: name, ModTime: modTime, Size: size, Hash: hash, Deleted: deleted}, false)
+}
+
+// PutLocal advances this path beyond every state it has observed, even when a
+// client preserves or rolls back filesystem timestamps.
+func (s *Store) PutLocal(meta FileMeta) (int64, error) { return s.put(meta, true) }
+
+// PutRemote preserves the source conflict clock; Version remains node-local.
+func (s *Store) PutRemote(meta FileMeta) (int64, error) { return s.put(meta, false) }
+
+func (s *Store) put(meta FileMeta, local bool) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	ver := s.cachedNextVer
-	s.cachedNextVer++
+	name, modTime, size, hash, deleted := meta.Name, meta.ModTime, meta.Size, meta.Hash, meta.Deleted
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if local {
+		meta.Clock = max(meta.Clock, meta.ModTime)
+		var previous int64
+		err := tx.QueryRow("SELECT CASE WHEN clock=0 THEN mod_time ELSE clock END FROM files WHERE name=?", name).Scan(&previous)
+		if err != nil && err != sql.ErrNoRows {
+			return 0, err
+		}
+		if err == nil {
+			if previous == math.MaxInt64 {
+				return 0, fmt.Errorf("conflict clock exhausted for %q", name)
+			}
+			meta.Clock = max(meta.Clock, previous+1)
+		}
+	}
+	var ver int64
+	if err := tx.QueryRow(`UPDATE node_meta SET value = CAST(value AS INTEGER) + 1
+		WHERE key = 'last_version' RETURNING CAST(value AS INTEGER)`).Scan(&ver); err != nil {
+		return 0, err
+	}
 
 	deletedInt := 0
 	// deleted_at is wall-clock "when did this node record the deletion", which
@@ -297,33 +381,40 @@ func (s *Store) PutFile(name string, modTime int64, size int64, hash string, del
 		deletedAt = time.Now().UnixNano()
 	}
 
-	_, execErr := s.db.Exec(`
-		INSERT INTO files (name, mod_time, size, hash, deleted, version, deleted_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+	_, execErr := tx.Exec(`
+		INSERT INTO files (name, mod_time, size, hash, deleted, version, deleted_at, clock)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			mod_time   = excluded.mod_time,
 			size       = excluded.size,
 			hash       = excluded.hash,
 			deleted    = excluded.deleted,
 			version    = excluded.version,
-			deleted_at = excluded.deleted_at
-	`, name, modTime, size, hash, deletedInt, ver, deletedAt)
+			deleted_at = excluded.deleted_at,
+ clock = excluded.clock
+	`, name, modTime, size, hash, deletedInt, ver, deletedAt, meta.Clock)
 	if execErr != nil {
 		// Roll back the version counter on failure so versions stay gapless.
-		s.cachedNextVer = ver
 		return 0, fmt.Errorf("upsert file %q: %w", name, execErr)
 	}
+	if _, err := tx.Exec("DELETE FROM replica_intents WHERE name=?", name); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit file %q: %w", name, err)
+	}
+	s.cachedNextVer = ver + 1
 
 	s.logger.Debug("store: file updated", "name", name, "version", ver, "hash", hash[:min(12, len(hash))], "deleted", deleted)
 	return ver, nil
 }
 
-const fileColumns = "name, mod_time, size, hash, deleted, version, deleted_at"
+const fileColumns = "name, mod_time, size, hash, deleted, version, deleted_at, clock"
 
 func scanFile(sc interface{ Scan(...any) error }) (FileMeta, error) {
 	var f FileMeta
 	var deleted int
-	err := sc.Scan(&f.Name, &f.ModTime, &f.Size, &f.Hash, &deleted, &f.Version, &f.DeletedAt)
+	err := sc.Scan(&f.Name, &f.ModTime, &f.Size, &f.Hash, &deleted, &f.Version, &f.DeletedAt, &f.Clock)
 	f.Deleted = deleted != 0
 	return f, err
 }
@@ -388,7 +479,7 @@ func (s *Store) ListManifest(afterName string, limit int) ([]FileMeta, error) {
 	return result, rows.Err()
 }
 
-// MaxVersion returns the current maximum version number, or 0 if the table is empty.
+// MaxVersion returns the highest committed version, even if its row was removed.
 // Uses the in-memory counter — O(1) instead of scanning the index.
 func (s *Store) MaxVersion() (int64, error) {
 	s.mu.Lock()
@@ -450,14 +541,15 @@ func (s *Store) SetCursor(peerID string, version int64) error {
 	return err
 }
 
-// PruneCursors drops cursor and ack rows for peers that are no longer
+// PruneCursors drops cursor and repair rows for peers that are no longer
 // configured, so a rotated peer list does not accumulate dead state forever.
 func (s *Store) PruneCursors(keep []string) error {
-	if len(keep) == 0 {
-		return nil
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(keep) == 0 {
+		_, err := s.db.Exec("DELETE FROM cursors; DELETE FROM repair_queue")
+		return err
+	}
 
 	placeholders := make([]string, len(keep))
 	args := make([]any, len(keep))
@@ -473,10 +565,16 @@ func (s *Store) PruneCursors(keep []string) error {
 	return err
 }
 
-// RecordAck notes how far a peer has consumed our change stream. The "since"
-// value of its poll is a proof of consumption: it will never ask for anything
-// below that version again.
+// RecordAck records a legacy peer's most recently observed stream cursor.
 func (s *Store) RecordAck(peerID string, version int64) error {
+	return s.RecordAckEpoch(peerID, "", version)
+}
+
+// RecordAckEpoch records the most recent observation, including a rewind.
+// This is diagnostic state, NOT proof of application and NOT a GC gate.
+// Reordered requests may conservatively lower it. Tombstone GC is disabled in
+// the daemon; membership and application acknowledgements need a separate protocol.
+func (s *Store) RecordAckEpoch(peerID, epoch string, version int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -484,18 +582,17 @@ func (s *Store) RecordAck(peerID string, version int64) error {
 		return nil
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO peer_acks (peer_id, acked_version, updated_at) VALUES (?, ?, ?)
+		INSERT INTO peer_acks (peer_id, acked_version, updated_at, epoch) VALUES (?, ?, ?, ?)
 		ON CONFLICT(peer_id) DO UPDATE SET
-			acked_version = MAX(peer_acks.acked_version, excluded.acked_version),
+			acked_version = excluded.acked_version,
+			epoch = excluded.epoch,
 			updated_at    = excluded.updated_at
-	`, peerID, version, time.Now().UnixNano())
+	`, peerID, version, time.Now().UnixNano(), epoch)
 	return err
 }
 
-// MinAckedVersion returns the lowest version acknowledged by peers that were
-// heard from within staleAfter. Peers silent for longer are excluded: they will
-// perform a full reconciliation when they return, so they no longer pin
-// tombstones. Returns NoAckGate when no live peer is known.
+// MinAckedVersion returns the lowest recently observed stream cursor, or
+// NoAckGate if none is known. This diagnostic is insufficient to authorize GC.
 func (s *Store) MinAckedVersion(staleAfter time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-staleAfter).UnixNano()
 	var minAck sql.NullInt64
@@ -531,9 +628,9 @@ func (s *Store) PeerAcks() (map[string]int64, error) {
 	return result, rows.Err()
 }
 
-// PurgeTombstones removes deleted file entries that are both older than ttl
-// (measured from when the deletion was recorded) and already consumed by every
-// live peer. Pass NoAckGate for maxVersion to apply the TTL alone.
+// PurgeTombstones is a low-level maintenance helper, unused by the daemon.
+// It removes records older than ttl and at or below maxVersion. The caller
+// must establish safety independently; poll cursors do not prove application.
 func (s *Store) PurgeTombstones(ttl time.Duration, maxVersion int64) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -549,29 +646,107 @@ func (s *Store) PurgeTombstones(ttl time.Duration, maxVersion int64) (int64, err
 	return result.RowsAffected()
 }
 
-// EnqueueRepair records a change that could not be applied. Keeping the highest
-// version seen for a name means the retry always targets the newest state, and
-// an existing entry keeps its attempt count so backoff is not reset by a
-// repeated sighting.
+// EnqueueRepair accepts legacy name-only work. New replication paths use
+// EnqueueChange so recovery does not depend on the source retaining metadata.
 func (s *Store) EnqueueRepair(peerID, name string, version int64, reason string) error {
+	return s.enqueueRepair(peerID, name, version, reason, nil)
+}
+
+// StateClock supports pre-clock database rows and imported metadata.
+func (f FileMeta) StateClock() int64 {
+	if f.Clock != 0 {
+		return f.Clock
+	}
+	return f.ModTime
+}
+
+// CompareState returns the deterministic ordering of replicated states. A nil
+// state precedes everything, including deletion history for an unknown name.
+func CompareState(a, b *FileMeta) int {
+	if a == nil {
+		if b == nil {
+			return 0
+		}
+		return -1
+	}
+	if b == nil {
+		return 1
+	}
+	if c := cmp.Compare(a.StateClock(), b.StateClock()); c != 0 {
+		return c
+	}
+	if a.ModTime < b.ModTime {
+		return -1
+	}
+	if a.ModTime > b.ModTime {
+		return 1
+	}
+	if a.Deleted != b.Deleted {
+		if a.Deleted {
+			return -1
+		}
+		return 1
+	}
+	if a.Deleted {
+		return 0
+	}
+	return strings.Compare(a.Hash, b.Hash)
+}
+
+// EnqueueChange retains the complete winning state, so even a deletion purged
+// by an older peer can still be applied after restart.
+func (s *Store) EnqueueChange(peerID string, meta FileMeta, reason string) error {
+	return s.enqueueRepair(peerID, meta.Name, meta.Version, reason, &meta)
+}
+
+func (s *Store) enqueueRepair(peerID, name string, version int64, reason string, meta *FileMeta) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var encoded string
+	err := s.db.QueryRow("SELECT metadata FROM repair_queue WHERE peer_id=? AND name=?", peerID, name).Scan(&encoded)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if meta != nil {
+		var previous FileMeta
+		if encoded == "" || json.Unmarshal([]byte(encoded), &previous) != nil || CompareState(meta, &previous) >= 0 {
+			data, err := json.Marshal(meta)
+			if err != nil {
+				return err
+			}
+			encoded = string(data)
+		}
+	}
 
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var revision int64
+	if err := tx.QueryRow(`UPDATE node_meta SET value=CAST(value AS INTEGER)+1 WHERE key='repair_revision' RETURNING CAST(value AS INTEGER)`).Scan(&revision); err != nil {
+		return err
+	}
 	now := time.Now().UnixNano()
-	_, err := s.db.Exec(`
-		INSERT INTO repair_queue (peer_id, name, version, attempts, next_attempt, first_seen, last_error)
-		VALUES (?, ?, ?, 0, ?, ?, ?)
+	_, err = tx.Exec(`
+  INSERT INTO repair_queue (peer_id, name, version, attempts, next_attempt, first_seen, last_error, metadata, revision)
+		VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)
 		ON CONFLICT(peer_id, name) DO UPDATE SET
 			version    = MAX(repair_queue.version, excluded.version),
+			metadata   = excluded.metadata,
+			revision   = excluded.revision,
 			last_error = excluded.last_error
-	`, peerID, name, version, now, now, reason)
-	return err
+	`, peerID, name, version, now, now, reason, encoded, revision)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DueRepairs returns repair items for a peer whose backoff has elapsed.
 func (s *Store) DueRepairs(peerID string, limit int) ([]RepairItem, error) {
 	rows, err := s.db.Query(`
-		SELECT peer_id, name, version, attempts, first_seen, last_error
+		SELECT peer_id, name, version, attempts, first_seen, last_error, revision, metadata
 		FROM repair_queue
 		WHERE peer_id = ? AND next_attempt <= ?
 		ORDER BY next_attempt ASC LIMIT ?
@@ -584,8 +759,15 @@ func (s *Store) DueRepairs(peerID string, limit int) ([]RepairItem, error) {
 	var items []RepairItem
 	for rows.Next() {
 		var it RepairItem
-		if err := rows.Scan(&it.PeerID, &it.Name, &it.Version, &it.Attempts, &it.FirstSeen, &it.LastError); err != nil {
+		var encoded string
+		if err := rows.Scan(&it.PeerID, &it.Name, &it.Version, &it.Attempts, &it.FirstSeen, &it.LastError, &it.Revision, &encoded); err != nil {
 			return nil, err
+		}
+		if encoded != "" {
+			it.Meta = &FileMeta{}
+			if err := json.Unmarshal([]byte(encoded), it.Meta); err != nil {
+				return nil, fmt.Errorf("decode queued state: %w", err)
+			}
 		}
 		items = append(items, it)
 	}
@@ -601,6 +783,14 @@ func (s *Store) ResolveRepair(peerID, name string) error {
 	return err
 }
 
+// ResolveRepairItem cannot erase an update enqueued while this retry ran.
+func (s *Store) ResolveRepairItem(item RepairItem) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("DELETE FROM repair_queue WHERE peer_id=? AND name=? AND revision=?", item.PeerID, item.Name, item.Revision)
+	return err
+}
+
 // DeferRepair increments the attempt count and schedules the next try. Items are
 // never dropped: an item that cannot be applied stays visible in /status rather
 // than silently disappearing.
@@ -613,6 +803,14 @@ func (s *Store) DeferRepair(peerID, name string, retryAfter time.Duration, cause
 		SET attempts = attempts + 1, next_attempt = ?, last_error = ?
 		WHERE peer_id = ? AND name = ?
 	`, time.Now().Add(retryAfter).UnixNano(), cause, peerID, name)
+	return err
+}
+
+// DeferRepairItem cannot postpone a replacement enqueued after this retry began.
+func (s *Store) DeferRepairItem(item RepairItem, retryAfter time.Duration, cause string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE repair_queue SET attempts=attempts+1,next_attempt=?,last_error=? WHERE peer_id=? AND name=? AND revision=?`, time.Now().Add(retryAfter).UnixNano(), cause, item.PeerID, item.Name, item.Revision)
 	return err
 }
 

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/server"
 	"github.com/birak/birak/internal/store"
@@ -58,9 +60,8 @@ type Options struct {
 	// RepairInterval is how often the durable repair queue is drained.
 	RepairInterval time.Duration
 	// ReconcileInterval is how often a full manifest comparison runs against
-	// each peer. This is the backstop that makes convergence guaranteed rather
-	// than best-effort: the version cursor alone cannot recover anything it has
-	// already moved past.
+	// each peer. It rediscovers divergence independently of the stream cursor.
+	// Zero disables full reconciliation.
 	ReconcileInterval time.Duration
 	// Secret is the optional cluster shared secret sent to peers.
 	Secret string
@@ -117,9 +118,12 @@ func New(
 	opts Options,
 ) *Syncer {
 	transport := &http.Transport{
-		MaxIdleConns:        20,
-		MaxIdleConnsPerHost: 5,
-		IdleConnTimeout:     90 * time.Second,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		MaxIdleConns:          20,
+		MaxIdleConnsPerHost:   5,
+		IdleConnTimeout:       90 * time.Second,
 	}
 
 	if opts.MaxConcurrentDownloads <= 0 {
@@ -128,10 +132,18 @@ func New(
 	if opts.RepairInterval <= 0 {
 		opts.RepairInterval = 30 * time.Second
 	}
-	if opts.ReconcileInterval <= 0 {
-		opts.ReconcileInterval = time.Hour
-	}
 
+	unique := make([]string, 0, len(peers))
+	seen := make(map[string]bool)
+	for _, peer := range peers {
+		peer = strings.TrimRight(strings.TrimSpace(peer), "/")
+		if !seen[peer] {
+			unique = append(unique, peer)
+			seen[peer] = true
+		}
+	}
+	peers = unique
+	w.SetRepairPeers(peers)
 	stats := make(map[string]*peerStat, len(peers))
 	for _, p := range peers {
 		stats[p] = &peerStat{}
@@ -204,6 +216,10 @@ func (s *Syncer) Run(ctx context.Context) {
 	wg.Wait()
 	s.logger.Info("syncer stopped")
 }
+
+// ScanStatus and CheckStorage expose local readiness separately from peers.
+func (s *Syncer) ScanStatus() watcher.ScanStatus { return s.watcher.Status() }
+func (s *Syncer) CheckStorage() error            { return s.watcher.CheckStorage() }
 
 // PeerStats implements server.StatsProvider.
 func (s *Syncer) PeerStats() []server.PeerStatus {
@@ -331,7 +347,7 @@ func (s *Syncer) syncBatch(ctx context.Context, peerURL string) (int, bool, erro
 		return 0, false, fmt.Errorf("get cursor for %s: %w", peerURL, err)
 	}
 
-	reqURL := fmt.Sprintf("%s/changes?since=%d&limit=%d", peerURL, state.Version, s.opts.BatchLimit)
+	reqURL := fmt.Sprintf("%s/changes?since=%d&limit=%d&epoch=%s", peerURL, state.Version, s.opts.BatchLimit, url.QueryEscape(state.Epoch))
 	resp, err := s.doRequest(ctx, reqURL)
 	if err != nil {
 		return 0, false, err
@@ -391,7 +407,13 @@ func (s *Syncer) syncBatch(ctx context.Context, peerURL string) (int, bool, erro
 	// cannot pass it — blocks that peer's entire stream permanently.
 	latest, batchMax := collapseByName(changes)
 
-	applied := s.applyBatch(ctx, peerURL, latest)
+	applied, err := s.applyBatch(ctx, peerURL, latest)
+	if err != nil {
+		return 0, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
 
 	// The cursor may advance past everything in the batch, including failures:
 	// each one is now durably recorded in the repair queue and retried out of
@@ -413,10 +435,12 @@ func (s *Syncer) syncBatch(ctx context.Context, peerURL string) (int, bool, erro
 // applyBatch applies deduplicated changes, downloading up to
 // MaxConcurrentDownloads files at a time. Failures are queued for repair rather
 // than aborting the batch.
-func (s *Syncer) applyBatch(ctx context.Context, peerURL string, changes []store.FileMeta) int {
+func (s *Syncer) applyBatch(ctx context.Context, peerURL string, changes []store.FileMeta) (int, error) {
 	sem := make(chan struct{}, s.opts.MaxConcurrentDownloads)
 	var wg sync.WaitGroup
 	var applied atomic.Int64
+	var errorsMu sync.Mutex
+	var batchErr error
 
 	for _, change := range changes {
 		if ctx.Err() != nil {
@@ -426,7 +450,7 @@ func (s *Syncer) applyBatch(ctx context.Context, peerURL string, changes []store
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			wg.Wait()
-			return int(applied.Load())
+			return int(applied.Load()), ctx.Err()
 		}
 
 		wg.Add(1)
@@ -448,23 +472,22 @@ func (s *Syncer) applyBatch(ctx context.Context, peerURL string, changes []store
 					s.logger.Error("apply change failed, queued for repair",
 						"name", change.Name, "peer", peerURL, "error", err)
 				}
-				if qErr := s.store.EnqueueRepair(peerURL, change.Name, change.Version, err.Error()); qErr != nil {
+				if qErr := s.store.EnqueueChange(peerURL, change, err.Error()); qErr != nil {
 					s.logger.Error("enqueue repair failed", "name", change.Name, "error", qErr)
+					errorsMu.Lock()
+					batchErr = errors.Join(batchErr, qErr)
+					errorsMu.Unlock()
 				}
 				return
 			}
 			applied.Add(1)
-			// The live stream just did what a queued retry was waiting to do.
-			// Clearing the entry now keeps /status honest instead of reporting
-			// a backlog that has already been dealt with.
-			if err := s.store.ResolveRepair(peerURL, change.Name); err != nil {
-				s.logger.Error("resolve repair failed", "name", change.Name, "error", err)
-			}
+			// The repair worker clears its own revision after verifying current
+			// state. An unconditional delete here could erase a concurrent enqueue.
 		}(change)
 	}
 
 	wg.Wait()
-	return int(applied.Load())
+	return int(applied.Load()), errors.Join(batchErr, ctx.Err())
 }
 
 // applyChange brings one file in line with a peer's metadata. The decision and
@@ -480,19 +503,50 @@ func (s *Syncer) applyChange(ctx context.Context, peerURL string, change store.F
 
 	unlock := s.paths.lock(change.Name)
 	defer unlock()
+	commitUnlock := fileops.Lock(s.syncDir)
+	refreshErr := s.watcher.RefreshLocked(change.Name)
+	damaged := errors.Is(refreshErr, watcher.ErrIntegrity)
+	if refreshErr != nil && !damaged {
+		err := refreshErr
+		commitUnlock()
+		return err
+	}
 
 	local, err := s.store.GetFile(change.Name)
 	if err != nil {
+		commitUnlock()
 		return fmt.Errorf("get local file %q: %w", change.Name, err)
 	}
 
-	if local != nil && local.Deleted == change.Deleted && local.Hash == change.Hash {
-		return nil // identical state, nothing to do
-	}
-	if !remoteWins(local, change) {
+	if !remoteWins(local, change) && !(damaged && store.CompareState(&change, local) == 0) {
+		commitUnlock()
 		s.logger.Debug("local state wins, skipping", "name", change.Name, "peer", peerURL)
 		return nil
 	}
+	if !damaged && local != nil && !local.Deleted && !change.Deleted && local.Hash == change.Hash && local.Size == change.Size {
+		defer commitUnlock()
+		path, err := s.safeLocalPath(change.Name)
+		if err != nil {
+			return err
+		}
+		if err := s.store.StageReplica(change); err != nil {
+			return err
+		}
+		stamp := time.Unix(0, change.ModTime)
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		if err := errors.Join(f.Sync(), f.Close()); err != nil {
+			return err
+		}
+		_, err = s.store.PutRemote(change)
+		return err
+	}
+	commitUnlock()
 
 	if change.Deleted {
 		s.logger.Info("applying remote deletion", "name", change.Name, "peer", peerURL)
@@ -541,23 +595,30 @@ func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
 	}
 }
 
-// repairOne retries a single queued item against the peer's *current*
-// metadata. Re-reading the metadata is what makes a superseded version
-// self-healing: the retry targets whatever the peer holds now, not the stale
-// version that failed.
+// repairOne compares current source metadata with the durably queued state.
+// A newer source state supersedes old work; missing source metadata cannot
+// erase a deletion that this node already accepted into its repair queue.
 func (s *Syncer) repairOne(ctx context.Context, peerURL string, item store.RepairItem) {
 	meta, err := s.fetchMeta(ctx, peerURL, item.Name)
 	if err != nil {
-		s.deferRepair(peerURL, item, fmt.Sprintf("fetch metadata: %v", err))
-		return
+		if ctx.Err() != nil {
+			return
+		}
+		if item.Meta == nil || !item.Meta.Deleted {
+			s.deferRepair(peerURL, item, fmt.Sprintf("fetch metadata: %v", err))
+			return
+		}
+		// A durably accepted deletion needs no bytes from the source. Apply it
+		// even while the peer is offline; any newer local state still wins.
+		meta = item.Meta
+	}
+	if item.Meta != nil && store.CompareState(item.Meta, meta) > 0 {
+		meta = item.Meta
 	}
 	if meta == nil {
-		// The peer has no record for this name at all — the entry was purged
-		// there. There is nothing left to converge on.
-		s.logger.Info("repair item dropped, peer has no record", "name", item.Name, "peer", peerURL)
-		if err := s.store.ResolveRepair(peerURL, item.Name); err != nil {
-			s.logger.Error("resolve repair failed", "name", item.Name, "error", err)
-		}
+		// Legacy queue rows lack a full operation. Absence on the peer is not
+		// proof of success: keep the unresolved item visible for intervention.
+		s.deferRepair(peerURL, item, "peer has no record and queued operation has no metadata")
 		return
 	}
 
@@ -570,7 +631,7 @@ func (s *Syncer) repairOne(ctx context.Context, peerURL string, item store.Repai
 	}
 
 	s.logger.Info("repair succeeded", "name", item.Name, "peer", peerURL, "attempts", item.Attempts+1)
-	if err := s.store.ResolveRepair(peerURL, item.Name); err != nil {
+	if err := s.store.ResolveRepairItem(item); err != nil {
 		s.logger.Error("resolve repair failed", "name", item.Name, "error", err)
 	}
 }
@@ -585,7 +646,7 @@ func (s *Syncer) deferRepair(peerURL string, item store.RepairItem, cause string
 	}
 	s.logger.Warn("repair deferred", "name", item.Name, "peer", peerURL,
 		"attempts", item.Attempts+1, "retry_in", backoff, "cause", cause)
-	if err := s.store.DeferRepair(peerURL, item.Name, backoff, cause); err != nil {
+	if err := s.store.DeferRepairItem(item, backoff, cause); err != nil {
 		s.logger.Error("defer repair failed", "name", item.Name, "error", err)
 	}
 }
@@ -593,11 +654,13 @@ func (s *Syncer) deferRepair(peerURL string, item store.RepairItem, cause string
 // reconcilePeer periodically compares the full manifest with a peer and queues
 // anything this node is missing or holds an older version of.
 //
-// The version cursor can only carry a change forward once. Everything that was
-// skipped, lost to a crash, or written while this node was unreachable is
-// invisible to it. This loop is the guarantee behind "nothing gets stuck": it
-// re-derives the difference from scratch, independent of any cursor.
+// A stream cursor cannot rediscover a difference below its current position.
+// Reconciliation derives that difference from the manifest, independently of
+// the cursor. Persistent I/O or connectivity failures still require recovery.
 func (s *Syncer) reconcilePeer(ctx context.Context, peerURL string) {
+	if s.opts.ReconcileInterval == 0 {
+		return
+	}
 	// Stagger the first pass so a restarted fleet does not reconcile in unison.
 	if !sleepCtx(ctx, jitter(s.opts.ReconcileInterval/4)) {
 		return
@@ -699,16 +762,13 @@ func (s *Syncer) reconcilePage(peerURL string, page []store.FileMeta) (int, erro
 	queued := 0
 	for _, entry := range usable {
 		mine := local[entry.Name]
-		if mine != nil && mine.Deleted == entry.Deleted && mine.Hash == entry.Hash {
-			continue
-		}
-		if !remoteWins(mine, entry) {
+		if !remoteWins(mine, entry) && !(s.watcher.NeedsRepair(entry.Name) && store.CompareState(&entry, mine) == 0) {
 			continue
 		}
 		s.logger.Info("reconciliation found divergence",
 			"name", entry.Name, "peer", peerURL,
 			"remote_deleted", entry.Deleted, "have_local", mine != nil)
-		if err := s.store.EnqueueRepair(peerURL, entry.Name, entry.Version, "reconcile"); err != nil {
+		if err := s.store.EnqueueChange(peerURL, entry, "reconcile"); err != nil {
 			return queued, fmt.Errorf("enqueue reconcile repair: %w", err)
 		}
 		queued++
@@ -753,11 +813,27 @@ func (s *Syncer) doRequest(ctx context.Context, reqURL string) (*http.Response, 
 	if err != nil {
 		return nil, fmt.Errorf("request %s: %w", reqURL, err)
 	}
+	if err := s.checkPeerIdentity(resp); err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
 	return resp, nil
 }
 
+func (s *Syncer) checkPeerIdentity(resp *http.Response) error {
+	if resp.Header.Get(server.HeaderProtocol) != server.ProtocolVersion {
+		return fmt.Errorf("incompatible replication protocol %q; require %s", resp.Header.Get(server.HeaderProtocol), server.ProtocolVersion)
+	}
+	if id := resp.Header.Get(server.HeaderNodeID); id != "" && id == s.nodeID {
+		return fmt.Errorf("peer has duplicate node_id %q", id)
+	}
+	return nil
+}
+
 func (s *Syncer) setClusterHeaders(req *http.Request) {
+	req.Header.Set(server.HeaderProtocol, server.ProtocolVersion)
 	req.Header.Set(server.HeaderNodeID, s.nodeID)
+	req.Header.Set(server.HeaderNodeEpoch, s.store.Incarnation())
 	if s.opts.Secret != "" {
 		req.Header.Set(server.HeaderSecret, s.opts.Secret)
 	}
@@ -795,6 +871,9 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		return fmt.Errorf("download %s: %w", meta.Name, err)
 	}
 	defer resp.Body.Close()
+	if err := s.checkPeerIdentity(resp); err != nil {
+		return err
+	}
 
 	if resp.StatusCode == http.StatusNotFound {
 		// The peer announced this file but cannot serve it right now — a
@@ -816,10 +895,11 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	// Write to temp file with a unique name (random suffix) to prevent
 	// collisions when multiple goroutines download the same file from
 	// different peers simultaneously.
-	tmpFile, err := os.CreateTemp(destDir, ".birak-tmp-"+filepath.Base(meta.Name)+"-*")
+	tmpFile, err := fileops.CreateTemp(destDir, ".birak-tmp-"+filepath.Base(meta.Name)+"-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
+	defer fileops.ReleaseTemp(tmpFile)
 	tmpPath := tmpFile.Name()
 	cleanup := func() {
 		tmpFile.Close()
@@ -887,12 +967,35 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		return fmt.Errorf("close file %s: %w", meta.Name, err)
 	}
 
-	// Mark as synced so the watcher's fast-path skips the fsnotify event
-	// without needing to hash the file. Even if MarkSynced expires before the
-	// watcher processes the event, the store-based dedup in inspectFile will
-	// catch it (PutFile runs right after Rename, microseconds later).
-	s.watcher.MarkSynced(meta.Name, meta.Hash)
+	// Downloading does not reserve the destination. Reinspect after the entire
+	// transfer, under the lock also used by gateways and the watcher.
+	defer os.Remove(tmpPath)
+	unlock := fileops.Lock(s.syncDir)
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	refreshErr := s.watcher.RefreshLocked(meta.Name)
+	damaged := errors.Is(refreshErr, watcher.ErrIntegrity)
+	if refreshErr != nil && !damaged {
+		return refreshErr
+	}
+	current, err := s.store.GetFile(meta.Name)
+	if err != nil {
+		return err
+	}
+	if !remoteWins(current, meta) && !(damaged && store.CompareState(&meta, current) == 0) {
+		return nil
+	}
+	// Validate again after waiting: an ancestor may have been moved meanwhile.
+	destPath, err = s.safeLocalPath(meta.Name)
+	if err != nil {
+		return err
+	}
 
+	if err := s.store.StageReplica(meta); err != nil {
+		return err
+	}
 	// Atomic rename — file appears on disk.
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		os.Remove(tmpPath)
@@ -902,7 +1005,9 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	// behind the disk on a crash, never ahead: a store entry for a file whose
 	// rename was lost would make the next periodic scan see "indexed but
 	// missing" and broadcast a deletion, destroying the file on every peer.
-	syncDirEntry(destDir, s.logger)
+	if err := fileops.SyncParents(destDir, s.syncDir); err != nil {
+		return fmt.Errorf("persist replica directory: %w", err)
+	}
 
 	// Update local store AFTER rename. This ordering is critical: if PutFile
 	// were called before Rename and Rename failed, the store would record a
@@ -912,10 +1017,13 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	// With Rename-then-PutFile, a PutFile failure is self-healing: the file
 	// is on disk, the watcher or periodic scan will detect it and create the
 	// store entry.
-	if _, err := s.store.PutFile(meta.Name, meta.ModTime, meta.Size, meta.Hash, false); err != nil {
+	if _, err := s.store.PutRemote(meta); err != nil {
 		return fmt.Errorf("update store for %s: %w", meta.Name, err)
 	}
 
+	if err := s.watcher.RefreshLocked(meta.Name); err != nil {
+		return err
+	}
 	s.logger.Info("file synced", "name", meta.Name, "size", meta.Size, "hash", meta.Hash[:12], "peer", peerURL)
 	return nil
 }
@@ -928,23 +1036,58 @@ func (s *Syncer) applyDeletion(meta store.FileMeta) error {
 		return err
 	}
 
-	// Mark as synced (fast-path optimisation for watcher).
-	s.watcher.MarkSynced(meta.Name, "")
+	unlock := fileops.Lock(s.syncDir)
+	defer unlock()
+	refreshErr := s.watcher.RefreshLocked(meta.Name)
+	damaged := errors.Is(refreshErr, watcher.ErrIntegrity)
+	if refreshErr != nil && !damaged {
+		return refreshErr
+	}
+	local, err := s.store.GetFile(meta.Name)
+	if err != nil {
+		return err
+	}
+	if !remoteWins(local, meta) {
+		return nil
+	}
+	destPath, err = s.safeLocalPath(meta.Name)
+	if err != nil {
+		return err
+	}
 
+	if err := s.store.StageReplica(meta); err != nil {
+		return err
+	}
 	// Remove file first (ignore if already gone).
 	if err := os.Remove(destPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove %s: %w", meta.Name, err)
 	}
 
-	// Try to clean up empty parent directories up to syncDir.
-	watcher.CleanEmptyParents(destPath, s.syncDir, s.ignorePatterns, s.logger)
+	// Persist the unlink before recording deletion. An already missing parent
+	// is harmless: find the surviving ancestor and flush it before the store.
+	parent := filepath.Dir(destPath)
+	for {
+		if _, err := os.Stat(parent); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if parent == s.syncDir {
+			return fmt.Errorf("sync root disappeared")
+		}
+		parent = filepath.Dir(parent)
+	}
+	if err := fileops.SyncParents(parent, s.syncDir); err != nil {
+		return err
+	}
+	watcher.CleanEmptyParentsLocked(destPath, s.syncDir, s.ignorePatterns, s.logger)
 
 	// Update store AFTER disk removal. Same reasoning as downloadAndApply:
 	// if PutFile fails after the file is already removed, the periodic scan
 	// will detect the deletion and create the store entry (self-healing).
 	// The reverse (PutFile first, then Remove fails) would leave the store
 	// saying "deleted" while the file still exists on disk.
-	if _, err := s.store.PutFile(meta.Name, meta.ModTime, 0, "", true); err != nil {
+	if _, err := s.store.PutRemote(meta); err != nil {
 		return fmt.Errorf("mark deleted in store %s: %w", meta.Name, err)
 	}
 
@@ -972,29 +1115,11 @@ func (s *Syncer) safeLocalPath(name string) (string, error) {
 // remoteWins reports whether a peer's entry should replace the local one.
 //
 // The ordering is total and identical on every node, which is what makes
-// convergence possible: newest mtime wins; on an exact tie a live file beats a
-// tombstone, and between two live files the lexicographically greater hash wins.
-// Without the tie-breaks, two nodes holding different bytes at the same mtime
-// each keep their own copy forever, with nothing to detect the split.
+// convergence possible: the per-path logical clock orders mutations; mtime,
+// live/deleted state and hash break ties between concurrent changes. Incoming
+// replication preserves that clock instead of inventing a local mutation.
 func remoteWins(local *store.FileMeta, remote store.FileMeta) bool {
-	if local == nil {
-		// A tombstone for a file we never had is not work; recording it would
-		// only make every reconciliation pass rediscover it.
-		return !remote.Deleted
-	}
-	if remote.ModTime != local.ModTime {
-		return remote.ModTime > local.ModTime
-	}
-	if remote.Deleted != local.Deleted {
-		// Equal timestamps: prefer existence. Losing data to a coincidental
-		// timestamp collision is far worse than keeping a file a moment longer,
-		// and a real deletion always carries mtime+1 so it still wins.
-		return local.Deleted
-	}
-	if remote.Deleted {
-		return false
-	}
-	return remote.Hash > local.Hash
+	return store.CompareState(&remote, local) > 0
 }
 
 // needsCursorReset reports whether a peer's identity or version space changed in
@@ -1099,20 +1224,6 @@ func watchStall(src *progressReader, timeout time.Duration, cancel context.Cance
 		}
 	}()
 	return w
-}
-
-// syncDirEntry flushes a directory entry so a rename survives a crash. Not every
-// platform or filesystem supports it; a failure is logged, not fatal.
-func syncDirEntry(dir string, logger *slog.Logger) {
-	d, err := os.Open(dir)
-	if err != nil {
-		logger.Debug("open dir for fsync failed", "dir", dir, "error", err)
-		return
-	}
-	defer d.Close()
-	if err := d.Sync(); err != nil {
-		logger.Debug("fsync dir failed", "dir", dir, "error", err)
-	}
 }
 
 // --- small helpers ---

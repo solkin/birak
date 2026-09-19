@@ -1365,15 +1365,7 @@ func newTestNodeWithOptions(t *testing.T, id, addr, syncDir, metaDir string, ign
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	onChange := func(events []watcher.FileEvent) {
-		for _, ev := range events {
-			if _, err := st.PutFile(ev.Name, ev.ModTime, ev.Size, ev.Hash, ev.Deleted); err != nil {
-				logger.Error("store update failed", "name", ev.Name, "error", err)
-			}
-		}
-	}
-
-	w := watcher.New(syncDir, st, logger, 200*time.Millisecond, 30*time.Second, ignorePatterns, onChange)
+	w := watcher.New(syncDir, st, logger, 200*time.Millisecond, 30*time.Second, ignorePatterns)
 
 	syn := syncer.New(st, w, syncDir, id, peers, ignorePatterns, logger, syncer.Options{
 		PollInterval:           500 * time.Millisecond, // fast poll for tests

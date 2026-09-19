@@ -11,8 +11,8 @@ Birak is a distributed file server with built-in replication. Each node stores a
 - **Multi-protocol access** — S3 API, WebDAV, SFTP, HTTP file browser, or direct filesystem.
 - **S3 multipart uploads** — crash-safe, resumable parallel uploads with TTL cleanup and per-part checksums.
 - **Automatic replication** — nodes discover changes in real time and replicate them to all peers.
-- **Guaranteed convergence** — a durable repair queue retries anything that fails, and periodic full reconciliation catches anything the change stream ever missed.
-- **Conflict resolution** — newest version wins, verified by SHA256 hash, with a deterministic tie-break so two nodes can never keep diverging copies.
+- **Recoverable replication** — durable repairs retain failed operations, periodic manifest reconciliation checks divergence, and checksum scans detect changes missed by filesystem events.
+- **Conflict resolution** — a per-path logical clock with deterministic tie-breaks, shared by polling, repairs, and reconciliation.
 - **No single point of failure** — every node is equal; any node can accept reads and writes.
 - **Zero external dependencies** — single Go binary, embedded SQLite for metadata.
 
@@ -25,7 +25,7 @@ A Birak cluster consists of one or more **nodes**. Each node has two directories
 
 Nodes know about each other through a **peers** list in the config. Each node polls its peers for changes and downloads new or updated files automatically. There is no central server — every node is a full replica.
 
-It doesn't matter how files get into `sync_dir` — you can copy them with `cp`, sync with `rsync`, save from any application, or upload via S3/WebDAV/SFTP/browser. Birak watches the directory for changes and replicates everything to other nodes. Once synced, files are accessible through any of the supported protocols.
+Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browser. For direct filesystem updates, publish atomically and change the mtime when replacing bytes. An unexplained checksum change with identical size and mtime is quarantined and repaired from a healthy peer; use a gateway when intentionally preserving both attributes. Once synced, files are accessible through any supported protocol.
 
 ## Quick Start
 
@@ -147,7 +147,7 @@ sync:
   poll_interval: 3s
   batch_limit: 1000
   max_concurrent_downloads: 5
-  tombstone_ttl: 168h       # 7 days
+  tombstone_ttl: 168h       # legacy setting; automatic tombstone GC is disabled
   scan_interval: 5m
   debounce_window: 300ms
   repair_interval: 30s      # how often failed changes are retried
@@ -211,8 +211,8 @@ export BIRAK_HTTP_ENABLED=true
 | `sync.poll_interval` | `BIRAK_SYNC_POLL_INTERVAL` | `3s` | Peer polling interval |
 | `sync.batch_limit` | `BIRAK_SYNC_BATCH_LIMIT` | `1000` | Max entries per sync request |
 | `sync.max_concurrent_downloads` | `BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS` | `5` | Concurrent downloads per peer |
-| `sync.tombstone_ttl` | `BIRAK_SYNC_TOMBSTONE_TTL` | `168h` | Deleted file record TTL (7 days) |
-| `sync.scan_interval` | `BIRAK_SYNC_SCAN_INTERVAL` | `5m` | Full filesystem scan interval |
+| `sync.tombstone_ttl` | `BIRAK_SYNC_TOMBSTONE_TTL` | `168h` | Legacy compatibility setting; tombstones are retained indefinitely |
+| `sync.scan_interval` | `BIRAK_SYNC_SCAN_INTERVAL` | `5m` | Full filesystem checksum scan interval; reads all visible file bytes |
 | `sync.debounce_window` | `BIRAK_SYNC_DEBOUNCE_WINDOW` | `300ms` | Delay before processing file events |
 | `sync.repair_interval` | `BIRAK_SYNC_REPAIR_INTERVAL` | `30s` | How often the repair queue is retried |
 | `sync.reconcile_interval` | `BIRAK_SYNC_RECONCILE_INTERVAL` | `1h` | Full manifest comparison interval (0 disables — not recommended) |
@@ -363,6 +363,9 @@ Standard SFTP protocol over SSH. Compatible with OpenSSH `sftp`, FileZilla, WinS
 - Password authentication (or open access if credentials are omitted)
 - SSH host key is auto-generated on first run and persisted in `meta_dir`
 - Supports `posix-rename@openssh.com` extension
+- Writable handles stage changes until CLOSE; disconnect aborts the upload
+- One active writer per inode; other writers and conflicting namespace operations return an error until it closes
+- Publication replaces a file generation; hard-link relationships are not preserved
 
 **Usage:**
 
@@ -377,36 +380,50 @@ sftp> rm old-file.txt
 
 ## How Sync Works
 
-1. Every file change (create, modify, delete) gets a new monotonic **version** in the local SQLite database.
-2. Each peer polls others: `GET /changes?since=<cursor>` — returns only files changed since the last sync.
-3. The batch is collapsed to the newest entry per name, then applied — up to `max_concurrent_downloads` files at a time.
-4. For each file: if the SHA256 hash differs and the incoming state wins conflict resolution, the file is downloaded, verified against its hash, fsynced, and renamed into place.
-5. The cursor is saved — the next poll only returns new changes.
-6. A new node joining the cluster starts with `since=0` and downloads everything.
+1. Every indexed create, modification, or deletion receives a new monotonic **version**. SQLite commits the file state and its persistent version counter in one transaction with `WAL + synchronous=FULL`.
+2. Each peer polls `GET /changes?since=<cursor>`. The batch is collapsed to the newest entry per name and applied with up to `max_concurrent_downloads` concurrent downloads.
+3. Incoming state is compared with current local bytes. A winning file is downloaded to a temporary file, checked against its size and SHA256, fsynced, and compared again before publication.
+4. Gateways, indexing, and replication share a filesystem commit lock. A gateway records its mutation intent before changing files and indexes the result before acknowledging success. Replica intents preserve the incoming conflict clock if a process stops between filesystem publication and SQLite commit. Writable SFTP handles use staging files: CLOSE publishes, disconnect aborts; aliases of an active inode are protected too.
+5. The cursor advances only when every operation has succeeded or its complete state has been persisted in the **repair queue**. Cancellation or a queue write failure prevents advancement.
+6. A new node starts at `since=0`, receiving both live files and deletion history.
 
-Nothing in that path can strand a file. Every failure is recorded in a durable **repair queue** and retried with exponential backoff, so a single unreadable file never holds up the rest of the stream. On top of that, **full reconciliation** compares the entire manifest with each peer every `reconcile_interval` and queues whatever diverged — the backstop for anything the version cursor has already moved past.
+Repairs retry with exponential backoff. A queued deletion survives loss of the source's metadata and can be applied while that source is offline. A persistent permission, disk, or connectivity failure stays visible in `/status`. **Full reconciliation** compares peer manifests every `reconcile_interval`; `0` disables it.
+
+Connect and TLS establishment are limited to 10 seconds each, response headers to 15 seconds, and inactivity during a file body to 60 seconds. Large transfers have no short overall timeout while bytes continue arriving.
 
 ### Conflict Resolution
 
-If the same file is modified on two nodes, the version with the newer `mod_time` wins, and the hash is checked to avoid redundant downloads. When timestamps are exactly equal — which happens on filesystems with coarse timestamps, with `rsync -t`, or with restored backups — the tie is broken deterministically: an existing file beats a tombstone, and between two files the lexicographically greater hash wins. The rule is identical on every node, so the cluster always converges on one copy instead of each node silently keeping its own.
+The greater per-path `clock` wins. A local mutation advances beyond the previous state, including overwrite, deletion, recreation, or a timestamp rollback. Incoming replication preserves that clock. Initial imported files start from their mtime; legacy database rows fall back to mtime. Equal clocks are resolved by mtime, then live-over-deleted state, then SHA256. The same ordering is used by polling, repairs, and reconciliation. Identical bytes can update their clock and timestamp without another download.
 
-### Cycle Prevention
+This is asynchronous last-writer-wins replication. Gateways acknowledge local filesystem and metadata completion, without waiting for a quorum. Clock skew can decide conflicts; concurrent edits do not keep both versions. A successful local write is not a zero-RPO cluster guarantee.
 
-When a node writes a file received from a peer, it marks it in memory. The file watcher sees the event but skips it if the hash matches. The mark expires after 5 seconds; the authoritative check is the store itself, which already holds that hash.
+### Indexing and Storage Readiness
+
+The watcher compares hash, size, and timestamp with the store; no timed suppression marks are needed. The initial scan and every periodic scan read and hash all visible regular files, including files whose size and timestamp did not change. This costs I/O proportional to the stored bytes; tune `scan_interval` for the volume and monitor scan freshness.
+
+An incomplete or unreadable directory walk never triggers the scan's deletion pass. A persistent marker at `sync_dir/.birak/storage-id` binds the data volume to its metadata database. A missing or mismatched marker makes local storage unready and prevents indexing, gateway mutations, and applying peer changes. Preserve this file with the data volume; do not delete it to bypass a storage fault. A legacy database is bound on first successful validation; an empty data root with existing live metadata is rejected.
+
+`/readyz` reports local scan and storage readiness; `/healthz` reports process liveness. `/status.local` exposes scan age and the last error. Peer outages and queued repairs must be monitored separately.
+
+Direct external filesystem writers do not acquire Birak's commit lock. Publish their files with atomic replacement and a changed mtime, and avoid concurrent external writes to names being changed through gateways or replication. Unexpected same-size/same-mtime checksum changes retain the last verified metadata, keep readiness false, and queue repair from peers. Without a healthy copy, the error remains visible; Birak does not guess which bytes are correct.
+
+COPY/MOVE overwrites have a local recovery journal. Startup restores an uncommitted replacement or finishes cleanup of a committed one before indexing. Backups are never swept as scratch files; an old backup without a journal blocks startup for explicit recovery. File-to-directory and directory-to-file replacements propagate, but multi-file operations become visible on peers one file at a time. Empty directories and arbitrary concurrent directory renames are outside the per-file convergence contract. Permissions are copied on download; a permission-only edit is not a replicated state change.
+
+Checksum scans and local COPY/staging work can hold the shared commit lock while reading large files. Benchmark scan intervals and file sizes on the intended storage; the correctness tests do not establish a throughput or latency SLA.
 
 ### Deletions
 
-When a file is deleted, a **tombstone** record (`deleted=true`) is created. Peers receive it and delete the file locally.
+A deletion creates a **tombstone** (`deleted=true`), including when a receiving node has never held that file. Tombstones are retained indefinitely. The old `sync.tombstone_ttl` setting remains accepted for configuration compatibility but does not trigger cleanup.
 
-Tombstones are purged only when both conditions hold: the deletion is older than `tombstone_ttl` (default 7 days) **and** every live peer has already read past it. Peers acknowledge implicitly — the `since` value of each poll proves what a peer has consumed. This is what keeps a deletion from being lost while a node is down and then undone by the next reconciliation.
+A polling cursor acknowledges receipt, not successful application. It cannot safely authorize distributed tombstone GC. Retaining deletion history lets a node return after a long outage without a TTL-based reseeding deadline; metadata storage consequently grows with distinct deleted names. Manual deletion of tombstones or loss of every copy of the metadata can reintroduce old files.
 
-> **Operational rule:** a node that has been unreachable for longer than `tombstone_ttl` must be re-seeded from scratch (wipe its `sync_dir` and `meta_dir` and let it resync), not simply reconnected. After that window the cluster stops holding tombstones for it, so reconnecting it can resurrect deleted files. This is the same constraint as `gc_grace_seconds` in Cassandra and applies to any last-writer-wins replicated store.
+### Node Identity and Recovery
 
-### Node Identity and Epochs
+Run one daemon per data volume and metadata directory; OS-held leases reject a second process and are released automatically on exit. Assign a unique `node_id` to each node. Replication rejects a peer advertising the same ID as the local node. Each database has a persistent identity, while every daemon start generates a fresh **process incarnation**, returned as `X-Birak-Epoch`. Peers reset their cursors on an incarnation change and replay current metadata. This also covers a restored backup whose version counter has already caught up with an old cursor.
 
-Each database carries an **epoch** — a random ID generated when the metadata is first created. Every cluster response includes it. If a node loses or restores its `meta_dir`, it comes back with a new epoch and restarts version numbering at 1; peers detect the change and reset their cursors, instead of sitting on a stale cursor that would hide every one of that node's changes forever.
+**Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 2`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration is automatic.
 
-For the same reason, **`meta_dir` should be persistent storage.** Birak recovers correctly if it is lost, but the node then has to be re-fetched by its peers from scratch.
+The version high-water mark survives deletion of file records. Both `meta_dir` and `sync_dir`, including `.birak/storage-id`, should use persistent storage and be included in a consistent backup. Losing the metadata also loses deletion history, cursors, and repair work that might have no other surviving copy.
 
 ## Peer-to-Peer HTTP API
 
@@ -452,7 +469,7 @@ curl 'http://localhost:9100/manifest?limit=100'
 
 ### GET /meta/{name...}
 
-Returns the current metadata for a single name, or 404 if the node has no record of it. The repair worker calls it before each retry so it always targets the peer's newest state.
+Returns the current metadata for a single name, or 404 if the node has no record of it. The repair worker compares it with the full queued operation and retains the greater conflict state.
 
 ### GET /status
 
@@ -469,6 +486,7 @@ curl 'http://localhost:9100/status'
   "max_version": 42,
   "file_count": 1500,
   "repairs": { "total": 0, "due": 0, "oldest_age_ms": 0 },
+  "local": { "ready": true, "last_scan_ms_ago": 812 },
   "peers": [
     {
       "peer": "http://192.168.1.2:9100",
@@ -486,7 +504,7 @@ curl 'http://localhost:9100/status'
 }
 ```
 
-Watch `peers[].lag`, `peers[].healthy` and `repairs.total` to spot a stalled peer: a stream that has stopped moving shows up here rather than only as a file-count drift between nodes.
+Watch `local.ready`, `local.last_scan_ms_ago`, `peers[].lag`, `peers[].healthy` and `repairs.total` to spot a stalled peer: a stream that has stopped moving shows up here rather than only as a file-count drift between nodes.
 
 ### GET /healthz
 
@@ -497,9 +515,18 @@ livenessProbe:
   httpGet: { path: /healthz, port: 9100 }
 ```
 
+### GET /readyz
+
+Unauthenticated readiness probe. Returns 200 only after a complete successful checksum scan, while the expected storage marker is available and the scan is fresh. Returns 503 on a local scan or storage fault. It does not certify that all peers have converged.
+
+```yaml
+readinessProbe:
+  httpGet: { path: /readyz, port: 9100 }
+```
+
 ### Authentication
 
-Set `cluster_secret` and every endpoint above except `/healthz` requires the `X-Birak-Secret` header. Peers send it automatically. Without it the sync API serves every file to anyone who can reach `listen_addr`, so either set the secret or keep the port off any untrusted network.
+Set `cluster_secret` and every endpoint above except `/healthz` and `/readyz` requires the `X-Birak-Secret` header. Peers send it automatically. Without it the sync API serves every file to anyone who can reach `listen_addr`, so either set the secret or keep the port off any untrusted network.
 
 ```bash
 curl -H "X-Birak-Secret: shared-secret" 'http://localhost:9100/status'
@@ -515,7 +542,8 @@ birak/
   cmd/birakd/main.go                 — entrypoint, CLI, graceful shutdown
   internal/
     config/config.go              — YAML config parsing
-    store/store.go                — SQLite: files + cursors tables
+    store/store.go                — SQLite: files, cursors, persistent repair queue
+    fileops/fileops.go            — shared filesystem commits and durability
     watcher/watcher.go            — fsnotify + debounce + periodic scan
     server/server.go              — HTTP API for peer synchronization
     syncer/syncer.go              — polling, conflict resolution, downloads
@@ -532,9 +560,21 @@ intentional differences, and the rules for porting protocol fixes.
 
 ### Running Tests
 
+The [second replication review](docs/audits/replication-second-review.md) records
+the reproduced failures before this round. The [follow-up fixes and validation](docs/audits/replication-followup-fixes.md)
+cover their resolution. Those acceptance tests now run in the default suite,
+including process interruption during replacement and automatic integrity repair.
+
+The [original production audit](docs/audits/sync-production-readiness.md) records
+the failures before these changes. The [fixes and validation report](docs/audits/sync-reliability-fixes.md)
+tracks their resolution. All regression scenarios now run in the normal suite,
+including real daemon SIGKILL/restart with race instrumentation. `-short` skips
+the real 15-second response-header timeout check.
+
 ```bash
 # All tests
-go test -race -v -timeout 120s ./...
+go vet ./...
+go test -race -v -timeout 240s ./...
 
 # Unit tests for a specific package
 go test -v ./internal/store/

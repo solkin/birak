@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/birak/birak/internal/config"
+	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/gateway"
 	httpuigw "github.com/birak/birak/internal/gateway/httpui"
 	s3gw "github.com/birak/birak/internal/gateway/s3"
@@ -36,39 +37,8 @@ func main() {
 	}
 }
 
-// purgeTombstones drops deletion records that are both older than the TTL and
-// already consumed by every live peer.
-//
-// The acknowledgement gate is what stops a deletion from being lost: a peer
-// that has not yet read a tombstone would otherwise keep the file, and the next
-// full reconciliation would copy it back — resurrecting deleted data. A peer
-// silent for longer than the whole TTL is presumed gone and no longer holds
-// tombstones back; such a node must be re-seeded from scratch rather than
-// reconnected, exactly as with any last-writer-wins replicated store.
-func purgeTombstones(st *store.Store, cfg config.Config, logger *slog.Logger) {
-	gate := store.NoAckGate
-	if len(cfg.Peers) > 0 {
-		minAck, err := st.MinAckedVersion(cfg.Sync.TombstoneTTL)
-		if err != nil {
-			logger.Error("read peer acknowledgements failed", "error", err)
-			return
-		}
-		if minAck == store.NoAckGate {
-			logger.Warn("skipping tombstone purge: no peer has acknowledged any change yet")
-			return
-		}
-		gate = minAck
-	}
-
-	purged, err := st.PurgeTombstones(cfg.Sync.TombstoneTTL, gate)
-	if err != nil {
-		logger.Error("tombstone purge failed", "error", err)
-		return
-	}
-	if purged > 0 {
-		logger.Info("tombstones purged", "count", purged, "acked_through", gate)
-	}
-}
+// Tombstones are retained indefinitely. Stream cursors acknowledge receipt,
+// not application, and cannot safely authorize distributed deletion GC.
 
 func run(configPath string) error {
 	// Load configuration.
@@ -93,14 +63,33 @@ func run(configPath string) error {
 		return fmt.Errorf("create meta dir: %w", err)
 	}
 
+	releaseMeta, err := fileops.AcquireLease(cfg.MetaDir)
+	if err != nil {
+		return err
+	}
+	defer releaseMeta()
+
 	// Ensure sync directory exists.
 	if err := os.MkdirAll(cfg.SyncDir, 0o755); err != nil {
 		return fmt.Errorf("create sync dir: %w", err)
 	}
 
-	// Clear scratch files left by a previous crash before serving any requests.
-	// No upload can be in flight yet, so age is irrelevant here.
-	gateway.SweepTempFiles(cfg.SyncDir, 0, logger)
+	private := filepath.Join(cfg.SyncDir, ".birak")
+	if info, err := os.Lstat(private); err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
+		return fmt.Errorf("storage state directory must be a real directory")
+	}
+	if err := os.MkdirAll(private, 0o700); err != nil {
+		return err
+	}
+	metaInfo, _ := os.Stat(cfg.MetaDir)
+	volumeInfo, _ := os.Stat(private)
+	if metaInfo == nil || volumeInfo == nil || !os.SameFile(metaInfo, volumeInfo) {
+		releaseVolume, err := fileops.AcquireLease(private)
+		if err != nil {
+			return err
+		}
+		defer releaseVolume()
+	}
 
 	// Warn about enabled gateways running without credentials.
 	for _, warning := range config.SecurityWarnings(cfg) {
@@ -123,26 +112,9 @@ func run(configPath string) error {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
-	// Set up watcher with onChange callback that updates the store.
-	// A store write that fails here is not lost: the file keeps its old (or
-	// absent) entry, so the next periodic scan sees a mismatch and retries.
-	// The failure is still worth shouting about — a persistently failing store
-	// means replication has quietly stopped advancing.
-	onChange := func(events []watcher.FileEvent) {
-		failed := 0
-		for _, ev := range events {
-			if _, err := st.PutFile(ev.Name, ev.ModTime, ev.Size, ev.Hash, ev.Deleted); err != nil {
-				failed++
-				logger.Error("store update failed", "name", ev.Name, "error", err)
-			}
-		}
-		if failed > 0 {
-			logger.Error("store updates failed, will be retried by the next periodic scan",
-				"failed", failed, "total", len(events))
-		}
-	}
-
+	// The watcher owns indexing and participates in the shared commit lock.
 	w := watcher.New(
 		cfg.SyncDir,
 		st,
@@ -150,8 +122,14 @@ func run(configPath string) error {
 		cfg.Sync.DebounceWindow,
 		cfg.Sync.ScanInterval,
 		cfg.Ignore,
-		onChange,
 	)
+
+	// Validate the volume and recover interrupted replacements before cleanup,
+	// indexing, or exposing any gateway.
+	if err := w.CheckStorage(); err != nil {
+		return fmt.Errorf("recover storage: %w", err)
+	}
+	gateway.SweepTempFiles(cfg.SyncDir, 0, logger)
 
 	// Drop cursors and repair items for peers that are no longer configured, so
 	// a rotated peer list does not leave dead state behind forever.
@@ -185,8 +163,10 @@ func run(configPath string) error {
 	}, logger)
 	srv.SetStats(syn)
 	httpServer := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: srv.Handler(),
+		Addr:              cfg.ListenAddr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second,
 	}
 
 	// Launch all components.
@@ -218,22 +198,6 @@ func run(configPath string) error {
 	go func() {
 		defer wg.Done()
 		syn.Run(ctx)
-	}()
-
-	// Tombstone purger.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(1 * time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				purgeTombstones(st, cfg, logger)
-			}
-		}
 	}()
 
 	// S3 Gateway (if enabled).

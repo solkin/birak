@@ -2,18 +2,18 @@ package watcher
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/store"
 	"github.com/fsnotify/fsnotify"
 )
@@ -38,13 +38,14 @@ type Watcher struct {
 	scanInterval      time.Duration
 	ignorePatterns    []string
 
-	// recentlySynced tracks files written by the syncer that should be
-	// ignored by the watcher to prevent sync loops. This serves as a
-	// fast-path optimisation — the store-based dedup in inspectFile is
-	// the authoritative check.
-	recentlySynced   map[string]syncedMark // relPath -> mark
-	recentlySyncedMu sync.Mutex
-	lastSyncedSweep  time.Time
+	statusMu    sync.Mutex
+	lastScan    time.Time
+	lastError   string
+	readyOnce   sync.Once
+	recovered   bool
+	repairPeers []string
+	integrity   map[string]bool // protected by statusMu
+	storageID   string          // accessed under the shared filesystem commit lock
 
 	// work carries debounced batches from the fsnotify loop to the processing
 	// goroutine. Hashing and directory scans must never run on the event loop:
@@ -56,47 +57,26 @@ type Watcher struct {
 	// anything the event stream may have dropped.
 	rescan chan struct{}
 
-	// onChange is called for each debounced file event batch.
-	onChange func([]FileEvent)
-
-	// ready is closed after the initial scan completes.
+	// ready is closed after the first complete, successful scan.
 	// Other components (e.g. syncer) should wait on this before starting.
 	ready chan struct{}
 }
-
-// syncedTTL is how long a MarkSynced hint stays usable. It is only a
-// fast path; the store-based dedup in inspectFile is authoritative, so an
-// expired hint costs a hash, never correctness.
-const syncedTTL = 5 * time.Second
 
 // workQueueDepth bounds the batches buffered between the event loop and the
 // processing goroutine. On overflow the watcher falls back to a full scan
 // rather than blocking the event loop.
 const workQueueDepth = 256
 
-// syncedMark records a file the syncer just wrote, with the time it did so.
-type syncedMark struct {
-	hash string
-	at   time.Time
-}
-
-// diskFile holds file metadata collected during a directory walk.
-type diskFile struct {
-	name    string
-	path    string
-	modTime int64
-	size    int64
-}
-
 // New creates a new Watcher.
-func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanInterval time.Duration, ignorePatterns []string, onChange func([]FileEvent)) *Watcher {
+func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanInterval time.Duration, ignorePatterns []string) *Watcher {
+	dir, _ = filepath.Abs(dir)
 	// Max debounce window: 10x the debounce window, at least 2 seconds.
 	maxDebounce := debounceWindow * 10
 	if maxDebounce < 2*time.Second {
 		maxDebounce = 2 * time.Second
 	}
 
-	return &Watcher{
+	w := &Watcher{
 		dir:               dir,
 		store:             s,
 		logger:            logger,
@@ -104,54 +84,19 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 		maxDebounceWindow: maxDebounce,
 		scanInterval:      scanInterval,
 		ignorePatterns:    ignorePatterns,
-		recentlySynced:    make(map[string]syncedMark),
-		onChange:          onChange,
 		ready:             make(chan struct{}),
 		work:              make(chan []string, workQueueDepth),
 		rescan:            make(chan struct{}, 1),
+		integrity:         make(map[string]bool),
 	}
+	fileops.SetNotifier(dir, w.requestRescan)
+	fileops.SetHooks(dir, fileops.Hooks{Validate: w.prepareStorageLocked, Begin: w.beginCommitLocked, Finish: w.finishCommitLocked})
+	return w
 }
 
-// Ready returns a channel that is closed after the initial scan completes.
+// Ready returns a channel closed after the first complete, successful scan.
 func (w *Watcher) Ready() <-chan struct{} {
 	return w.ready
-}
-
-// MarkSynced marks a file as recently synced so the watcher ignores the
-// next fsnotify event for it. The entry expires after 5 seconds.
-func (w *Watcher) MarkSynced(name, hash string) {
-	w.recentlySyncedMu.Lock()
-	defer w.recentlySyncedMu.Unlock()
-	w.recentlySynced[name] = syncedMark{hash: hash, at: time.Now()}
-	w.sweepSyncedLocked()
-}
-
-// sweepSyncedLocked drops expired marks. Entries expire by timestamp rather
-// than by a timer goroutine each: a bulk sync marks thousands of files, and one
-// sleeping goroutine per file is a needless pile of scheduler work.
-func (w *Watcher) sweepSyncedLocked() {
-	now := time.Now()
-	if now.Sub(w.lastSyncedSweep) < syncedTTL {
-		return
-	}
-	w.lastSyncedSweep = now
-	for name, mark := range w.recentlySynced {
-		if now.Sub(mark.at) > syncedTTL {
-			delete(w.recentlySynced, name)
-		}
-	}
-}
-
-// isSynced checks if a file event should be ignored (was recently synced).
-func (w *Watcher) isSynced(name, hash string) bool {
-	w.recentlySyncedMu.Lock()
-	defer w.recentlySyncedMu.Unlock()
-	mark, ok := w.recentlySynced[name]
-	if !ok || mark.hash != hash {
-		return false
-	}
-	delete(w.recentlySynced, name)
-	return time.Since(mark.at) <= syncedTTL
 }
 
 // shouldIgnore checks if a file path matches any of the configured ignore patterns.
@@ -208,7 +153,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 	// maxDebounceTimer is a hard deadline: if events keep arriving and the
 	// debounce timer keeps resetting, we force a flush after maxDebounceWindow
-	// to prevent starvation (and MarkSynced expiry under sustained load).
+	// to prevent starvation under sustained load.
 	var maxDebounceTimer *time.Timer
 	var maxDebounceCh <-chan time.Time
 
@@ -359,10 +304,6 @@ func (w *Watcher) processLoop(ctx context.Context) {
 	// Initial scan picks up anything that changed while the daemon was down.
 	w.periodicScan(ctx)
 
-	// Signal that the initial scan is complete. Other components (syncer) wait
-	// on this to avoid syncing before the local state is known.
-	close(w.ready)
-
 	scanTicker := time.NewTicker(w.scanInterval)
 	defer scanTicker.Stop()
 
@@ -444,293 +385,336 @@ func (w *Watcher) addDirsRecursive(fsw *fsnotify.Watcher, root string) (failCoun
 	return failCount, err
 }
 
-// processBatch handles a batch of relative file paths detected by fsnotify.
+// processBatch inspects and publishes each file under the same lock used by
+// gateway commits and replication. No stale event batch can overwrite a newer
+// store entry at the end of a long scan.
 func (w *Watcher) processBatch(names []string) {
-	var events []FileEvent
-
 	for _, name := range names {
-		ev, err := w.inspectFile(name)
-		if err != nil {
+		if err := w.Refresh(name); err != nil {
+			w.setError(err)
 			w.logger.Error("inspect file failed", "name", name, "error", err)
-			continue
 		}
-		if ev == nil {
-			continue // skipped (synced file or directory)
-		}
-		events = append(events, *ev)
-	}
-
-	if len(events) > 0 {
-		w.onChange(events)
 	}
 }
 
-// inspectFile stats and hashes a file, returning a FileEvent.
-// name is a relative path (e.g. "subdir/file.txt").
-// Returns nil if the file should be skipped (recently synced or a directory).
+func (w *Watcher) Refresh(name string) error {
+	unlock := fileops.Lock(w.dir)
+	defer unlock()
+	return w.RefreshLocked(name)
+}
+
+// RefreshLocked synchronously indexes current bytes, including a gateway
+// commit whose fsnotify event has not been processed yet. Caller holds Lock.
+func (w *Watcher) RefreshLocked(name string) error {
+	if err := w.prepareStorageLocked(); err != nil {
+		return err
+	}
+	return w.refreshFileLocked(name)
+}
+func (w *Watcher) refreshFileLocked(name string) error {
+	if fileops.BusyLocked(w.dir, filepath.Join(w.dir, filepath.FromSlash(name))) {
+		return fileops.ErrBusy
+	}
+	if err := w.recoverReplicaLocked(name); err != nil {
+		return err
+	}
+	ev, err := w.inspectFile(name)
+	if err != nil || ev == nil {
+		return err
+	}
+	// A recovered rename or a direct filesystem write must be durable before
+	// peers can consume its metadata, even if its original writer never fsynced.
+	path := filepath.Join(w.dir, filepath.FromSlash(name))
+	if !ev.Deleted {
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		if err := errors.Join(f.Sync(), f.Close()); err != nil {
+			return err
+		}
+	}
+	if err := fileops.SyncSurvivingParent(path, w.dir); err != nil {
+		return err
+	}
+	_, err = w.store.PutLocal(store.FileMeta{Name: ev.Name, ModTime: ev.ModTime, Size: ev.Size, Hash: ev.Hash, Deleted: ev.Deleted})
+	return err
+}
+
 func (w *Watcher) inspectFile(name string) (*FileEvent, error) {
-	// Safety check: reject paths that escape the sync directory.
-	if isOutsideSyncDir(name) {
+	if isOutsideSyncDir(name) || w.shouldIgnore(name) {
 		return nil, nil
 	}
-
 	fullPath := filepath.Join(w.dir, filepath.FromSlash(name))
+	if fileops.BusyLocked(w.dir, fullPath) {
+		return nil, fileops.ErrBusy
+	}
+	existing, err := w.store.GetFile(name)
+	if err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(fullPath)
-	if os.IsNotExist(err) {
-		// File was deleted — look up the last known ModTime from the store
-		// so the deletion timestamp reflects the file's real age rather than
-		// the wall-clock time of detection. Using time.Now() would make
-		// every deletion "newer" than the original file on other nodes,
-		// causing false conflict wins.
-		existing, _ := w.store.GetFile(name)
-		if existing != nil && existing.Deleted {
-			// Already marked as deleted in store — nothing to do.
-			w.logger.Debug("skipping deletion, already in store", "name", name)
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		if existing == nil || existing.Deleted {
+			w.clearIntegrity(name)
 			return nil, nil
 		}
-
-		// Check fast-path MarkSynced (syncer just deleted this file).
-		if w.isSynced(name, "") {
-			w.logger.Debug("skipping synced deletion", "name", name)
-			return nil, nil
-		}
-
-		w.logger.Info("file deleted detected", "name", name)
-
-		// Clean up empty parent directories on the source node.
-		CleanEmptyParents(fullPath, w.dir, w.ignorePatterns, w.logger)
-
-		delModTime := time.Now().UnixNano()
-		if existing != nil {
-			// Use the file's last known ModTime + 1ns. This ensures the
-			// deletion beats the exact version it's deleting, but does NOT
-			// beat legitimately newer versions of the same file on other
-			// nodes (unlike time.Now() which always wins).
-			delModTime = existing.ModTime + 1
-		}
-
-		return &FileEvent{
-			Name:    name,
-			ModTime: delModTime,
-			Size:    0,
-			Hash:    "",
-			Deleted: true,
-		}, nil
+		w.clearIntegrity(name)
+		// The root was verified above; absence is a local deletion, not loss of a mount.
+		CleanEmptyParentsLocked(fullPath, w.dir, w.ignorePatterns, w.logger)
+		return &FileEvent{Name: name, ModTime: existing.ModTime + 1, Deleted: true}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("stat %s: %w", fullPath, err)
+		return nil, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		resolvedInfo, safe := w.safeSymlinkInfo(fullPath)
+		var safe bool
+		info, safe = w.safeSymlinkInfo(fullPath)
 		if !safe {
+			if existing != nil && !existing.Deleted {
+				return nil, fmt.Errorf("indexed file %q was replaced by an unsupported symlink", name)
+			}
 			return nil, nil
 		}
-		info = resolvedInfo
 	}
-
-	// Skip directories.
-	if info.IsDir() {
+	if !info.Mode().IsRegular() {
+		trusted, err := w.store.HasLocalIntent(name)
+		if err != nil {
+			return nil, err
+		}
+		if info.IsDir() && trusted && existing != nil && !existing.Deleted {
+			return &FileEvent{Name: name, ModTime: existing.ModTime, Deleted: true}, nil
+		}
+		if existing != nil && !existing.Deleted {
+			return nil, fmt.Errorf("indexed file %q was replaced by a non-regular file", name)
+		}
 		return nil, nil
 	}
-
-	hash, err := hashFile(fullPath)
+	info, hash, err := fileops.Snapshot(fullPath)
 	if err != nil {
-		return nil, fmt.Errorf("hash %s: %w", fullPath, err)
+		return nil, err
 	}
-
-	// Fast-path: check in-memory MarkSynced (avoids unnecessary store writes).
-	if w.isSynced(name, hash) {
-		w.logger.Debug("skipping synced file", "name", name)
+	trusted, err := w.store.HasLocalIntent(name)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil && !existing.Deleted && existing.Hash != hash && existing.ModTime == info.ModTime().UnixNano() && existing.Size == info.Size() && !trusted {
+		return nil, w.quarantine(existing)
+	}
+	w.clearIntegrity(name)
+	if existing != nil && !existing.Deleted && existing.Hash == hash && existing.ModTime == info.ModTime().UnixNano() && existing.Size == info.Size() {
 		return nil, nil
 	}
-
-	// Authoritative dedup: if the store already has this exact hash for this
-	// file, the change was already recorded (e.g. by the syncer). This
-	// replaces the fragile time-based MarkSynced as the primary guard
-	// against sync loops.
-	existing, _ := w.store.GetFile(name)
-	if existing != nil && !existing.Deleted && existing.Hash == hash {
-		w.logger.Debug("skipping file, store already has same hash", "name", name)
-		return nil, nil
-	}
-
-	w.logger.Info("file change detected", "name", name, "size", info.Size(), "hash", hash[:12])
-	return &FileEvent{
-		Name:    name,
-		ModTime: info.ModTime().UnixNano(),
-		Size:    info.Size(),
-		Hash:    hash,
-		Deleted: false,
-	}, nil
+	return &FileEvent{Name: name, ModTime: info.ModTime().UnixNano(), Size: info.Size(), Hash: hash}, nil
 }
 
-// periodicScan performs a recursive directory scan to detect changes missed by fsnotify.
-//
-// Memory-efficient implementation:
-//   - Files on disk are checked against the store in batches (not one-by-one).
-//   - Deletion detection iterates the store in pages instead of loading
-//     all entries into a single map.
-//   - Scans cannot overlap: periodicScan only ever runs on processLoop, so a
-//     scan that outlasts its interval simply delays the next tick rather than
-//     racing a second walk.
-func (w *Watcher) periodicScan(ctx context.Context) {
-	started := time.Now()
-	w.logger.Debug("periodic scan started")
+// ScanStatus describes the last complete checksum scan, independent of peers.
+// A failed or incomplete scan never opens readiness.
+type ScanStatus struct {
+	Ready         bool   `json:"ready"`
+	LastScanAgoMS int64  `json:"last_scan_ms_ago"`
+	LastError     string `json:"last_error,omitempty"`
+}
 
-	// Record the max version BEFORE walking the disk. Files added by the
-	// syncer during the walk will have version > maxVer and are excluded
-	// from deletion detection, preventing false deletions.
-	maxVer, err := w.store.MaxVersion()
-	if err != nil {
-		w.logger.Error("periodic scan: get max version failed", "error", err)
-		return
+func (w *Watcher) Status() ScanStatus {
+	w.statusMu.Lock()
+	defer w.statusMu.Unlock()
+	status := ScanStatus{LastError: w.lastError, LastScanAgoMS: -1}
+	if !w.lastScan.IsZero() {
+		status.LastScanAgoMS = time.Since(w.lastScan).Milliseconds()
+		status.Ready = len(w.integrity) == 0 && w.lastError == "" && time.Since(w.lastScan) < 2*w.scanInterval+time.Minute
 	}
+	return status
+}
 
-	// Walk disk: collect file info in batches and compare with the store.
-	const scanBatchSize = 500
-	onDisk := make(map[string]struct{})
-	var events []FileEvent
-	var batch []diskFile
+func (w *Watcher) setError(err error) {
+	w.statusMu.Lock()
+	defer w.statusMu.Unlock()
+	w.lastError = err.Error()
+}
 
-	processBatch := func() {
-		if len(batch) == 0 {
+func (w *Watcher) CheckStorage() error {
+	unlock := fileops.Lock(w.dir)
+	defer unlock()
+	return w.prepareStorageLocked()
+}
+
+// A persisted sentinel binds this metadata database to its data volume. A
+// missing/remounted root after restart must fail closed, not delete the cluster.
+func (w *Watcher) checkStorageLocked() error {
+	info, err := os.Stat(w.dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("sync root is not a directory")
+	}
+	if w.storageID == "" {
+		w.storageID, err = w.store.NodeValue("storage_id")
+		if err != nil {
+			return err
+		}
+	}
+	private := filepath.Join(w.dir, ".birak")
+	if info, err := os.Lstat(private); err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
+		return fmt.Errorf("storage state directory must be a real directory")
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	marker := filepath.Join(private, "storage-id")
+	if info, err := os.Lstat(marker); err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("invalid storage sentinel")
+	}
+	data, err := os.ReadFile(marker)
+	if w.storageID != "" {
+		if err != nil {
+			return fmt.Errorf("data volume sentinel unavailable: %w", err)
+		}
+		if string(data) != w.storageID {
+			return fmt.Errorf("data volume identity mismatch")
+		}
+		return nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	id := string(data)
+	if id == "" {
+		// Migration from pre-sentinel releases: an empty data root alongside live
+		// metadata could be an absent mount. Require an operator to restore it.
+		count, err := w.store.FileCount()
+		if err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(w.dir)
+		if err != nil {
+			return err
+		}
+		visible := false
+		for _, entry := range entries {
+			if !w.shouldIgnore(entry.Name()) {
+				visible = true
+				break
+			}
+		}
+		if count > 0 && !visible {
+			return fmt.Errorf("data root is empty but metadata contains live files")
+		}
+		id = w.store.Epoch()
+		if err := os.MkdirAll(private, 0o700); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return err
+		}
+		_, writeErr := f.WriteString(id)
+		err = errors.Join(writeErr, f.Sync(), f.Close())
+		if err != nil {
+			return err
+		}
+		if err := fileops.SyncParents(private, w.dir); err != nil {
+			return err
+		}
+	}
+	if err := w.store.SetNodeValue("storage_id", id); err != nil {
+		return err
+	}
+	w.storageID = id
+	return nil
+}
+
+// periodicScan is a checksum scrub, not just an mtime/size comparison. Changes
+// are published one by one using fresh snapshots; memory holds only names.
+// Any traversal error suppresses the entire deletion pass.
+func (w *Watcher) periodicScan(ctx context.Context) (result error) {
+	defer func() {
+		if result != nil {
+			w.setError(result)
+			w.logger.Error("scan incomplete", "error", result)
 			return
 		}
-		evts := w.compareScanBatch(batch)
-		events = append(events, evts...)
-		batch = batch[:0]
+		w.statusMu.Lock()
+		w.lastScan = time.Now()
+		w.lastError = ""
+		w.statusMu.Unlock()
+		w.readyOnce.Do(func() { close(w.ready) })
+	}()
+	if err := w.CheckStorage(); err != nil {
+		return err
 	}
-
-	err = filepath.WalkDir(w.dir, func(path string, d fs.DirEntry, walkErr error) error {
-		// A scan over a large tree must not hold up shutdown.
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+	onDisk := make(map[string]struct{})
+	var scanErr, integrityErr error
+	err := filepath.WalkDir(w.dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if walkErr != nil {
-			w.logger.Error("periodic scan: walk error", "path", path, "error", walkErr)
-			return nil // continue walking
+			scanErr = errors.Join(scanErr, walkErr)
+			return nil
+		}
+		if path == w.dir {
+			return nil
+		}
+		rel, err := filepath.Rel(w.dir, path)
+		if err != nil {
+			scanErr = errors.Join(scanErr, err)
+			return nil
+		}
+		name := filepath.ToSlash(rel)
+		if w.shouldIgnore(name) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
-			if path != w.dir {
-				relPath, relErr := filepath.Rel(w.dir, path)
-				if relErr == nil {
-					relPath = filepath.ToSlash(relPath)
-					if w.shouldIgnore(relPath) {
-						return fs.SkipDir
-					}
-				}
-			}
 			return nil
 		}
-
-		relPath, relErr := filepath.Rel(w.dir, path)
-		if relErr != nil {
-			return nil
-		}
-		name := filepath.ToSlash(relPath)
-
-		if w.shouldIgnore(name) {
-			return nil
-		}
-
-		info, infoErr := d.Info()
-		if infoErr != nil {
-			w.logger.Error("periodic scan: stat failed", "name", name, "error", infoErr)
-			return nil
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			resolvedInfo, safe := w.safeSymlinkInfo(path)
-			if !safe {
-				return nil
-			}
-			info = resolvedInfo
-		}
-
 		onDisk[name] = struct{}{}
-
-		batch = append(batch, diskFile{
-			name:    name,
-			path:    path,
-			modTime: info.ModTime().UnixNano(),
-			size:    info.Size(),
-		})
-		if len(batch) >= scanBatchSize {
-			processBatch()
+		if err := w.Refresh(name); err != nil {
+			if errors.Is(err, ErrIntegrity) {
+				integrityErr = errors.Join(integrityErr, err)
+			} else {
+				scanErr = errors.Join(scanErr, err)
+			}
 		}
 		return nil
 	})
-	if err != nil {
-		if ctx.Err() != nil {
-			w.logger.Debug("periodic scan aborted by shutdown")
-			return
-		}
-		w.logger.Error("periodic scan: walk failed", "error", err)
+	if err != nil || scanErr != nil {
+		return errors.Join(err, scanErr)
 	}
-	processBatch() // flush remaining
-
-	// Detect deletions: iterate the store in pages instead of loading
-	// everything into memory. Only consider entries with version <= maxVer
-	// to avoid false deletions for files added by the syncer during the walk.
-	const pageSize = 5000
-	var afterName string
+	var after string
 	for {
-		if ctx.Err() != nil {
-			w.logger.Debug("periodic scan aborted by shutdown")
-			return
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		page, pageErr := w.store.ListNonDeleted(afterName, pageSize)
-		if pageErr != nil {
-			w.logger.Error("periodic scan: list non-deleted failed", "error", pageErr)
-			break
+		page, err := w.store.ListNonDeleted(after, 1000)
+		if err != nil {
+			return err
 		}
 		if len(page) == 0 {
 			break
 		}
-
-		for i := range page {
-			meta := &page[i]
-			afterName = meta.Name
-
-			// Skip files added during the walk.
-			if meta.Version > maxVer {
+		for _, meta := range page {
+			after = meta.Name
+			if _, ok := onDisk[meta.Name]; ok || w.shouldIgnore(meta.Name) {
 				continue
 			}
-
-			if _, ok := onDisk[meta.Name]; ok {
-				continue
+			// A file may have appeared since the walk. Refresh rechecks disk and store
+			// under the commit lock, so it cannot publish a stale deletion.
+			if err := w.Refresh(meta.Name); err != nil {
+				return err
 			}
-
-			// Double-check the live store — the syncer may have already
-			// marked this file as deleted while we were walking.
-			liveMeta, _ := w.store.GetFile(meta.Name)
-			if liveMeta == nil || liveMeta.Deleted {
-				continue
-			}
-
-			// Check synced (fast-path for syncer-originated deletions).
-			if w.isSynced(meta.Name, "") {
-				continue
-			}
-
-			w.logger.Info("periodic scan: deletion detected", "name", meta.Name)
-
-			fullPath := filepath.Join(w.dir, filepath.FromSlash(meta.Name))
-			CleanEmptyParents(fullPath, w.dir, w.ignorePatterns, w.logger)
-
-			events = append(events, FileEvent{
-				Name:    meta.Name,
-				ModTime: meta.ModTime + 1,
-				Deleted: true,
-			})
 		}
 	}
-
-	if len(events) > 0 {
-		w.logger.Info("periodic scan completed", "changes", len(events), "took", time.Since(started))
-		w.onChange(events)
-	} else {
-		w.logger.Debug("periodic scan completed, no changes", "took", time.Since(started))
+	if err := w.CheckStorage(); err != nil {
+		return err
 	}
+	if integrityErr != nil {
+		w.readyOnce.Do(func() { close(w.ready) })
+	}
+	return integrityErr
 }
 
 // safeSymlinkInfo follows a file symlink only when its target remains inside the
@@ -765,72 +749,9 @@ func (w *Watcher) safeSymlinkInfo(path string) (os.FileInfo, bool) {
 	return info, true
 }
 
-// compareScanBatch queries the store for a batch of on-disk files and returns
-// FileEvents for files that are new or modified.
-func (w *Watcher) compareScanBatch(batch []diskFile) []FileEvent {
-	names := make([]string, len(batch))
-	for i, f := range batch {
-		names[i] = f.name
-	}
-
-	known, err := w.store.GetFilesBatch(names)
-	if err != nil {
-		w.logger.Error("periodic scan: batch query failed", "error", err)
-		return nil
-	}
-
-	var events []FileEvent
-	for _, f := range batch {
-		existing := known[f.name]
-
-		// Quick check: if mod_time and size match, skip expensive hash.
-		if existing != nil && !existing.Deleted &&
-			existing.ModTime == f.modTime &&
-			existing.Size == f.size {
-			continue
-		}
-
-		hash, hashErr := hashFile(f.path)
-		if hashErr != nil {
-			w.logger.Error("periodic scan: hash failed", "name", f.name, "error", hashErr)
-			continue
-		}
-
-		// If hash matches, no real change.
-		if existing != nil && !existing.Deleted && existing.Hash == hash {
-			continue
-		}
-
-		// Check synced (fast-path).
-		if w.isSynced(f.name, hash) {
-			continue
-		}
-
-		w.logger.Info("periodic scan: change detected", "name", f.name, "size", f.size)
-		events = append(events, FileEvent{
-			Name:    f.name,
-			ModTime: f.modTime,
-			Size:    f.size,
-			Hash:    hash,
-		})
-	}
-
-	return events
-}
-
-// hashFile computes the SHA256 hex digest of a file.
 func hashFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	_, hash, err := fileops.Snapshot(path)
+	return hash, err
 }
 
 // CleanEmptyParents removes parent directories up to (but not including) rootDir,
@@ -838,6 +759,13 @@ func hashFile(path string) (string, error) {
 // before attempting to remove the directory. This is used both by the watcher
 // (source node) and the syncer (remote nodes) after file deletions.
 func CleanEmptyParents(filePath, rootDir string, ignorePatterns []string, logger *slog.Logger) {
+	unlock := fileops.Lock(rootDir)
+	defer unlock()
+	CleanEmptyParentsLocked(filePath, rootDir, ignorePatterns, logger)
+}
+
+// CleanEmptyParentsLocked requires the shared namespace lock.
+func CleanEmptyParentsLocked(filePath, rootDir string, ignorePatterns []string, logger *slog.Logger) {
 	absRoot, _ := filepath.Abs(rootDir)
 	dir := filepath.Dir(filePath)
 	for {
@@ -845,10 +773,17 @@ func CleanEmptyParents(filePath, rootDir string, ignorePatterns []string, logger
 		if absDir == absRoot || !strings.HasPrefix(absDir, absRoot+string(filepath.Separator)) {
 			break
 		}
+		if fileops.BusyTreeLocked(rootDir, dir) {
+			break
+		}
 		if !removeIfOnlyIgnored(dir, ignorePatterns, logger) {
 			break
 		}
 		logger.Debug("removed empty directory", "path", dir)
+		if err := fileops.SyncDir(filepath.Dir(dir)); err != nil {
+			logger.Error("persist directory cleanup failed", "error", err)
+			break
+		}
 		dir = filepath.Dir(dir)
 	}
 }
@@ -863,6 +798,11 @@ func removeIfOnlyIgnored(dir string, ignorePatterns []string, logger *slog.Logge
 
 	// Check if all remaining entries are ignored files (not directories).
 	for _, entry := range entries {
+		// Scratch files may belong to an active upload. Only the age-based
+		// janitor may reclaim them, never unrelated directory cleanup.
+		if strings.HasPrefix(entry.Name(), ".birak-tmp-") || strings.HasPrefix(entry.Name(), ".birak-bak-") {
+			return false
+		}
 		if entry.IsDir() {
 			return false // subdirectory present — don't remove
 		}

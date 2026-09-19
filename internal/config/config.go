@@ -103,9 +103,11 @@ type SyncConfig struct {
 	PollInterval           time.Duration `yaml:"poll_interval"`
 	BatchLimit             int           `yaml:"batch_limit"`
 	MaxConcurrentDownloads int           `yaml:"max_concurrent_downloads"`
-	TombstoneTTL           time.Duration `yaml:"tombstone_ttl"`
-	ScanInterval           time.Duration `yaml:"scan_interval"`
-	DebounceWindow         time.Duration `yaml:"debounce_window"`
+	// TombstoneTTL is retained for config compatibility. Automatic tombstone
+	// GC is disabled until a membership/application-acknowledgement protocol exists.
+	TombstoneTTL   time.Duration `yaml:"tombstone_ttl"`
+	ScanInterval   time.Duration `yaml:"scan_interval"`
+	DebounceWindow time.Duration `yaml:"debounce_window"`
 	// RepairInterval is how often queued failed changes are retried.
 	RepairInterval time.Duration `yaml:"repair_interval"`
 	// ReconcileInterval is how often a full manifest comparison runs against
@@ -365,6 +367,16 @@ func parseBool(s string) bool {
 }
 
 func (c *Config) validate() error {
+	seen := make(map[string]bool)
+	for i, peer := range c.Peers {
+		key := strings.TrimRight(strings.TrimSpace(peer), "/")
+		if seen[key] {
+			return fmt.Errorf("duplicate peer %q", peer)
+		}
+		seen[key] = true
+		c.Peers[i] = key
+	}
+
 	if c.NodeID == "" {
 		return fmt.Errorf("node_id is required")
 	}

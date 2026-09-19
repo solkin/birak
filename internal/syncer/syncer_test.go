@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/birak/birak/internal/server"
 	"github.com/birak/birak/internal/store"
 )
 
@@ -61,9 +62,8 @@ func TestSafeLocalPathRejectsPeerTraversalAndProtectedTargets(t *testing.T) {
 }
 
 func TestDownloadAndApplyRejectsMalformedMetadataAndSizeMismatch(t *testing.T) {
-	root := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &Syncer{syncDir: root, logger: logger, downloadClient: http.DefaultClient}
+	s, _ := auditSyncer(t)
+	root := s.syncDir
 
 	if err := s.downloadAndApply(context.Background(), "http://unused.invalid", store.FileMeta{
 		Name: "object.txt", Size: 1, Hash: "short",
@@ -74,6 +74,7 @@ func TestDownloadAndApplyRejectsMalformedMetadataAndSizeMismatch(t *testing.T) {
 	body := []byte("payload")
 	sum := sha256.Sum256(body)
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(server.HeaderProtocol, server.ProtocolVersion)
 		w.Write(body)
 	}))
 	defer peer.Close()

@@ -11,19 +11,23 @@ import (
 
 	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/store"
+	"github.com/birak/birak/internal/watcher"
 )
 
 // Cluster protocol headers. Peers exchange them on every metadata request so a
 // stale cursor or a rebuilt database is detected on the very next poll instead
 // of silently hiding changes forever.
 const (
-	// HeaderEpoch carries the responding node's database incarnation.
+	HeaderProtocol  = "X-Birak-Protocol"
+	ProtocolVersion = "2"
+	// HeaderEpoch carries the responding node's process incarnation.
 	HeaderEpoch = "X-Birak-Epoch"
 	// HeaderMaxVersion carries the responding node's highest assigned version.
 	HeaderMaxVersion = "X-Birak-Max-Version"
 	// HeaderNodeID identifies the caller so the callee can track how far that
 	// peer has consumed its change stream.
-	HeaderNodeID = "X-Birak-Node-Id"
+	HeaderNodeID    = "X-Birak-Node-Id"
+	HeaderNodeEpoch = "X-Birak-Node-Epoch"
 	// HeaderSecret carries the optional cluster shared secret.
 	HeaderSecret = "X-Birak-Secret"
 	// HeaderMode carries the source file's permission bits on /files responses,
@@ -35,6 +39,11 @@ const (
 // implements it; a node with no peers may pass nil.
 type StatsProvider interface {
 	PeerStats() []PeerStatus
+}
+
+type localStatsProvider interface {
+	ScanStatus() watcher.ScanStatus
+	CheckStorage() error
 }
 
 // PeerStatus is the per-peer replication state reported by /status. It is what
@@ -94,6 +103,7 @@ func New(s *store.Store, syncDir, nodeID string, ignorePatterns []string, cfg Co
 	srv.mux.HandleFunc("GET /status", srv.guard(srv.handleStatus))
 	// Liveness stays unauthenticated so a Kubernetes probe needs no secret.
 	srv.mux.HandleFunc("GET /healthz", srv.handleHealthz)
+	srv.mux.HandleFunc("GET /readyz", srv.handleReadyz)
 	return srv
 }
 
@@ -112,6 +122,7 @@ func (s *Server) Handler() http.Handler {
 // node's epoch and max version.
 func (s *Server) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(HeaderProtocol, ProtocolVersion)
 		if s.secret != "" {
 			got := r.Header.Get(HeaderSecret)
 			if subtle.ConstantTimeCompare([]byte(got), []byte(s.secret)) != 1 {
@@ -119,12 +130,28 @@ func (s *Server) guard(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		}
-		w.Header().Set(HeaderEpoch, s.store.Epoch())
+		if r.Header.Get(HeaderNodeID) != "" && r.Header.Get(HeaderProtocol) != ProtocolVersion {
+			http.Error(w, "incompatible replication protocol; upgrade every node", http.StatusUpgradeRequired)
+			return
+		}
+		w.Header().Set(HeaderEpoch, s.store.Incarnation())
+		w.Header().Set(HeaderNodeID, s.nodeID)
 		if maxVer, err := s.store.MaxVersion(); err == nil {
 			w.Header().Set(HeaderMaxVersion, strconv.FormatInt(maxVer, 10))
 		}
 		next(w, r)
 	}
+}
+
+// Readiness depends on local storage and a complete successful checksum scan;
+// peer outages affect replication health, not process liveness.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	local, ok := s.stats.(localStatsProvider)
+	if !ok || local.CheckStorage() != nil || !local.ScanStatus().Ready {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+	fmt.Fprintln(w, "ok")
 }
 
 // handleHealthz reports process liveness. It deliberately does not touch the
@@ -144,7 +171,7 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	since, err := strconv.ParseInt(sinceStr, 10, 64)
-	if err != nil {
+	if err != nil || since < 0 {
 		http.Error(w, fmt.Sprintf("invalid since value: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -154,13 +181,15 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The caller asking for "everything after N" is proof it will never ask for
-	// anything at or below N again. That is the acknowledgement tombstone
-	// retention needs, and it costs no extra round trip.
-	// Recorded even at since=0: a peer that has consumed nothing must pin every
-	// tombstone, not be invisible to the retention gate.
+	// Record receipt for diagnostics, including a consumer rewind. This is not
+	// proof of application and never authorizes tombstone GC. A cursor for an
+	// older source incarnation acknowledges nothing in this incarnation.
 	if peer := r.Header.Get(HeaderNodeID); peer != "" {
-		if err := s.store.RecordAck(peer, since); err != nil {
+		ack := since
+		if epoch := r.URL.Query().Get("epoch"); epoch != "" && epoch != s.store.Incarnation() {
+			ack = 0
+		}
+		if err := s.store.RecordAckEpoch(peer, r.Header.Get(HeaderNodeEpoch), ack); err != nil {
 			s.logger.Warn("record peer ack failed", "peer", peer, "error", err)
 		}
 	}
@@ -283,8 +312,9 @@ type StatusResponse struct {
 
 	// Repairs and Peers make replication health observable. A peer whose
 	// stream has stalled shows up here rather than only as a file-count drift.
-	Repairs store.RepairStats `json:"repairs"`
-	Peers   []PeerStatus      `json:"peers"`
+	Repairs store.RepairStats   `json:"repairs"`
+	Peers   []PeerStatus        `json:"peers"`
+	Local   *watcher.ScanStatus `json:"local,omitempty"`
 }
 
 // handleStatus returns daemon health and current state.
@@ -312,11 +342,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := StatusResponse{
 		NodeID:     s.nodeID,
-		Epoch:      s.store.Epoch(),
+		Epoch:      s.store.Incarnation(),
 		MaxVersion: maxVer,
 		FileCount:  count,
 		Repairs:    repairs,
 		Peers:      []PeerStatus{},
+	}
+	if local, ok := s.stats.(localStatsProvider); ok {
+		status := local.ScanStatus()
+		if err := local.CheckStorage(); err != nil {
+			status.Ready = false
+			status.LastError = err.Error()
+		}
+		resp.Local = &status
 	}
 	if s.stats != nil {
 		if peers := s.stats.PeerStats(); peers != nil {
