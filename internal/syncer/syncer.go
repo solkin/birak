@@ -400,6 +400,16 @@ func (s *Syncer) syncBatch(ctx context.Context, peerURL string) (int, bool, erro
 	if err := json.NewDecoder(resp.Body).Decode(&changes); err != nil {
 		return 0, false, fmt.Errorf("decode changes from %s: %w", peerURL, err)
 	}
+	// Validate the entire page before applying any of it. Repeated or reordered
+	// pages must enter poll backoff, not advance over unseen work or spin forever
+	// on a nonempty response that never moves the cursor. Version gaps are valid.
+	previousVersion := state.Version
+	for _, change := range changes {
+		if change.Version <= previousVersion {
+			return 0, false, fmt.Errorf("invalid changes page from %s: version %d does not follow %d", peerURL, change.Version, previousVersion)
+		}
+		previousVersion = change.Version
+	}
 	if len(changes) == 0 {
 		return 0, false, nil
 	}
@@ -771,6 +781,16 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
 		if len(page) == 0 {
 			break
 		}
+		// The manifest contract is strict name order beyond `after`. Checking
+		// before enqueue also avoids invalidating active repair revisions with
+		// the same cached page on every trip around an endless loop.
+		previousName := after
+		for _, entry := range page {
+			if entry.Name <= previousName {
+				return fmt.Errorf("invalid manifest page from %s: name %q does not follow %q", peerURL, entry.Name, previousName)
+			}
+			previousName = entry.Name
+		}
 
 		n, err := s.reconcilePage(peerURL, page)
 		if err != nil {
@@ -888,6 +908,9 @@ func (s *Syncer) checkPeerIdentity(resp *http.Response) error {
 }
 
 func (s *Syncer) setClusterHeaders(req *http.Request) {
+	// Metadata and file URLs name mutable state. Revalidate even entries an
+	// intermediary cached before peers began returning no-store responses.
+	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set(server.HeaderProtocol, server.ProtocolVersion)
 	req.Header.Set(server.HeaderNodeID, s.nodeID)
 	req.Header.Set(server.HeaderNodeEpoch, s.store.Incarnation())

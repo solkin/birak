@@ -393,6 +393,8 @@ Connect and TLS establishment are limited to 10 seconds each, response headers t
 
 The peer file endpoint serves regular files only. Pipes and other special files are rejected without waiting for a writer.
 
+Replication requests require cache revalidation, and cluster responses use `Cache-Control: no-store`. Each change page must advance strictly by version, and each manifest page must advance strictly by name. A repeated or reordered page is rejected before applying or queueing any part of that page; polling reports an error and uses its normal backoff.
+
 ### Conflict Resolution
 
 The greater `clock` wins. A local mutation advances beyond the observed state at that name and its ancestors/descendants, including overwrite, deletion, recreation, or a timestamp rollback. This lets an explicit file/directory replacement supersede its old contents even when the client preserves an older mtime. Incoming replication preserves that clock. Initial local indexing starts from `max(1, mtime)`; legacy database rows fall back to mtime. Equal clocks are resolved by mtime, then live-over-deleted state, SHA256, and finally the path name. The same ordering is used by polling, repairs, and reconciliation. Identical bytes can update their clock and timestamp without another download.
@@ -441,7 +443,7 @@ The internal API used by nodes to synchronize. Can also be used for monitoring o
 
 ### GET /changes?since=N&limit=1000
 
-Returns files changed since version N.
+Returns files with versions strictly greater than N, in increasing version order. Version gaps are normal: the stream contains each name's current state.
 
 ```bash
 curl 'http://localhost:9100/changes?since=0&limit=100'
@@ -471,7 +473,7 @@ curl -O 'http://localhost:9100/files/docs/drafts/spec.pdf'
 
 ### GET /manifest?after=&limit=1000
 
-Returns entries in name order, tombstones included, for full reconciliation. Page through it by passing the last name returned as `after`.
+Returns entries in strictly increasing name order, tombstones included, for full reconciliation. Every name is greater than `after`. Page through it by passing the last name returned as `after`.
 
 ```bash
 curl 'http://localhost:9100/manifest?limit=100'
@@ -569,6 +571,10 @@ See the [protocol parity contract](docs/protocol-parity.md) for shared behavior,
 intentional differences, and the rules for porting protocol fixes.
 
 ### Running Tests
+
+The [pagination and HTTP cache review](docs/audits/replication-pagination-and-cache.md)
+covers repeated/reordered pages, polling backoff, an intermediary serving stale
+bytes, and traversal of a real manifest spanning multiple pages.
 
 The [repair validation and disk-full review](docs/audits/replication-repair-validation.md)
 covers blocked local paths, malformed metadata replies, special-file requests,

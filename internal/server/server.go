@@ -123,6 +123,9 @@ func (s *Server) Handler() http.Handler {
 // node's epoch and max version.
 func (s *Server) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Cluster URLs expose current mutable state, including file bytes and
+		// absence/authentication errors; caching any of these can pin repairs.
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set(HeaderProtocol, ProtocolVersion)
 		if s.secret != "" {
 			got := r.Header.Get(HeaderSecret)
