@@ -430,7 +430,7 @@ func (g *Gateway) handleMove(w http.ResponseWriter, r *http.Request) {
 		if fileops.BusyTreeLocked(g.syncDir, srcFull) || fileops.BusyTreeLocked(g.syncDir, dstFull) {
 			return fileops.ErrBusy
 		}
-		if err := fileops.ReplaceLocked(g.syncDir, srcFull, dstFull, func() error { return os.Rename(srcFull, dstFull) }); err != nil {
+		if err := fileops.ReplaceLocked(g.syncDir, srcFull, dstFull); err != nil {
 			return err
 		}
 		return errors.Join(fileops.SyncParents(filepath.Dir(srcFull), g.syncDir), fileops.SyncParents(filepath.Dir(dstFull), g.syncDir))
@@ -522,11 +522,11 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 		if fileops.BusyTreeLocked(g.syncDir, dstFull) || fileops.BusyTreeLocked(g.syncDir, srcFull) {
 			return fileops.ErrBusy
 		}
-		if err := fileops.ReplaceLocked(g.syncDir, "", dstFull, func() error {
+		if err := fileops.CopyReplaceLocked(g.syncDir, dstFull, func(stage string) error {
 			if srcInfo.IsDir() {
-				return cp.copyDir(srcFull, dstFull)
+				return cp.copyDir(srcFull, stage)
 			}
-			return cp.copyFile(srcFull, dstFull)
+			return cp.copyFile(srcFull, stage)
 		}); err != nil {
 			return err
 		}
@@ -839,6 +839,6 @@ func (c *copier) copyDir(src, dst string) error {
 }
 
 // stageReplace is also used by the replacement fault-injection tests.
-func stageReplace(dst string, op func() error) error {
-	return fileops.ReplaceLocked(filepath.Dir(dst), "", dst, op)
+func stageReplace(dst string, op func(string) error) error {
+	return fileops.CopyReplaceLocked(filepath.Dir(dst), dst, op)
 }

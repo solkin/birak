@@ -772,9 +772,8 @@ func hashFile(path string) (string, error) {
 }
 
 // CleanEmptyParents removes parent directories up to (but not including) rootDir,
-// if they are empty or contain only ignored files. Ignored files are removed
-// before attempting to remove the directory. This is used both by the watcher
-// (source node) and the syncer (remote nodes) after file deletions.
+// only when they are actually empty. Ignore patterns exclude files from
+// replication; they never grant permission to delete local-only contents.
 func CleanEmptyParents(filePath, rootDir string, ignorePatterns []string, logger *slog.Logger) {
 	unlock := fileops.Lock(rootDir)
 	defer unlock()
@@ -783,7 +782,15 @@ func CleanEmptyParents(filePath, rootDir string, ignorePatterns []string, logger
 
 // CleanEmptyParentsLocked requires the shared namespace lock.
 func CleanEmptyParentsLocked(filePath, rootDir string, ignorePatterns []string, logger *slog.Logger) {
-	absRoot, _ := filepath.Abs(rootDir)
+	absRoot, err := filepath.Abs(rootDir)
+	if err != nil {
+		return
+	}
+	r, err := os.OpenRoot(absRoot)
+	if err != nil {
+		return
+	}
+	defer r.Close()
 	dir := filepath.Dir(filePath)
 	for {
 		absDir, _ := filepath.Abs(dir)
@@ -793,7 +800,8 @@ func CleanEmptyParentsLocked(filePath, rootDir string, ignorePatterns []string, 
 		if fileops.BusyTreeLocked(rootDir, dir) {
 			break
 		}
-		if !removeIfOnlyIgnored(dir, ignorePatterns, logger) {
+		rel, err := filepath.Rel(absRoot, absDir)
+		if err != nil || !removeEmptyDirectory(r, rel) {
 			break
 		}
 		logger.Debug("removed empty directory", "path", dir)
@@ -805,59 +813,11 @@ func CleanEmptyParentsLocked(filePath, rootDir string, ignorePatterns []string, 
 	}
 }
 
-// removeIfOnlyIgnored removes a directory if it is empty or contains only ignored files.
-// Returns true if the directory was successfully removed.
-func removeIfOnlyIgnored(dir string, ignorePatterns []string, logger *slog.Logger) bool {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-
-	// Check if all remaining entries are ignored files (not directories).
-	for _, entry := range entries {
-		// Scratch files may belong to an active upload. Only the age-based
-		// janitor may reclaim them, never unrelated directory cleanup.
-		if strings.HasPrefix(entry.Name(), ".birak-tmp-") || strings.HasPrefix(entry.Name(), ".birak-bak-") {
-			return false
-		}
-		if entry.IsDir() {
-			return false // subdirectory present — don't remove
-		}
-		if !shouldIgnoreCleanupFile(entry.Name(), ignorePatterns) {
-			return false // non-ignored file present — don't remove
-		}
-	}
-
-	// Remove ignored files first, then the directory.
-	for _, entry := range entries {
-		fp := filepath.Join(dir, entry.Name())
-		if err := os.Remove(fp); err != nil {
-			logger.Warn("failed to remove ignored file during cleanup", "path", fp, "error", err)
-			return false
-		}
-		logger.Debug("removed ignored file during cleanup", "path", fp)
-	}
-
-	return os.Remove(dir) == nil
-}
-
-// shouldIgnoreCleanupFile applies basename and scratch-file rules without the
-// top-level .birak rule. removeIfOnlyIgnored receives only an entry name, so
-// treating a nested user file named ".birak" as the root state directory would
-// delete data that the watcher otherwise considers visible.
-func shouldIgnoreCleanupFile(name string, patterns []string) bool {
-	if matched, _ := filepath.Match(".birak-tmp-*", name); matched {
-		return true
-	}
-	if matched, _ := filepath.Match(".birak-bak-*", name); matched {
-		return true
-	}
-	for _, pattern := range patterns {
-		if matched, _ := filepath.Match(pattern, name); matched {
-			return true
-		}
-	}
-	return false
+// removeEmptyDirectory never unlinks files or symlinks. The final Remove is an
+// atomic emptiness check by the OS, including files created after Lstat.
+func removeEmptyDirectory(root *os.Root, dir string) bool {
+	info, err := root.Lstat(dir)
+	return err == nil && info.IsDir() && root.Remove(dir) == nil
 }
 
 // isOutsideSyncDir returns true if a relative path escapes the sync directory

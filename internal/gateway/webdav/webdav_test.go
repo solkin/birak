@@ -893,8 +893,8 @@ func TestStageReplace_RestoresOriginalOnFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := stageReplace(dst, func() error {
-		if err := os.WriteFile(dst, []byte("partial"), 0o644); err != nil {
+	err := stageReplace(dst, func(stage string) error {
+		if err := os.WriteFile(stage, []byte("partial"), 0o644); err != nil {
 			return err
 		}
 		return fmt.Errorf("boom")

@@ -399,3 +399,35 @@ func TestSweepPreservesActiveWriterWithOldTimestamp(t *testing.T) {
 		t.Fatalf("publication: %q %v", body, err)
 	}
 }
+
+func TestSweepPreservesJournalOwnedCopyStage(t *testing.T) {
+	root := t.TempDir()
+	stage := filepath.Join(root, ".birak-tmp-replace-test")
+	if err := os.MkdirAll(stage, 0700); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(stage, "payload")
+	if err := os.WriteFile(payload, []byte("pending recovery"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, ".birak", "transactions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(dir, "replace-test.json")
+	// Even a malformed/blocked journal must fence the janitor.
+	if err := os.WriteFile(journal, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	SweepTempFiles(root, 0, slog.Default())
+	if b, err := os.ReadFile(payload); err != nil || string(b) != "pending recovery" {
+		t.Fatalf("deleted journal-owned stage: %q %v", b, err)
+	}
+	if err := os.Remove(journal); err != nil {
+		t.Fatal(err)
+	}
+	SweepTempFiles(root, 0, slog.Default())
+	if _, err := os.Stat(stage); !os.IsNotExist(err) {
+		t.Fatalf("orphan COPY stage remains: %v", err)
+	}
+}

@@ -7,15 +7,17 @@ import (
 	"testing"
 )
 
-func TestRemoveIfOnlyIgnored_EmptyDir(t *testing.T) {
+func TestRemoveEmptyDirectory_EmptyDir(t *testing.T) {
 	dir := t.TempDir()
+	r, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
 	sub := filepath.Join(dir, "empty")
 	os.MkdirAll(sub, 0o755)
 
-	logger := slog.Default()
-	patterns := []string{".DS_Store", "Thumbs.db"}
-
-	if !removeIfOnlyIgnored(sub, patterns, logger) {
+	if !removeEmptyDirectory(r, filepath.Base(sub)) {
 		t.Fatal("expected empty dir to be removed")
 	}
 	if _, err := os.Stat(sub); !os.IsNotExist(err) {
@@ -23,35 +25,42 @@ func TestRemoveIfOnlyIgnored_EmptyDir(t *testing.T) {
 	}
 }
 
-func TestRemoveIfOnlyIgnored_OnlyIgnoredFiles(t *testing.T) {
+func TestRemoveEmptyDirectory_OnlyIgnoredFiles(t *testing.T) {
 	dir := t.TempDir()
+	r, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
 	sub := filepath.Join(dir, "only-ignored")
 	os.MkdirAll(sub, 0o755)
 	os.WriteFile(filepath.Join(sub, ".DS_Store"), []byte("apple"), 0o644)
 	os.WriteFile(filepath.Join(sub, "Thumbs.db"), []byte("windows"), 0o644)
 
-	logger := slog.Default()
-	patterns := []string{".DS_Store", "Thumbs.db"}
-
-	if !removeIfOnlyIgnored(sub, patterns, logger) {
-		t.Fatal("expected dir with only ignored files to be removed")
+	if removeEmptyDirectory(r, filepath.Base(sub)) {
+		t.Fatal("ignored contents must prevent directory removal")
 	}
-	if _, err := os.Stat(sub); !os.IsNotExist(err) {
-		t.Fatal("expected dir to be gone")
+	for name, want := range map[string]string{".DS_Store": "apple", "Thumbs.db": "windows"} {
+		got, err := os.ReadFile(filepath.Join(sub, name))
+		if err != nil || string(got) != want {
+			t.Fatalf("ignored file changed: %s %q %v", name, got, err)
+		}
 	}
 }
 
-func TestRemoveIfOnlyIgnored_HasRealFile(t *testing.T) {
+func TestRemoveEmptyDirectory_HasRealFile(t *testing.T) {
 	dir := t.TempDir()
+	r, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
 	sub := filepath.Join(dir, "has-real")
 	os.MkdirAll(sub, 0o755)
 	os.WriteFile(filepath.Join(sub, ".DS_Store"), []byte("apple"), 0o644)
 	os.WriteFile(filepath.Join(sub, "important.txt"), []byte("keep me"), 0o644)
 
-	logger := slog.Default()
-	patterns := []string{".DS_Store", "Thumbs.db"}
-
-	if removeIfOnlyIgnored(sub, patterns, logger) {
+	if removeEmptyDirectory(r, filepath.Base(sub)) {
 		t.Fatal("expected dir with real files NOT to be removed")
 	}
 	// Both files should still be there.
@@ -63,15 +72,17 @@ func TestRemoveIfOnlyIgnored_HasRealFile(t *testing.T) {
 	}
 }
 
-func TestRemoveIfOnlyIgnored_HasSubdirectory(t *testing.T) {
+func TestRemoveEmptyDirectory_HasSubdirectory(t *testing.T) {
 	dir := t.TempDir()
+	r, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
 	sub := filepath.Join(dir, "has-subdir")
 	os.MkdirAll(filepath.Join(sub, "child"), 0o755)
 
-	logger := slog.Default()
-	patterns := []string{".DS_Store"}
-
-	if removeIfOnlyIgnored(sub, patterns, logger) {
+	if removeEmptyDirectory(r, filepath.Base(sub)) {
 		t.Fatal("expected dir with subdirectory NOT to be removed")
 	}
 }
@@ -81,10 +92,6 @@ func TestCleanEmptyParents_RecursiveCleanup(t *testing.T) {
 	// Create a/b/c structure.
 	deepDir := filepath.Join(root, "a", "b", "c")
 	os.MkdirAll(deepDir, 0o755)
-	// Place .DS_Store at each level.
-	os.WriteFile(filepath.Join(root, "a", ".DS_Store"), []byte("idx"), 0o644)
-	os.WriteFile(filepath.Join(root, "a", "b", ".DS_Store"), []byte("idx"), 0o644)
-	os.WriteFile(filepath.Join(root, "a", "b", "c", ".DS_Store"), []byte("idx"), 0o644)
 
 	logger := slog.Default()
 	patterns := []string{".DS_Store"}
@@ -93,7 +100,7 @@ func TestCleanEmptyParents_RecursiveCleanup(t *testing.T) {
 	filePath := filepath.Join(deepDir, "gone.txt")
 	CleanEmptyParents(filePath, root, patterns, logger)
 
-	// All dirs should be cleaned up since each only has .DS_Store.
+	// All empty parents should be removed.
 	if _, err := os.Stat(filepath.Join(root, "a")); !os.IsNotExist(err) {
 		t.Fatal("a/ should have been removed")
 	}
@@ -104,7 +111,6 @@ func TestCleanEmptyParents_StopsAtNonEmpty(t *testing.T) {
 	// Create parent/sub structure.
 	os.MkdirAll(filepath.Join(root, "parent", "sub"), 0o755)
 	os.WriteFile(filepath.Join(root, "parent", "keep.txt"), []byte("keep"), 0o644)
-	os.WriteFile(filepath.Join(root, "parent", "sub", ".DS_Store"), []byte("idx"), 0o644)
 
 	logger := slog.Default()
 	patterns := []string{".DS_Store"}
@@ -173,9 +179,11 @@ func TestCleanEmptyParents_GlobPattern(t *testing.T) {
 	filePath := filepath.Join(sub, "deleted.txt")
 	CleanEmptyParents(filePath, root, patterns, logger)
 
-	// logs/ should be removed since *.log matches all remaining files.
-	if _, err := os.Stat(sub); !os.IsNotExist(err) {
-		t.Fatal("logs/ should have been removed (only *.log files)")
+	for name, want := range map[string]string{"app.log": "log data", "error.log": "error data"} {
+		got, err := os.ReadFile(filepath.Join(sub, name))
+		if err != nil || string(got) != want {
+			t.Fatalf("ignored file changed: %s %q %v", name, got, err)
+		}
 	}
 }
 
@@ -243,5 +251,20 @@ func TestWatcherShouldIgnore_UsesReservedAndConfiguredRules(t *testing.T) {
 
 	if w.shouldIgnore("bucket/photo.jpg") {
 		t.Fatal("watcher ignored a normal user file")
+	}
+}
+
+func TestCleanEmptyParentsDoesNotFollowOutsideSymlink(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	empty := filepath.Join(outside, "empty")
+	if err := os.Mkdir(empty, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	CleanEmptyParents(filepath.Join(root, "alias", "empty", "deleted"), root, nil, slog.Default())
+	if _, err := os.Stat(empty); err != nil {
+		t.Fatalf("cleanup touched outside directory: %v", err)
 	}
 }

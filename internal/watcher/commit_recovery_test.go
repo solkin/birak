@@ -246,3 +246,53 @@ func TestRecoveryDoesNotTraverseIgnoredDirectory(t *testing.T) {
 		t.Fatalf("ignored directory blocks recovery: %v", err)
 	}
 }
+
+func TestAmbiguousReplacementFencesIndexAndGateway(t *testing.T) {
+	w := auditWatcher(t)
+	path := filepath.Join(w.dir, "file")
+	if err := os.WriteFile(path, []byte("acknowledged"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Refresh("file"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := w.store.GetFile("file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(w.dir, ".birak-bak-legacy")
+	if err := os.Rename(path, backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("offline generation"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(w.dir, ".birak", "transactions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Old journals cannot identify which generation now occupies these paths.
+	journal := fmt.Sprintf(`{"destination":%q,"source":"","backup":%q,"had_destination":true,"committed":false}`, path, backup)
+	if err := os.WriteFile(filepath.Join(dir, "replace-legacy.json"), []byte(journal), 0600); err != nil {
+		t.Fatal(err)
+	}
+	restarted := New(w.dir, w.store, w.logger, time.Millisecond, time.Hour, nil)
+	if err := restarted.CheckStorage(); err == nil {
+		t.Fatal("accepted ambiguous recovery")
+	}
+	if err := restarted.Refresh("file"); err == nil {
+		t.Fatal("indexed before successful recovery")
+	}
+	if err := fileops.Remove(w.dir, path, false); err == nil {
+		t.Fatal("gateway mutated during blocked recovery")
+	}
+	after, err := w.store.GetFile("file")
+	if err != nil || after == nil || after.Version != before.Version || store.CompareState(after, before) != 0 {
+		t.Fatalf("advertised ambiguous data: %+v %v", after, err)
+	}
+	for p, want := range map[string]string{path: "offline generation", backup: "acknowledged"} {
+		if got, err := os.ReadFile(p); err != nil || string(got) != want {
+			t.Fatalf("lost %s: %q %v", p, got, err)
+		}
+	}
+}

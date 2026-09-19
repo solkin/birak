@@ -122,9 +122,9 @@ func TestReviewSuccessfulOverwriteMustSurviveReplication(t *testing.T) {
 
 func TestReviewReplacementCrashMustPreserveOldFile(t *testing.T) {
 	if root := os.Getenv("BIRAK_REVIEW_REPLACE_CHILD"); root != "" {
-		_ = stageReplace(filepath.Join(root, "valuable"), func() error {
-			// Kill at the real cut between moving the original and publishing
-			// the replacement. No defers or rollback execute in this process.
+		_ = stageReplace(filepath.Join(root, "valuable"), func(stage string) error {
+			// Kill while building the unpublished copy. The old destination now
+			// stays in place throughout this step; no defers execute.
 			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
 			os.Exit(73)
 			return nil

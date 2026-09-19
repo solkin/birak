@@ -128,12 +128,27 @@ func IsScratchFile(name string) bool {
 func SweepTempFiles(rootDir string, maxAge time.Duration, logger *slog.Logger) {
 	unlock := fileops.Lock(rootDir)
 	defer unlock()
+	if pending, err := fileops.ReplacementPendingLocked(rootDir); err != nil || pending {
+		logger.Debug("defer scratch cleanup until replacement recovery completes", "error", err)
+		return
+	}
 	cutoff := time.Now().Add(-maxAge)
 	filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
+			// COPY staging is private and only disposable without a journal.
+			// The root lock excludes an active builder for the entire sweep.
+			if strings.HasPrefix(d.Name(), ".birak-tmp-replace-") {
+				info, statErr := d.Info()
+				if statErr == nil && (maxAge <= 0 || !info.ModTime().After(cutoff)) {
+					if err := os.RemoveAll(path); err != nil {
+						logger.Warn("failed to remove orphan COPY stage", "path", path, "error", err)
+					}
+				}
+				return fs.SkipDir
+			}
 			if strings.HasPrefix(d.Name(), backupFilePrefix) {
 				return fs.SkipDir
 			}

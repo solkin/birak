@@ -148,6 +148,15 @@ func TestWriterRefusesExternalReplacement(t *testing.T) {
 // loss or fake filesystem durability model is involved.
 func TestReplacementProcessCuts(t *testing.T) {
 	if root := os.Getenv("BIRAK_REPLACE_ROOT"); root != "" {
+		checkpoint := func(step string) {
+			if step == os.Getenv("BIRAK_REPLACE_CUT") {
+				_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			}
+		}
+		if os.Getenv("BIRAK_REPLACE_RECOVER") == "true" {
+			err := recoverLocked(root, checkpoint)
+			t.Fatalf("recovery child missed cut: %v", err)
+		}
 		src, dst := filepath.Join(root, "src"), filepath.Join(root, "dst")
 		move := os.Getenv("BIRAK_REPLACE_MOVE") == "true"
 		directory := os.Getenv("BIRAK_REPLACE_DIRECTORY") == "true"
@@ -155,22 +164,19 @@ func TestReplacementProcessCuts(t *testing.T) {
 		if move {
 			moveSrc = src
 		}
-		err := replaceLocked(root, moveSrc, dst, func() error {
-			if move {
-				return os.Rename(src, dst)
-			}
-			if directory {
-				if err := os.Mkdir(dst, 0o700); err != nil {
-					return err
+		var build func(string) error
+		if !move {
+			build = func(stage string) error {
+				if directory {
+					if err := os.Mkdir(stage, 0700); err != nil {
+						return err
+					}
+					return os.WriteFile(filepath.Join(stage, "file"), []byte("new"), 0600)
 				}
-				return os.WriteFile(filepath.Join(dst, "file"), []byte("new"), 0o600)
+				return os.WriteFile(stage, []byte("new"), 0600)
 			}
-			return os.WriteFile(dst, []byte("new"), 0o600)
-		}, func(step string) {
-			if step == os.Getenv("BIRAK_REPLACE_CUT") {
-				_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
-			}
-		})
+		}
+		err := replaceLocked(root, moveSrc, dst, build, checkpoint)
 		t.Fatalf("child missed cut: %v", err)
 	}
 	binary, err := os.Executable()

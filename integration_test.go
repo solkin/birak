@@ -802,8 +802,7 @@ func TestIntegration_DeepNestedSubdirs(t *testing.T) {
 }
 
 func TestIntegration_DirWithOnlyIgnoredFile(t *testing.T) {
-	// After deleting the last real file in a subdir that also contains .DS_Store,
-	// the directory (and .DS_Store inside it) should be cleaned up on the peer.
+	// Deleting a replicated sibling must preserve ignored local contents on the peer.
 	ln1, _ := net.Listen("tcp", "127.0.0.1:0")
 	ln2, _ := net.Listen("tcp", "127.0.0.1:0")
 	addr1 := ln1.Addr().String()
@@ -836,19 +835,11 @@ func TestIntegration_DirWithOnlyIgnoredFile(t *testing.T) {
 		return !fileExists(filepath.Join(node2.syncDir, "photos"), "pic.jpg")
 	})
 
-	// The photos/ directory should be cleaned up, including the .DS_Store.
-	time.Sleep(1 * time.Second)
-	if fileExists(node2.syncDir, "photos") {
-		// Check what's left.
-		entries, _ := os.ReadDir(filepath.Join(node2.syncDir, "photos"))
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Fatalf("photos/ directory should have been cleaned up, remaining: %v", names)
+	waitForDeletionMetadata(t, "photos/pic.jpg", node1, node2)
+	if got := readFile(t, filepath.Join(node2.syncDir, "photos"), ".DS_Store"); got != "apple index" {
+		t.Fatalf("ignored peer data changed: %q", got)
 	}
 
-	t.Log("directory with only ignored file cleaned up correctly")
 }
 
 func TestIntegration_PartialDirCleanup(t *testing.T) {
@@ -1181,9 +1172,7 @@ func TestIntegration_DeleteEntireDirectory(t *testing.T) {
 }
 
 func TestIntegration_SourceNodeDirCleanup(t *testing.T) {
-	// The key bug: on the SOURCE node, when the last non-ignored file in a directory
-	// is deleted, but an ignored file (e.g. .DS_Store) remains, the directory should
-	// still be cleaned up by the watcher.
+	// The source watcher must retain ignored data after deleting the last replicated file.
 	ln1, _ := net.Listen("tcp", "127.0.0.1:0")
 	ln2, _ := net.Listen("tcp", "127.0.0.1:0")
 	addr1 := ln1.Addr().String()
@@ -1211,22 +1200,17 @@ func TestIntegration_SourceNodeDirCleanup(t *testing.T) {
 	// Delete the real file on node1 — only .DS_Store remains.
 	os.Remove(filepath.Join(subDir, "readme.txt"))
 
-	// Wait for the source node (node1) to clean up the directory.
-	waitForSync(t, 10*time.Second, func() bool {
-		return !fileExists(node1.syncDir, "docs")
-	})
+	waitForDeletionMetadata(t, "docs/readme.txt", node1, node2)
+	// The peer has no ignored contents, so its genuinely empty directory goes.
+	waitForSync(t, 10*time.Second, func() bool { return !fileExists(node2.syncDir, "docs") })
+	if got := readFile(t, subDir, ".DS_Store"); got != "apple index" {
+		t.Fatalf("ignored source data changed: %q", got)
+	}
 
-	// Also verify the peer (node2) cleaned up.
-	waitForSync(t, 10*time.Second, func() bool {
-		return !fileExists(node2.syncDir, "docs")
-	})
-
-	t.Log("source node directory cleanup with ignored files works correctly")
 }
 
 func TestIntegration_SourceNodeDeepDirCleanup(t *testing.T) {
-	// Source node: deeply nested dirs should be cleaned up recursively
-	// when the only file is deleted and ignored files remain at various levels.
+	// Ignored contents at every depth survive source-side directory cleanup.
 	ln1, _ := net.Listen("tcp", "127.0.0.1:0")
 	ln2, _ := net.Listen("tcp", "127.0.0.1:0")
 	addr1 := ln1.Addr().String()
@@ -1256,22 +1240,18 @@ func TestIntegration_SourceNodeDeepDirCleanup(t *testing.T) {
 	// Delete the real file.
 	os.Remove(filepath.Join(deepDir, "file.txt"))
 
-	// All directories (a/b/c, a/b, a) should be cleaned up on the source node
-	// since each level only has .DS_Store after the file is deleted.
-	waitForSync(t, 10*time.Second, func() bool {
-		return !fileExists(node1.syncDir, "a")
-	})
+	waitForDeletionMetadata(t, "a/b/c/file.txt", node1, node2)
+	waitForSync(t, 10*time.Second, func() bool { return !fileExists(node2.syncDir, "a") })
+	for dir, want := range map[string]string{"a": "idx a", "a/b": "idx b", "a/b/c": "idx c"} {
+		if got := readFile(t, filepath.Join(node1.syncDir, dir), ".DS_Store"); got != want {
+			t.Fatalf("ignored data changed at %s: %q", dir, got)
+		}
+	}
 
-	// Peer should also be clean.
-	waitForSync(t, 10*time.Second, func() bool {
-		return !fileExists(node2.syncDir, "a")
-	})
-
-	t.Log("source node deep directory cleanup works correctly")
 }
 
 func TestIntegration_SourceNodePartialCleanup(t *testing.T) {
-	// Source node: cleanup should stop at a directory that still has non-ignored content.
+	// Cleanup stops at ignored contents as well as ordinary replicated files.
 	ln1, _ := net.Listen("tcp", "127.0.0.1:0")
 	ln2, _ := net.Listen("tcp", "127.0.0.1:0")
 	addr1 := ln1.Addr().String()
@@ -1300,10 +1280,10 @@ func TestIntegration_SourceNodePartialCleanup(t *testing.T) {
 	// Delete the real file in sub/.
 	os.Remove(filepath.Join(node1.syncDir, "parent", "sub", "remove.txt"))
 
-	// sub/ should be cleaned up on source, but parent/ should remain (has keep.txt).
-	waitForSync(t, 10*time.Second, func() bool {
-		return !fileExists(filepath.Join(node1.syncDir, "parent"), "sub")
-	})
+	waitForDeletionMetadata(t, "parent/sub/remove.txt", node1, node2)
+	if got := readFile(t, filepath.Join(node1.syncDir, "parent", "sub"), ".DS_Store"); got != "apple idx" {
+		t.Fatalf("ignored source data changed: %q", got)
+	}
 
 	// parent/ and keep.txt must still exist.
 	if !fileExists(filepath.Join(node1.syncDir, "parent"), "keep.txt") {
@@ -1313,7 +1293,7 @@ func TestIntegration_SourceNodePartialCleanup(t *testing.T) {
 		t.Fatal("parent/ directory should still exist on source node")
 	}
 
-	// Same on peer.
+	// The peer has no ignored contents, so its empty subdirectory is removed.
 	waitForSync(t, 10*time.Second, func() bool {
 		return !fileExists(filepath.Join(node2.syncDir, "parent"), "sub")
 	})
@@ -1424,4 +1404,19 @@ func newTestNodeWithOptions(t *testing.T, id, addr, syncDir, metaDir string, ign
 
 	waitForHTTP(t, addr)
 	return node
+}
+
+// Wait for both filesystem deletion and its durable metadata, so preservation
+// assertions cannot pass before cleanup has actually run on either node.
+func waitForDeletionMetadata(t *testing.T, name string, nodes ...*testNode) {
+	t.Helper()
+	waitForSync(t, 10*time.Second, func() bool {
+		for _, node := range nodes {
+			meta, err := node.store.GetFile(name)
+			if err != nil || meta == nil || !meta.Deleted || fileExists(node.syncDir, name) {
+				return false
+			}
+		}
+		return true
+	})
 }
