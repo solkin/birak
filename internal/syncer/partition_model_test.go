@@ -199,7 +199,7 @@ func TestPartitionedClusterMatchesAcknowledgedHistory(t *testing.T) {
 								break
 							}
 						}
-						if err := s.reconcileOnce(ctx, peer); err != nil {
+						if _, err := s.reconcileOnce(ctx, peer); err != nil {
 							t.Fatal(err)
 						}
 						items, err := s.store.DueRepairs(peer, 100)

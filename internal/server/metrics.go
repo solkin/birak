@@ -60,7 +60,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			out.gauge("birak_peer_consecutive_errors", "Consecutive failed polls of a peer.", labels, float64(peer.ConsecutiveErrs))
 			out.gauge("birak_peer_pending_repairs", "Repair entries queued for a peer.", labels, float64(peer.Pending))
 			out.gauge("birak_peer_last_success_seconds", "Time since the last successful poll of a peer.", labels, float64(peer.LastSuccessAgo)/1000)
-			out.gauge("birak_peer_last_reconcile_seconds", "Time since the last manifest comparison with a peer.", labels, float64(peer.LastReconcileMS)/1000)
+			if peer.LastReconcileMS >= 0 {
+				out.gauge("birak_peer_last_reconcile_seconds", "Time since the last completed manifest comparison with a peer.", labels, float64(peer.LastReconcileMS)/1000)
+			}
 		}
 	}
 	// Write throughput on a volume is bounded by how long its one commit lock

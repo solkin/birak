@@ -59,7 +59,7 @@ func TestBlockedLocalPathRemainsInRepair(t *testing.T) {
 					}
 					dest.repairOne(context.Background(), peer.URL, items[0])
 				case "reconcile":
-					if err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
+					if _, err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
 						t.Fatal(err)
 					}
 				}

@@ -61,7 +61,9 @@ type PeerStatus struct {
 	LastError       string `json:"last_error,omitempty"`
 	ConsecutiveErrs int64  `json:"consecutive_errors"`
 	Pending         int64  `json:"pending_repairs"`
-	LastReconcileMS int64  `json:"last_reconcile_ms_ago"`
+	// LastReconcileMS is the age of the last *completed* manifest comparison,
+	// or -1 when none has finished yet.
+	LastReconcileMS int64 `json:"last_reconcile_ms_ago"`
 }
 
 // Server provides the HTTP API for peers to pull changes and files.

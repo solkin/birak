@@ -118,7 +118,7 @@ func TestInvalidManifestPageStopsBeforeRequeue(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(page)
 			}))
 			defer peer.Close()
-			if err := s.reconcileOnce(context.Background(), peer.URL); err == nil {
+			if _, err := s.reconcileOnce(context.Background(), peer.URL); err == nil {
 				t.Fatal("invalid manifest page accepted")
 			}
 			if got := requests.Load(); got != int32(len(tc.pages)) {
@@ -128,7 +128,7 @@ func TestInvalidManifestPageStopsBeforeRequeue(t *testing.T) {
 				t.Fatalf("invalid page changed accepted work: count=%d err=%v", count, err)
 			}
 			healthy.Store(true)
-			if err := s.reconcileOnce(context.Background(), peer.URL); err != nil {
+			if _, err := s.reconcileOnce(context.Background(), peer.URL); err != nil {
 				t.Fatalf("healthy reconciliation failed: %v", err)
 			}
 			if count, err := s.store.PendingRepairCount(peer.URL); err != nil || count != 2 {
@@ -212,7 +212,7 @@ func TestReconciliationTraversesRealManifestPages(t *testing.T) {
 		handler.ServeHTTP(w, r)
 	}))
 	defer peer.Close()
-	if err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
+	if _, err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -265,7 +265,7 @@ func TestReconciliationResumesWhereItsBudgetRanOut(t *testing.T) {
 	dest.opts.ReconcilePageBudget = 1
 	var queued int64
 	for pass := 0; pass < total; pass++ {
-		if err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
+		if _, err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
 			t.Fatalf("pass %d: %v", pass, err)
 		}
 		got, err := dest.store.PendingRepairCount(peer.URL)
@@ -279,7 +279,7 @@ func TestReconciliationResumesWhereItsBudgetRanOut(t *testing.T) {
 	}
 
 	// The cycle completes and the next one starts from the beginning.
-	if err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
+	if _, err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
 		t.Fatal(err)
 	}
 	position, err := dest.store.NodeValue(reconcilePositionKey(peer.URL))
@@ -302,10 +302,49 @@ func TestReconciliationWithoutABudgetComparesEverything(t *testing.T) {
 	peer := httptest.NewServer(server.New(source.store, source.syncDir, "source", nil, server.Config{}, source.logger).Handler())
 	defer peer.Close()
 
-	if err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
+	if _, err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := dest.store.PendingRepairCount(peer.URL); err != nil || got != 5 {
 		t.Fatalf("queued %d of 5 entries in one pass (%v)", got, err)
+	}
+}
+
+// "Last reconciled" has to mean a finished comparison. While a paced pass
+// reported itself as one, an operator watching that number would believe the
+// cluster had been compared when only a slice of it had.
+func TestOnlyAFinishedCycleCountsAsReconciled(t *testing.T) {
+	dest, _ := auditSyncer(t)
+	var manifest []store.FileMeta
+	for i := range 3 {
+		manifest = append(manifest, auditMeta(fmt.Sprintf("file-%02d", i), "body", int64(100+i)))
+	}
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(server.HeaderProtocol, server.ProtocolVersion)
+		after := r.URL.Query().Get("after")
+		out := []store.FileMeta{}
+		for _, entry := range manifest {
+			if entry.Name > after {
+				out = append(out, entry)
+				break
+			}
+		}
+		json.NewEncoder(w).Encode(out)
+	}))
+	defer peer.Close()
+
+	dest.opts.ReconcilePageBudget = 1
+	for pass := range len(manifest) {
+		completed, err := dest.reconcileOnce(context.Background(), peer.URL)
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if completed {
+			t.Fatalf("pass %d reported a finished cycle after one page of %d", pass, len(manifest))
+		}
+	}
+	completed, err := dest.reconcileOnce(context.Background(), peer.URL)
+	if err != nil || !completed {
+		t.Fatalf("the pass that reached the end did not report a finished cycle: %v %v", completed, err)
 	}
 }

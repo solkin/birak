@@ -349,6 +349,9 @@ func (s *Syncer) PeerStats() []server.PeerStatus {
 		if !st.lastSuccess.IsZero() {
 			status.LastSuccessAgo = time.Since(st.lastSuccess).Milliseconds()
 		}
+		// -1, not 0, when no cycle has finished: "never compared" and "compared
+		// a moment ago" are opposite answers and must not share a value.
+		status.LastReconcileMS = -1
 		if !st.lastReconcile.IsZero() {
 			status.LastReconcileMS = time.Since(st.lastReconcile).Milliseconds()
 		}
@@ -891,12 +894,16 @@ func (s *Syncer) reconcilePeer(ctx context.Context, peerURL string) {
 		return
 	}
 	for {
-		if err := s.reconcileOnce(ctx, peerURL); err != nil {
+		completed, err := s.reconcileOnce(ctx, peerURL)
+		switch {
+		case err != nil:
 			if ctx.Err() != nil {
 				return
 			}
 			s.logger.Warn("reconcile with peer failed", "peer", peerURL, "error", err)
-		} else {
+		case completed:
+			// Only a finished cycle means "this peer has been compared". A pass
+			// that stopped on its page budget has compared a slice of it.
 			s.withStat(peerURL, func(st *peerStat) { st.lastReconcile = time.Now() })
 		}
 		if !sleepCtx(ctx, jitter(s.opts.ReconcileInterval)) {
@@ -907,7 +914,7 @@ func (s *Syncer) reconcilePeer(ctx context.Context, peerURL string) {
 
 // reconcileOnce walks the peer's manifest page by page and queues every entry
 // whose remote state should win locally.
-func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
+func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) (completed bool, err error) {
 	s.logger.Debug("reconciliation started", "peer", peerURL)
 
 	// Resume where the last pass stopped. A comparison of a large manifest is
@@ -916,19 +923,21 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
 	// finishes a full comparison at all.
 	after, err := s.store.NodeValue(reconcilePositionKey(peerURL))
 	if err != nil {
-		return err
+		return false, err
 	}
 	queued, scanned, pages := 0, 0, 0
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
 		if s.opts.ReconcilePageBudget > 0 && pages >= s.opts.ReconcilePageBudget {
 			// Budget spent. Remember the position and continue next interval.
+			// The cycle is not finished, and reporting it as finished would tell
+			// an operator the cluster had been compared when it had not.
 			s.logger.Debug("reconciliation paused on its page budget",
 				"peer", peerURL, "after", after, "scanned", scanned)
-			return s.store.SetNodeValue(reconcilePositionKey(peerURL), after)
+			return false, s.store.SetNodeValue(reconcilePositionKey(peerURL), after)
 		}
 		pages++
 
@@ -936,34 +945,35 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
 			peerURL, url.QueryEscape(after), manifestPageSize)
 		resp, err := s.doRequest(ctx, reqURL)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if resp.StatusCode == http.StatusNotFound {
 			// A peer running an older build has no /manifest. Reconciliation is
 			// simply unavailable against it; the change stream still works.
 			resp.Body.Close()
 			s.logger.Debug("peer does not support reconciliation", "peer", peerURL)
-			return s.store.SetNodeValue(reconcilePositionKey(peerURL), "")
+			return false, s.store.SetNodeValue(reconcilePositionKey(peerURL), "")
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			return fmt.Errorf("manifest from %s: status %d", peerURL, resp.StatusCode)
+			return false, fmt.Errorf("manifest from %s: status %d", peerURL, resp.StatusCode)
 		}
 
 		var page []store.FileMeta
 		decErr := decodePage(resp.Body, manifestPageSize, &page)
 		resp.Body.Close()
 		if decErr != nil {
-			return fmt.Errorf("decode manifest from %s: %w", peerURL, decErr)
+			return false, fmt.Errorf("decode manifest from %s: %w", peerURL, decErr)
 		}
 		if len(page) > manifestPageSize {
-			return fmt.Errorf("manifest from %s returned %d entries for a limit of %d", peerURL, len(page), manifestPageSize)
+			return false, fmt.Errorf("manifest from %s returned %d entries for a limit of %d", peerURL, len(page), manifestPageSize)
 		}
 		if len(page) == 0 {
 			// A full cycle is complete; the next one starts at the beginning.
 			if err := s.store.SetNodeValue(reconcilePositionKey(peerURL), ""); err != nil {
-				return err
+				return false, err
 			}
+			completed = true
 			break
 		}
 		// The manifest contract is strict name order beyond `after`. Checking
@@ -972,14 +982,14 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
 		previousName := after
 		for _, entry := range page {
 			if entry.Name <= previousName {
-				return fmt.Errorf("invalid manifest page from %s: name %q does not follow %q", peerURL, entry.Name, previousName)
+				return false, fmt.Errorf("invalid manifest page from %s: name %q does not follow %q", peerURL, entry.Name, previousName)
 			}
 			previousName = entry.Name
 		}
 
 		n, err := s.reconcilePage(peerURL, page)
 		if err != nil {
-			return err
+			return false, err
 		}
 		queued += n
 		scanned += len(page)
@@ -994,7 +1004,7 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
 		s.logger.Debug("reconciliation complete, no divergence",
 			"peer", peerURL, "scanned", scanned)
 	}
-	return nil
+	return completed, nil
 }
 
 // reconcilePage diffs one manifest page against the local store.
