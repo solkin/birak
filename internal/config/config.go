@@ -108,7 +108,8 @@ type SyncConfig struct {
 	TombstoneTTL   time.Duration `yaml:"tombstone_ttl"`
 	ScanInterval   time.Duration `yaml:"scan_interval"`
 	DebounceWindow time.Duration `yaml:"debounce_window"`
-	// RepairInterval is how often queued failed changes are retried.
+	// RepairInterval is the periodic rescan for new or due repairs. Repair
+	// workers also refill on completion while preserving per-item backoff.
 	RepairInterval time.Duration `yaml:"repair_interval"`
 	// ReconcileInterval is how often a full manifest comparison runs against
 	// every peer. This is the backstop that catches anything the version

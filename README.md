@@ -210,11 +210,11 @@ export BIRAK_HTTP_ENABLED=true
 | `multipart.temp_file_max_age` | `BIRAK_MULTIPART_TEMP_FILE_MAX_AGE` | `24h` | Age for orphaned atomic-write scratch cleanup |
 | `sync.poll_interval` | `BIRAK_SYNC_POLL_INTERVAL` | `3s` | Peer polling interval |
 | `sync.batch_limit` | `BIRAK_SYNC_BATCH_LIMIT` | `1000` | Max entries per sync request |
-| `sync.max_concurrent_downloads` | `BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS` | `5` | Concurrent downloads per peer |
+| `sync.max_concurrent_downloads` | `BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS` | `5` | Combined polling and repair downloads per peer; also bounds active repair operations |
 | `sync.tombstone_ttl` | `BIRAK_SYNC_TOMBSTONE_TTL` | `168h` | Legacy compatibility setting; tombstones are retained indefinitely |
 | `sync.scan_interval` | `BIRAK_SYNC_SCAN_INTERVAL` | `5m` | Full filesystem checksum scan interval; reads all visible file bytes |
 | `sync.debounce_window` | `BIRAK_SYNC_DEBOUNCE_WINDOW` | `300ms` | Delay before processing file events |
-| `sync.repair_interval` | `BIRAK_SYNC_REPAIR_INTERVAL` | `30s` | How often the repair queue is retried |
+| `sync.repair_interval` | `BIRAK_SYNC_REPAIR_INTERVAL` | `30s` | Rescan interval for new or due repairs; free workers also refill on completion |
 | `sync.reconcile_interval` | `BIRAK_SYNC_RECONCILE_INTERVAL` | `1h` | Full manifest comparison interval (0 disables — not recommended) |
 | `gateways.s3.enabled` | `BIRAK_S3_ENABLED` | `false` | Enable S3 Gateway |
 | `gateways.s3.listen_addr` | `BIRAK_S3_LISTEN_ADDR` | `:9200` | S3 Gateway address |
@@ -388,6 +388,8 @@ sftp> rm old-file.txt
 6. A new node starts at `since=0`, receiving both live files and deletion history.
 
 Repairs retry with exponential backoff. A queued deletion survives loss of the source's metadata and can be applied while that source is offline. A persistent permission, disk, or connectivity failure stays visible in `/status`. A valid peer name blocked by a local symlink also remains queued until the obstruction is resolved; malformed or misrouted `/meta` replies cannot erase accepted work. Explicitly ignored names are skipped. **Full reconciliation** compares peer manifests every `reconcile_interval`; `0` disables it.
+
+Repairs run concurrently up to `max_concurrent_downloads`, with at most one active repair per name and peer. A slow repair leaves other worker slots available, including for work queued while it is running. Completed workers immediately pick up due work; periodic rescans discover new arrivals and elapsed backoffs. Polling and repairs share the same per-peer file-transfer limit. Queue write failures pause new repair dispatch until the next rescan. Shutdown waits for workers; unfinished operations remain in SQLite for restart.
 
 Connect and TLS establishment are limited to 10 seconds each, response headers to 15 seconds, and inactivity during a file body to 60 seconds. Large transfers have no short overall timeout while bytes continue arriving.
 
@@ -571,6 +573,10 @@ See the [protocol parity contract](docs/protocol-parity.md) for shared behavior,
 intentional differences, and the rules for porting protocol fixes.
 
 ### Running Tests
+
+The [repair scheduling review](docs/audits/replication-repair-scheduling.md)
+covers slow transfers, new arrivals, the shared download limit, cancellation,
+queue replacement during a transfer, and SQLite bookkeeping failures.
 
 The [pagination and HTTP cache review](docs/audits/replication-pagination-and-cache.md)
 covers repeated/reordered pages, polling backoff, an intermediary serving stale

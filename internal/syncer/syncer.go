@@ -54,10 +54,13 @@ var errContentChanged = errors.New("peer content changed during download")
 
 // Options bundles the syncer's tuning knobs.
 type Options struct {
-	PollInterval           time.Duration
-	BatchLimit             int
+	PollInterval time.Duration
+	BatchLimit   int
+	// MaxConcurrentDownloads bounds polling and repair transfers together for
+	// each peer, and the number of that peer's active repair operations.
 	MaxConcurrentDownloads int
-	// RepairInterval is how often the durable repair queue is drained.
+	// RepairInterval is the rescan interval for newly queued/due work. Completing
+	// a repair immediately makes its worker slot available to the next due row.
 	RepairInterval time.Duration
 	// ReconcileInterval is how often a full manifest comparison runs against
 	// each peer. It rediscovers divergence independently of the stream cursor.
@@ -96,6 +99,9 @@ type Syncer struct {
 	// downloadClient has no overall timeout — large file transfers are
 	// bounded by context cancellation and per-read stall detection instead.
 	downloadClient *http.Client
+	// Polling and repair share the same per-peer transfer budget.
+	downloadsMu sync.Mutex
+	downloads   map[string]chan struct{}
 
 	// paths serializes work on a single file name. Several peers can announce
 	// the same path at once; without this the store could end up recording a
@@ -162,6 +168,7 @@ func New(
 		logger:         logger,
 		opts:           opts,
 		paths:          newKeyedMutex(),
+		downloads:      make(map[string]chan struct{}),
 		stats:          stats,
 		// Metadata requests: 30s is plenty.
 		client: &http.Client{
@@ -630,28 +637,71 @@ func validateSyncName(name string) error {
 	return nil
 }
 
-// repairPeer drains the durable repair queue for one peer.
+// repairPeer keeps a bounded set of independent repairs running. Rows stay in
+// SQLite until completion, so stopping this scheduler needs no recovery state.
 func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
+	limit := s.opts.MaxConcurrentDownloads
+	active := make(map[string]bool, limit)
+	type completion struct {
+		name string
+		err  error
+	}
+	completed := make(chan completion, limit)
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	timer := time.NewTimer(jitter(s.opts.RepairInterval))
+	defer timer.Stop()
+	paused := false
 	for {
-		if !sleepCtx(ctx, jitter(s.opts.RepairInterval)) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			paused = false
+			timer.Reset(jitter(s.opts.RepairInterval))
+		case result := <-completed:
+			delete(active, result.name)
+			// If queue bookkeeping failed, the row is still immediately due.
+			// Wait for the next sweep instead of retrying it in a tight loop.
+			if result.err != nil {
+				paused = true
+			}
+		}
+		if ctx.Err() != nil {
 			return
 		}
+		if paused || len(active) == limit {
+			continue
+		}
 
-		items, err := s.store.DueRepairs(peerURL, s.opts.BatchLimit)
+		// At most len(active) of these oldest rows are already running. Fetching
+		// limit rows therefore supplies every available slot without offset
+		// pagination, persistent claims, or an unbounded in-memory work list.
+		items, err := s.store.DueRepairs(peerURL, limit)
 		if err != nil {
 			s.logger.Error("read repair queue failed", "peer", peerURL, "error", err)
+			paused = true
 			continue
 		}
-		if len(items) == 0 {
-			continue
-		}
-
-		s.logger.Info("processing repair queue", "peer", peerURL, "items", len(items))
 		for _, item := range items {
 			if ctx.Err() != nil {
 				return
 			}
-			s.repairOne(ctx, peerURL, item)
+			if active[item.Name] {
+				continue
+			}
+			active[item.Name] = true
+			workers.Add(1)
+			go func(item store.RepairItem) {
+				defer workers.Done()
+				err := s.repairOne(ctx, peerURL, item)
+				// Capacity equals the maximum worker count, so shutdown can wait
+				// for all workers without draining completion notifications.
+				completed <- completion{name: item.Name, err: err}
+			}(item)
+			if len(active) == limit {
+				break
+			}
 		}
 	}
 }
@@ -659,15 +709,16 @@ func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
 // repairOne compares current source metadata with the durably queued state.
 // A newer source state supersedes old work; missing source metadata cannot
 // erase a deletion that this node already accepted into its repair queue.
-func (s *Syncer) repairOne(ctx context.Context, peerURL string, item store.RepairItem) {
+// A handled transfer failure returns nil after persisting its backoff; errors
+// report cancellation or failed queue bookkeeping to the scheduler.
+func (s *Syncer) repairOne(ctx context.Context, peerURL string, item store.RepairItem) error {
 	meta, err := s.fetchMeta(ctx, peerURL, item.Name)
 	if err != nil {
 		if ctx.Err() != nil {
-			return
+			return ctx.Err()
 		}
 		if item.Meta == nil || !item.Meta.Deleted {
-			s.deferRepair(peerURL, item, fmt.Sprintf("fetch metadata: %v", err))
-			return
+			return s.deferRepair(peerURL, item, fmt.Sprintf("fetch metadata: %v", err))
 		}
 		// A durably accepted deletion needs no bytes from the source. Apply it
 		// even while the peer is offline; any newer local state still wins.
@@ -679,28 +730,28 @@ func (s *Syncer) repairOne(ctx context.Context, peerURL string, item store.Repai
 	if meta == nil {
 		// Legacy queue rows lack a full operation. Absence on the peer is not
 		// proof of success: keep the unresolved item visible for intervention.
-		s.deferRepair(peerURL, item, "peer has no record and queued operation has no metadata")
-		return
+		return s.deferRepair(peerURL, item, "peer has no record and queued operation has no metadata")
 	}
 
 	if err := s.applyChange(ctx, peerURL, *meta); err != nil {
 		if ctx.Err() != nil {
-			return
+			return ctx.Err()
 		}
-		s.deferRepair(peerURL, item, err.Error())
-		return
+		return s.deferRepair(peerURL, item, err.Error())
 	}
 
 	s.logger.Info("repair succeeded", "name", item.Name, "peer", peerURL, "attempts", item.Attempts+1)
 	if err := s.store.ResolveRepairItem(item); err != nil {
 		s.logger.Error("resolve repair failed", "name", item.Name, "error", err)
+		return err
 	}
+	return nil
 }
 
 // deferRepair reschedules a failed item with exponential backoff. Items are kept
 // forever; /status surfaces the backlog so a permanently failing file is visible
 // rather than silently absent.
-func (s *Syncer) deferRepair(peerURL string, item store.RepairItem, cause string) {
+func (s *Syncer) deferRepair(peerURL string, item store.RepairItem, cause string) error {
 	backoff := minRepairBackoff << min(item.Attempts, 12)
 	if backoff > maxRepairBackoff || backoff <= 0 {
 		backoff = maxRepairBackoff
@@ -709,7 +760,9 @@ func (s *Syncer) deferRepair(peerURL string, item store.RepairItem, cause string
 		"attempts", item.Attempts+1, "retry_in", backoff, "cause", cause)
 	if err := s.store.DeferRepairItem(item, backoff, cause); err != nil {
 		s.logger.Error("defer repair failed", "name", item.Name, "error", err)
+		return err
 	}
+	return nil
 }
 
 // reconcilePeer periodically compares the full manifest with a peer and queues
@@ -929,6 +982,11 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	if meta.Size < 0 || meta.Size == math.MaxInt64 || !isSHA256Hex(meta.Hash) {
 		return fmt.Errorf("invalid metadata for %s", meta.Name)
 	}
+	release, err := s.acquireDownload(ctx, peerURL)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	// URL-encode each path segment to handle special characters and subdirectories.
 	reqURL := fmt.Sprintf("%s/files/%s", peerURL, encodePathSegments(meta.Name))
@@ -1340,6 +1398,22 @@ func watchStall(src *progressReader, timeout time.Duration, cancel context.Cance
 }
 
 // --- small helpers ---
+
+func (s *Syncer) acquireDownload(ctx context.Context, peerURL string) (func(), error) {
+	s.downloadsMu.Lock()
+	slots := s.downloads[peerURL]
+	if slots == nil {
+		slots = make(chan struct{}, s.opts.MaxConcurrentDownloads)
+		s.downloads[peerURL] = slots
+	}
+	s.downloadsMu.Unlock()
+	select {
+	case slots <- struct{}{}:
+		return func() { <-slots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 // keyedMutex serializes work per file name without holding a global lock.
 type keyedMutex struct {
