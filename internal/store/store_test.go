@@ -424,25 +424,33 @@ func TestDeleteAndRecreateSameFile(t *testing.T) {
 	}
 }
 
-func TestAllFiles(t *testing.T) {
+// Live names are listed a page at a time. There is deliberately no call that
+// returns the whole table: a sweep that held every name at once allocates with
+// the size of the tree, and the tree is the thing that grows.
+func TestListNonDeletedPagesLiveNames(t *testing.T) {
 	s := newTestStore(t)
 
 	s.PutFile("a.txt", 1000, 10, "h1", false)
 	s.PutFile("b.txt", 2000, 20, "h2", false)
 	s.PutFile("c.txt", 3000, 30, "h3", true) // deleted
 
-	files, err := s.AllFiles()
-	if err != nil {
-		t.Fatalf("AllFiles: %v", err)
+	var seen []string
+	after := ""
+	for {
+		page, err := s.ListNonDeleted(after, 1)
+		if err != nil {
+			t.Fatalf("ListNonDeleted: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, meta := range page {
+			seen = append(seen, meta.Name)
+			after = meta.Name
+		}
 	}
-	if len(files) != 2 {
-		t.Fatalf("expected 2 non-deleted files, got %d", len(files))
-	}
-	if _, ok := files["a.txt"]; !ok {
-		t.Fatal("expected a.txt")
-	}
-	if _, ok := files["b.txt"]; !ok {
-		t.Fatal("expected b.txt")
+	if len(seen) != 2 || seen[0] != "a.txt" || seen[1] != "b.txt" {
+		t.Fatalf("live names = %v, want a.txt and b.txt in order", seen)
 	}
 }
 

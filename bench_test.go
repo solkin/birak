@@ -221,6 +221,17 @@ func TestBenchSyncUnderLoad(t *testing.T) {
 	report.indexTime = time.Since(indexStart)
 	report.indexedFiles = benchFileCount(t, nodeA)
 
+	// --- Phase 1b: what one write costs with nothing else happening -------
+	// Without this the load numbers below are read as per-write cost, which is
+	// how the first round of this stand reached the wrong conclusion. The gap
+	// between the publish floor and this line is Birak's own overhead; the gap
+	// between this line and the loaded figure is queueing.
+	quiet := newBenchLoad(nodeA, benchOptions{
+		dir: opt.dir, files: opt.files, fileBytes: opt.fileBytes, writers: 1,
+	}, "quiet")
+	quiet.run(t, 5*time.Second)
+	report.quietWrite = quiet.writeLatency()
+
 	nodeB.start(t)
 	t.Cleanup(nodeB.stop)
 
@@ -621,6 +632,7 @@ func (s benchStats) String() string {
 type benchReport struct {
 	options            benchOptions
 	floor              time.Duration
+	quietWrite         benchStats
 	largeWrite         benchStats
 	seedBytes          int64
 	seedWrite          time.Duration
@@ -651,7 +663,8 @@ func (r *benchReport) String() string {
 
   publish floor        %s per write on this filesystem
   first index          %s for %d files (%s)
-  write latency        %s
+  write, node idle     %s
+  write, under load    %s
   large-file overwrite %s
   commit-lock wait     %s
   writes accepted      %d in %s (%s)
@@ -661,15 +674,17 @@ func (r *benchReport) String() string {
   outage writes        %d
   convergence          %s for %d files after the peer returned
 
-  Read these against the storage this ran on. A page-cached laptop run says
-  nothing about a network volume, and neither number bounds replication lag
-  on a slow link: a transfer that keeps making progress has no deadline.`,
+  Read the three write lines together. Floor to idle is what Birak adds per
+  write; idle to loaded is queueing on the one commit lock a volume has. Read
+  all of it against the storage this ran on: a page-cached laptop says nothing
+  about a network volume, and no number here bounds replication lag on a slow
+  link, where a transfer that keeps making progress has no deadline.`,
 		r.options.dir,
 		r.options.files, mib(int64(r.options.fileBytes)), r.options.large, mib(int64(r.options.largeBytes)), mib(r.seedBytes),
 		mib(r.options.scrubRate),
 		r.floor.Round(time.Microsecond),
 		r.indexTime.Round(time.Millisecond), r.indexedFiles, rate(r.indexedFiles, r.indexTime),
-		r.write, r.largeWrite, r.lock,
+		r.quietWrite, r.write, r.largeWrite, r.lock,
 		r.writes, r.options.duration, rate(r.writes, r.options.duration),
 		r.readyFailures,
 		r.scrubbed,

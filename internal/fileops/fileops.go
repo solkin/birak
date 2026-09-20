@@ -280,7 +280,17 @@ func Mkdir(dir, path string, mode os.FileMode, parents bool) error {
 // OpenWriter stages a complete generation. CLOSE is the publication boundary;
 // disconnects and process termination leave the previous generation intact.
 func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() error, error) {
-	unlock := Lock(dir)
+	// The lock is released explicitly before the staged generation is seeded
+	// from the current one, so it is not held across a whole file copy.
+	r := root(dir)
+	r.mu.Lock()
+	locked := true
+	unlock := func() {
+		if locked {
+			locked = false
+			r.mu.Unlock()
+		}
+	}
 	defer unlock()
 	if err := validateLocked(dir); err != nil {
 		return nil, nil, err
@@ -329,24 +339,6 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 	if err := f.Chmod(mode); err != nil {
 		return fail(err)
 	}
-	if info != nil && flag&os.O_TRUNC == 0 {
-		source, err := os.Open(dest)
-		if err != nil {
-			return fail(err)
-		}
-		_, err = io.Copy(f, source)
-		err = errors.Join(err, source.Close())
-		if err != nil {
-			return fail(err)
-		}
-		if _, err = f.Seek(0, io.SeekStart); err != nil {
-			return fail(err)
-		}
-		if err = os.Chtimes(f.Name(), info.ModTime(), info.ModTime()); err != nil {
-			return fail(err)
-		}
-	}
-	r := root(dir)
 	r.writers[f] = &writer{path: dest, requested: path, original: info}
 	var once sync.Once
 	var closeErr error
@@ -398,7 +390,39 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 		})
 		return closeErr
 	}
+
+	// Seeding happens after the writer is registered and the lock is dropped.
+	// Registration already makes the destination busy for every other commit on
+	// this volume, so the copy needs no lock of its own — and holding one across
+	// it meant that appending to a large file stopped every write on the node
+	// for as long as the copy took. An external replacement during the copy is
+	// caught by the generation check at publication, as it always was.
+	if info != nil && flag&os.O_TRUNC == 0 {
+		unlock()
+		if err := seedFromCurrent(f, dest, info); err != nil {
+			return nil, nil, errors.Join(err, AbortWriter(dir, f))
+		}
+	}
 	return f, closeWriter, nil
+}
+
+// seedFromCurrent fills a staged generation with the bytes it replaces, so a
+// write that does not truncate starts from the published content.
+func seedFromCurrent(f *os.File, dest string, info os.FileInfo) error {
+	source, err := os.Open(dest)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, source); err != nil {
+		return errors.Join(err, source.Close())
+	}
+	if err := source.Close(); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return os.Chtimes(f.Name(), info.ModTime(), info.ModTime())
 }
 func AbortWriter(dir string, f *os.File) error {
 	unlock := Lock(dir)

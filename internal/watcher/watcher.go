@@ -760,7 +760,6 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 	if err := w.CheckStorage(); err != nil {
 		return err
 	}
-	onDisk := make(map[string]struct{})
 	var scanErr, integrityErr error
 	err := filepath.WalkDir(w.dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
@@ -788,7 +787,6 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 		if d.IsDir() {
 			return nil
 		}
-		onDisk[name] = struct{}{}
 		if err := w.sweepFile(name); err != nil {
 			switch {
 			case errors.Is(err, ErrIntegrity):
@@ -821,12 +819,19 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 		}
 		for _, meta := range page {
 			after = meta.Name
-			if _, ok := onDisk[meta.Name]; ok || w.shouldIgnore(meta.Name) {
+			if w.shouldIgnore(meta.Name) {
 				continue
 			}
-			// A file may have appeared since the walk. Refresh rechecks disk and store
-			// under the commit lock, so it cannot publish a stale deletion.
-			if err := w.Refresh(meta.Name); err != nil && !errors.Is(err, fileops.ErrBusy) {
+			// Names the walk already reconciled are answered by a single stat and
+			// cost nothing more. Remembering which ones those were would mean
+			// holding every name in memory at once — a gigabyte on a tree of ten
+			// million files, allocated by a background sweep, which is the kind
+			// of thing that takes a node down at exactly the wrong moment.
+			//
+			// A file may also have appeared since the walk. Both paths recheck
+			// disk and store under the commit lock, so neither can publish a
+			// stale deletion.
+			if err := w.sweepFile(meta.Name); err != nil && !errors.Is(err, fileops.ErrBusy) && !errors.Is(err, ErrIntegrity) {
 				return err
 			}
 		}

@@ -954,26 +954,6 @@ func (s *Store) ListNonDeleted(afterName string, limit int) ([]FileMeta, error) 
 	return result, rows.Err()
 }
 
-// AllFiles returns all non-deleted file entries (for periodic scan diffing).
-// Deprecated: prefer ListNonDeleted for paginated access to avoid memory spikes.
-func (s *Store) AllFiles() (map[string]FileMeta, error) {
-	rows, err := s.db.Query("SELECT " + fileColumns + " FROM files WHERE deleted = 0")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := make(map[string]FileMeta)
-	for rows.Next() {
-		f, err := scanFile(rows)
-		if err != nil {
-			return nil, err
-		}
-		result[f.Name] = f
-	}
-	return result, rows.Err()
-}
-
 // PendingRepairCount returns how many items are queued for a peer, due or not.
 func (s *Store) PendingRepairCount(peerID string) (int64, error) {
 	var n int64
