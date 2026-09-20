@@ -25,4 +25,8 @@ jobs:
           mkdir -p "$limited_volume"
           sudo mount -t tmpfs -o size=16m,mode=1777 tmpfs "$limited_volume"
           trap 'sudo umount "$limited_volume"' EXIT
-          BIRAK_TEST_FULL_VOLUME="$limited_volume" go test -race -count=1 -v -timeout 240s ./...
+          # The suite now runs real daemon processes under -race: crash
+          # consistency, backup restore, and a three-node partition model. On a
+          # shared runner those are minutes, not seconds, and a timeout that
+          # kills them looks exactly like a flaky test.
+          BIRAK_TEST_FULL_VOLUME="$limited_volume" go test -race -count=1 -v -timeout 900s ./...

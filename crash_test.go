@@ -43,23 +43,60 @@ import (
 	"github.com/birak/birak/internal/store"
 )
 
-func TestCrashLeavesTheIndexBehindTheDisk(t *testing.T) {
-	rounds := 3
-	if raw := os.Getenv("BIRAK_CRASH_ROUNDS"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 {
-			t.Fatalf("BIRAK_CRASH_ROUNDS: %q is not a round count", raw)
+// crashRounds is how many times a test kills the daemon. A few prove the
+// invariants; BIRAK_CRASH_ROUNDS turns the same tests into a soak.
+func crashRounds(t *testing.T) int {
+	t.Helper()
+	raw := os.Getenv("BIRAK_CRASH_ROUNDS")
+	if raw == "" {
+		return 3
+	}
+	rounds, err := strconv.Atoi(raw)
+	if err != nil || rounds < 1 {
+		t.Fatalf("BIRAK_CRASH_ROUNDS: %q is not a round count", raw)
+	}
+	return rounds
+}
+
+var (
+	daemonOnce  sync.Once
+	daemonPath  string
+	daemonBuilt error
+)
+
+// daemonBinary builds the daemon once for the whole test run. Building it per
+// test costs more than the tests do, and on a slow runner that is the
+// difference between passing and timing out.
+func daemonBinary(t *testing.T) string {
+	t.Helper()
+	daemonOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "birak-daemon-*")
+		if err != nil {
+			daemonBuilt = err
+			return
 		}
-		rounds = parsed
+		daemonPath = filepath.Join(dir, "birakd")
+		build := exec.Command("go", "build", "-o", daemonPath, "./cmd/birakd")
+		if output, err := build.CombinedOutput(); err != nil {
+			daemonBuilt = fmt.Errorf("build daemon: %w\n%s", err, output)
+		}
+	})
+	if daemonBuilt != nil {
+		t.Fatal(daemonBuilt)
 	}
+	return daemonPath
+}
 
-	binary := filepath.Join(t.TempDir(), "birakd")
-	build := exec.Command("go", "build", "-o", binary, "./cmd/birakd")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build daemon: %v\n%s", err, output)
+// removeDaemonBinary is called from TestMain, which owns what Once created.
+func removeDaemonBinary() {
+	if daemonPath != "" {
+		os.RemoveAll(filepath.Dir(daemonPath))
 	}
+}
 
-	node := newCrashNode(t, binary)
+func TestCrashLeavesTheIndexBehindTheDisk(t *testing.T) {
+	rounds := crashRounds(t)
+	node := newCrashNode(t, daemonBinary(t))
 	node.start(t)
 	node.awaitReady(t)
 
@@ -376,12 +413,7 @@ func crashFreePort(t *testing.T) string {
 // A crash must not leave scratch files that nothing will ever clean up, and
 // must not leave the private state directory in a shape that blocks startup.
 func TestCrashLeavesNoUnreachableScratch(t *testing.T) {
-	binary := filepath.Join(t.TempDir(), "birakd")
-	build := exec.Command("go", "build", "-o", binary, "./cmd/birakd")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build daemon: %v\n%s", err, output)
-	}
-	node := newCrashNode(t, binary)
+	node := newCrashNode(t, daemonBinary(t))
 	node.start(t)
 	node.awaitReady(t)
 	node.writeUntilKilled(t, 0)
@@ -414,20 +446,8 @@ func TestCrashLeavesNoUnreachableScratch(t *testing.T) {
 // still end up holding exactly what the writer holds — with its own index still
 // behind its own disk after every restart.
 func TestCrashDuringReplicationStillConverges(t *testing.T) {
-	rounds := 3
-	if raw := os.Getenv("BIRAK_CRASH_ROUNDS"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 {
-			t.Fatalf("BIRAK_CRASH_ROUNDS: %q is not a round count", raw)
-		}
-		rounds = parsed
-	}
-	binary := filepath.Join(t.TempDir(), "birakd")
-	build := exec.Command("go", "build", "-o", binary, "./cmd/birakd")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build daemon: %v\n%s", err, output)
-	}
-
+	rounds := crashRounds(t)
+	binary := daemonBinary(t)
 	writer := newCrashNode(t, binary)
 	replica := newCrashNode(t, binary)
 	writer.pairWith(t, replica)

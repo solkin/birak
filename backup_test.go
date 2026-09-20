@@ -17,19 +17,13 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
 func TestRestoredBackupRejoinsTheCluster(t *testing.T) {
-	binary := filepath.Join(t.TempDir(), "birakd")
-	build := exec.Command("go", "build", "-o", binary, "./cmd/birakd")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build daemon: %v\n%s", err, output)
-	}
-
+	binary := daemonBinary(t)
 	writer := newCrashNode(t, binary)
 	restored := newCrashNode(t, binary)
 	writer.pairWith(t, restored)
@@ -113,12 +107,7 @@ func TestRestoredBackupRejoinsTheCluster(t *testing.T) {
 // since deleted. Bringing them back would be worse than losing them — a delete
 // that undoes itself is the failure operators never forgive.
 func TestRestoredBackupDoesNotResurrectDeletedFiles(t *testing.T) {
-	binary := filepath.Join(t.TempDir(), "birakd")
-	build := exec.Command("go", "build", "-o", binary, "./cmd/birakd")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build daemon: %v\n%s", err, output)
-	}
-
+	binary := daemonBinary(t)
 	writer := newCrashNode(t, binary)
 	restored := newCrashNode(t, binary)
 	writer.pairWith(t, restored)
