@@ -653,6 +653,11 @@ intentional differences, and the rules for porting protocol fixes.
 
 ### Running Tests
 
+[docs/production-readiness.md](docs/production-readiness.md) states where the
+sync path stands: what is guaranteed and what proves it, the measured numbers,
+the one performance limit that remains, and what still has to be tested on your
+own hardware.
+
 Every round of this work is written up in [docs/audits](docs/audits/README.md) —
 what was checked, what broke, what changed, and what is still true. The most
 recent rounds cover the load stand, write cost, and crash consistency against a
