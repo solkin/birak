@@ -74,13 +74,24 @@ func SetNotifier(dir string, notify func()) {
 	root(dir).notify = notify
 }
 
+// Published is bytes a commit has already read and already made durable. The
+// indexer takes them instead of reading the file again under the lock, which is
+// what kept a large write waiting for its own bytes twice.
+type Published struct {
+	Info os.FileInfo
+	Hash string
+}
+
 // Hooks run under the root lock. The watcher owns validation and durable
 // indexing; fileops owns filesystem mutations. No callback reacquires Lock.
 type Hooks struct {
 	Validate     func() error
 	CheckSources func([]string) error
 	Begin        func([]string) error
-	Finish       func([]string) error
+	// Finish indexes the result. Every commit fsyncs what it publishes before
+	// publishing it, so Finish is told the bytes are durable and need no second
+	// fsync, and is handed whatever the commit already hashed.
+	Finish func(paths []string, published map[string]Published) error
 }
 
 func SetHooks(dir string, hooks Hooks) { unlock := Lock(dir); defer unlock(); root(dir).hooks = hooks }
@@ -109,6 +120,10 @@ func checkSourcesLocked(dir string, paths []string) error {
 }
 
 func commitLocked(dir string, sources, paths []string, fn func() error) error {
+	return commitPublishedLocked(dir, sources, paths, nil, fn)
+}
+
+func commitPublishedLocked(dir string, sources, paths []string, published map[string]Published, fn func() error) error {
 	if err := validateLocked(dir); err != nil {
 		return err
 	}
@@ -130,7 +145,7 @@ func commitLocked(dir string, sources, paths []string, fn func() error) error {
 	// Even a failed operation may have modified the namespace. Keep the intent
 	// until its actual result has been indexed; never acknowledge stale metadata.
 	if h.Finish != nil {
-		err = errors.Join(err, h.Finish(paths))
+		err = errors.Join(err, h.Finish(paths, published))
 	}
 	if root(dir).notify != nil {
 		root(dir).notify()
@@ -337,6 +352,19 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 	var closeErr error
 	closeWriter := func() error {
 		once.Do(func() {
+			// Flush and hash the staged bytes before taking the lock. The
+			// scratch file belongs to this writer alone, so nothing can change
+			// it meanwhile — and doing either under the lock would make every
+			// other commit on this volume wait for one file to reach the disk.
+			// The rename below keeps the inode, so this stat and hash describe
+			// the published file exactly.
+			syncErr := f.Sync()
+			var published map[string]Published
+			if syncErr == nil {
+				if info, hash, err := Snapshot(f.Name()); err == nil {
+					published = map[string]Published{dest: {Info: info, Hash: hash}}
+				}
+			}
 			u := Lock(dir)
 			defer u()
 			if _, ok := r.writers[f]; !ok {
@@ -346,11 +374,11 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 			delete(r.writers, f)
 			defer ReleaseTemp(f)
 			defer os.Remove(f.Name())
-			closeErr = errors.Join(f.Sync(), f.Close())
+			closeErr = errors.Join(syncErr, f.Close())
 			if closeErr != nil {
 				return
 			}
-			closeErr = commitLocked(dir, nil, []string{dest, path}, func() error {
+			closeErr = commitPublishedLocked(dir, nil, []string{dest, path}, published, func() error {
 				// External namespace replacement must not turn an open handle into a lost update.
 				current, err := os.Stat(dest)
 				if info != nil && (err != nil || !same(info, current)) {

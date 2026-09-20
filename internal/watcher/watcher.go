@@ -448,7 +448,7 @@ func (w *Watcher) RefreshLocked(name string) error {
 	if err := w.prepareStorageLocked(); err != nil {
 		return err
 	}
-	return w.refreshFileLocked(name, nil)
+	return w.refreshFileLocked(name, indexOptions{})
 }
 
 // hashed carries bytes read outside the commit lock. It is used only while the
@@ -471,24 +471,29 @@ func (w *Watcher) scanFile(name string) error {
 	}
 	unlock := fileops.Lock(w.dir)
 	defer unlock()
-	return w.refreshFileLocked(name, &hashed{info: info, hash: hash})
+	return w.refreshFileLocked(name, indexOptions{published: map[string]*hashed{name: {info: info, hash: hash}}})
 }
 
-func (w *Watcher) refreshFileLocked(name string, precomputed *hashed) error {
+func (w *Watcher) refreshFileLocked(name string, opts indexOptions) error {
 	if fileops.BusyLocked(w.dir, filepath.Join(w.dir, filepath.FromSlash(name))) {
 		return fileops.ErrBusy
 	}
 	if err := w.recoverReplicaLocked(name); err != nil {
 		return err
 	}
-	ev, err := w.inspectFile(name, precomputed)
+	if opts.trustStat && w.unchangedByStat(name) {
+		return nil
+	}
+	ev, err := w.inspectFile(name, opts.published[name])
 	if err != nil || ev == nil {
 		return err
 	}
 	// A recovered rename or a direct filesystem write must be durable before
 	// peers can consume its metadata, even if its original writer never fsynced.
+	// A commit already did: every publishing path fsyncs its bytes before the
+	// rename, so repeating it here only made each write wait for the disk twice.
 	path := filepath.Join(w.dir, filepath.FromSlash(name))
-	if !ev.Deleted {
+	if !ev.Deleted && !opts.durable {
 		f, err := os.Open(path)
 		if err != nil {
 			return err
@@ -549,7 +554,7 @@ func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, err
 		}
 		if targets[0] != name {
 			// An alias without history must not publish a known damaged target.
-			if err := w.refreshFileLocked(targets[0], nil); err != nil {
+			if err := w.refreshFileLocked(targets[0], indexOptions{}); err != nil {
 				return nil, err
 			}
 		}

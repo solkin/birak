@@ -230,6 +230,7 @@ func TestBenchSyncUnderLoad(t *testing.T) {
 	load := newBenchLoad(nodeA, opt, "steady")
 	load.run(t, opt.duration)
 	report.write = load.writeLatency()
+	report.largeWrite = load.largeWrite()
 	report.lock = load.lockWait()
 	report.writes = load.writes.Load()
 	report.readyFailures = load.notReady.Load()
@@ -275,6 +276,7 @@ type benchLoad struct {
 
 	mu        sync.Mutex
 	latencies []time.Duration
+	largeOnes []time.Duration
 	lockWaits []time.Duration
 
 	writes   atomic.Int64
@@ -331,6 +333,29 @@ func (l *benchLoad) run(t *testing.T, d time.Duration) {
 		}
 	}()
 
+	// One writer keeps overwriting a large file. Publishing it has to observe
+	// the generation it replaces, so this is where the commit path's reads show
+	// up — and where holding the shared lock across them is felt.
+	if l.opt.large > 0 && l.opt.largeBytes > 0 {
+		helpers.Add(1)
+		go func() {
+			defer helpers.Done()
+			blob := make([]byte, l.opt.largeBytes)
+			rand.Read(blob)
+			copy(blob, l.generation)
+			for i := 0; time.Now().Before(deadline); i++ {
+				name := fmt.Sprintf("large/blob-%02d.bin", i%l.opt.large)
+				elapsed, err := benchWrite(l.node.syncDir, name, blob)
+				if err != nil {
+					continue
+				}
+				l.mu.Lock()
+				l.largeOnes = append(l.largeOnes, elapsed)
+				l.mu.Unlock()
+			}
+		}()
+	}
+
 	var writers sync.WaitGroup
 	for worker := 0; worker < max(1, l.opt.writers); worker++ {
 		writers.Add(1)
@@ -365,6 +390,12 @@ func (l *benchLoad) writeLatency() benchStats {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return benchSummarize(l.latencies)
+}
+
+func (l *benchLoad) largeWrite() benchStats {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return benchSummarize(l.largeOnes)
 }
 
 func (l *benchLoad) lockWait() benchStats {
@@ -590,6 +621,7 @@ func (s benchStats) String() string {
 type benchReport struct {
 	options            benchOptions
 	floor              time.Duration
+	largeWrite         benchStats
 	seedBytes          int64
 	seedWrite          time.Duration
 	indexTime          time.Duration
@@ -620,6 +652,7 @@ func (r *benchReport) String() string {
   publish floor        %s per write on this filesystem
   first index          %s for %d files (%s)
   write latency        %s
+  large-file overwrite %s
   commit-lock wait     %s
   writes accepted      %d in %s (%s)
   readiness failures   %d
@@ -636,7 +669,7 @@ func (r *benchReport) String() string {
 		mib(r.options.scrubRate),
 		r.floor.Round(time.Microsecond),
 		r.indexTime.Round(time.Millisecond), r.indexedFiles, rate(r.indexedFiles, r.indexTime),
-		r.write, r.lock,
+		r.write, r.largeWrite, r.lock,
 		r.writes, r.options.duration, rate(r.writes, r.options.duration),
 		r.readyFailures,
 		r.scrubbed,

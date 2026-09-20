@@ -49,6 +49,23 @@ func (w *Watcher) relativePaths(paths []string) ([]string, error) {
 	}
 	return names, nil
 }
+
+// indexOptions is what the caller already guarantees about the names it asks to
+// index. Everything here is a promise a commit can make and an external writer
+// cannot, which is why indexing is conservative by default.
+type indexOptions struct {
+	// allowIntegrity lets a quarantined name pass instead of failing the caller.
+	allowIntegrity bool
+	// durable means these bytes were fsynced before they were published. Every
+	// commit path does that; a file that merely appeared on disk did not.
+	durable bool
+	// published carries bytes the caller already read, keyed by name.
+	published map[string]*hashed
+	// trustStat accepts an unchanged size and timestamp as proof that the file
+	// did not change. Bytes that changed underneath both is the scrub's job.
+	trustStat bool
+}
+
 func (w *Watcher) checkSourcesLocked(paths []string) error {
 	// Walk directory symlink targets too; ordinary scans do not follow them.
 	resolved := make([]string, 0, 2*len(paths))
@@ -63,7 +80,7 @@ func (w *Watcher) checkSourcesLocked(paths []string) error {
 	if err != nil {
 		return err
 	}
-	return w.indexPathsLocked(names, false)
+	return w.indexPathsLocked(names, indexOptions{})
 }
 
 func (w *Watcher) beginCommitLocked(paths []string) error {
@@ -73,22 +90,37 @@ func (w *Watcher) beginCommitLocked(paths []string) error {
 	}
 	// Observe the old destination before an overwrite, even if fsnotify has not
 	// indexed it yet. Its clock is the lower bound for the acknowledged mutation.
-	if err = w.indexPathsLocked(names, true); err != nil {
+	// A file whose size and timestamp still match the index has nothing new to
+	// observe, so the old generation is not read again just to confirm that.
+	if err = w.indexPathsLocked(names, indexOptions{allowIntegrity: true, trustStat: true}); err != nil {
 		return err
 	}
 	return w.store.BeginLocal(names)
 }
-func (w *Watcher) finishCommitLocked(paths []string) error {
+func (w *Watcher) finishCommitLocked(paths []string, published map[string]fileops.Published) error {
 	names, err := w.relativePaths(paths)
 	if err != nil {
 		return err
 	}
-	if err = w.indexPathsLocked(names, false); err != nil {
+	opts := indexOptions{durable: true}
+	for full, entry := range published {
+		// Converted one at a time: a shortcut that cannot be attributed to a
+		// name is simply dropped, and that name is read the ordinary way.
+		mapped, err := w.relativePaths([]string{full})
+		if err != nil || len(mapped) != 1 {
+			continue
+		}
+		if opts.published == nil {
+			opts.published = make(map[string]*hashed, len(published))
+		}
+		opts.published[mapped[0]] = &hashed{info: entry.Info, hash: entry.Hash}
+	}
+	if err = w.indexPathsLocked(names, opts); err != nil {
 		return err
 	}
 	return w.store.EndLocal(names)
 }
-func (w *Watcher) indexPathsLocked(paths []string, allowIntegrity bool) error {
+func (w *Watcher) indexPathsLocked(paths []string, opts indexOptions) error {
 	names := make(map[string]bool)
 	for _, name := range paths {
 		if w.shouldIgnore(name) {
@@ -130,8 +162,8 @@ func (w *Watcher) indexPathsLocked(paths []string, allowIntegrity bool) error {
 		}
 	}
 	for name := range names {
-		err := w.refreshFileLocked(name, nil)
-		if allowIntegrity && errors.Is(err, ErrIntegrity) {
+		err := w.refreshFileLocked(name, opts)
+		if opts.allowIntegrity && errors.Is(err, ErrIntegrity) {
 			continue
 		}
 		if err != nil {
@@ -155,7 +187,7 @@ func (w *Watcher) prepareStorageLocked() error {
 		if err != nil {
 			return err
 		}
-		if err = w.indexPathsLocked(paths, false); err != nil {
+		if err = w.indexPathsLocked(paths, indexOptions{}); err != nil {
 			return err
 		}
 		if err = w.store.EndLocal(paths); err != nil {
