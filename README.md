@@ -666,3 +666,23 @@ go test -v ./internal/gateway/sftp/
 # Integration tests only (spins up real nodes)
 go test -v -timeout 120s -run TestIntegration
 ```
+
+### Load stand
+
+Correctness is covered by the suite above. What it cannot answer is what writes
+cost on *your* storage, and how long a peer takes to catch up after it dies.
+`bench_test.go` answers both. It is opt-in, writes real data at a real rate, and
+must be pointed at the storage you intend to ship on — numbers from a laptop's
+page cache say nothing about a network volume.
+
+```bash
+BIRAK_BENCH_DIR=/data/bench go test -run TestBenchSyncUnderLoad -timeout 30m .
+```
+
+It seeds a tree, measures the first index, then drives sustained writes against
+one node while the scrub runs and a peer replicates, and finally kills the peer,
+keeps writing, and times convergence to an identical manifest digest. The report
+begins with the **publish floor**: the cost of a bare write-fsync-rename-fsync on
+that filesystem. Read every latency against it — it is the floor Birak's own
+write path sits on. Run once with `BIRAK_BENCH_SCRUB=0` to separate verification
+cost from the rest. Every knob is listed at the top of `bench_test.go`.
