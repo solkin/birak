@@ -638,6 +638,11 @@ intentional differences, and the rules for porting protocol fixes.
 
 ### Running Tests
 
+Every round of this work is written up in [docs/audits](docs/audits/README.md) —
+what was checked, what broke, what changed, and what is still true. The most
+recent rounds cover the load stand, write cost, and crash consistency against a
+real daemon process.
+
 The [repair scheduling review](docs/audits/replication-repair-scheduling.md)
 covers slow transfers, new arrivals, the shared download limit, cancellation,
 queue replacement during a transfer, and SQLite bookkeeping failures.
@@ -689,6 +694,22 @@ page cache say nothing about a network volume.
 ```bash
 BIRAK_BENCH_DIR=/data/bench go test -run TestBenchSyncUnderLoad -timeout 30m .
 ```
+
+### Crash consistency
+
+`crash_test.go` runs the real daemon, kills it mid-write, restarts it, and
+insists that the index never claims a file the disk does not have and that every
+acknowledged write is on disk with the bytes the client sent. A second test does
+the same to a replica while its peer keeps writing. Both run in the normal
+suite; `BIRAK_CRASH_ROUNDS` raises the number of crashes.
+
+```bash
+BIRAK_CRASH_ROUNDS=25 go test -run TestCrash -timeout 30m .
+```
+
+SIGKILL leaves the page cache intact, so this checks ordering and recovery, not
+the physics of an fsync. Power loss needs hardware or a fault-injecting block
+device and is not simulated here.
 
 It seeds a tree, measures the first index, then drives sustained writes against
 one node while the scrub runs and a peer replicates, and finally kills the peer,
