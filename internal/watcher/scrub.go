@@ -56,16 +56,17 @@ func (w *Watcher) unchangedByStat(name string) bool {
 // background budget, not a deadline: it never fails readiness and never blocks
 // the sweep, and a name it cannot verify is quarantined like any other.
 func (w *Watcher) scrubLoop(ctx context.Context) {
-	if w.scrubRate <= 0 {
+	if w.scrubRate.Load() <= 0 {
 		w.logger.Warn("checksum scrub disabled; silent corruption will only be found by a peer")
 		return
 	}
-	w.logger.Info("checksum scrub started", "bytes_per_second", w.scrubRate)
+	w.logger.Info("checksum scrub started", "bytes_per_second", w.scrubRate.Load())
 
 	position, err := w.store.NodeValue(scrubPositionKey)
 	if err != nil {
 		w.logger.Error("read scrub position failed", "error", err)
 	}
+	verified := 0
 	for {
 		if ctx.Err() != nil {
 			return
@@ -79,7 +80,11 @@ func (w *Watcher) scrubLoop(ctx context.Context) {
 			continue
 		}
 		if len(page) == 0 {
-			w.finishScrubCycle()
+			// An empty node completes a cycle every time it looks, so announce
+			// only cycles that actually read something. Otherwise a quiet node
+			// writes a log line a minute, forever.
+			w.finishScrubCycle(verified)
+			verified = 0
 			position = ""
 			if err := w.store.SetNodeValue(scrubPositionKey, position); err != nil {
 				w.logger.Error("persist scrub position failed", "error", err)
@@ -102,6 +107,7 @@ func (w *Watcher) scrubLoop(ctx context.Context) {
 				w.logger.Warn("scrub could not verify a file", "name", meta.Name, "error", err)
 			}
 			position = meta.Name
+			verified++
 			if !w.spendScrubBudget(ctx, meta.Size, started) {
 				return
 			}
@@ -117,18 +123,26 @@ func (w *Watcher) spendScrubBudget(ctx context.Context, size int64, started time
 	if size <= 0 {
 		return ctx.Err() == nil
 	}
-	owed := time.Duration(float64(size) / float64(w.scrubRate) * float64(time.Second))
+	rate := w.scrubRate.Load()
+	if rate <= 0 {
+		return ctx.Err() == nil
+	}
+	owed := time.Duration(float64(size) / float64(rate) * float64(time.Second))
 	if remaining := owed - time.Since(started); remaining > 0 {
 		return sleepCtx(ctx, remaining)
 	}
 	return ctx.Err() == nil
 }
 
-func (w *Watcher) finishScrubCycle() {
+func (w *Watcher) finishScrubCycle(verified int) {
 	w.statusMu.Lock()
 	w.lastScrub = time.Now()
 	w.statusMu.Unlock()
-	w.logger.Info("checksum scrub completed a full cycle")
+	if verified == 0 {
+		w.logger.Debug("checksum scrub found nothing to verify")
+		return
+	}
+	w.logger.Info("checksum scrub completed a full cycle", "files", verified)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {

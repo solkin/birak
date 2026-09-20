@@ -38,8 +38,12 @@ type Async struct {
 }
 
 type shared struct {
-	queue  chan entry
-	done   chan struct{}
+	queue chan entry
+	// stop ends the writer. The queue itself is never closed: a record logged
+	// during or after shutdown would then be a send on a closed channel, and
+	// taking the process down over a log line is exactly the failure this
+	// package exists to prevent.
+	stop   chan struct{}
 	closed sync.Once
 	wg     sync.WaitGroup
 }
@@ -48,7 +52,7 @@ type shared struct {
 func NewAsync(inner slog.Handler) *Async {
 	h := &Async{
 		inner:   inner,
-		shared:  &shared{queue: make(chan entry, QueueDepth), done: make(chan struct{})},
+		shared:  &shared{queue: make(chan entry, QueueDepth), stop: make(chan struct{})},
 		dropped: new(atomic.Int64),
 	}
 	h.shared.wg.Add(1)
@@ -65,10 +69,7 @@ func (h *Async) run() {
 	reported := int64(0)
 	for {
 		select {
-		case e, ok := <-h.shared.queue:
-			if !ok {
-				return
-			}
+		case e := <-h.shared.queue:
 			_ = e.handler.Handle(context.Background(), e.record)
 		case <-report.C:
 			if total := h.dropped.Load(); total > reported {
@@ -77,6 +78,17 @@ func (h *Async) run() {
 					"log records dropped; the log consumer is not keeping up", 0,
 				))
 				reported = total
+			}
+		case <-h.shared.stop:
+			// Write what is already queued, then leave. Records that arrive
+			// after this simply have nobody to write them.
+			for {
+				select {
+				case e := <-h.shared.queue:
+					_ = e.handler.Handle(context.Background(), e.record)
+				default:
+					return
+				}
 			}
 		}
 	}
@@ -109,10 +121,11 @@ func (h *Async) WithGroup(name string) slog.Handler {
 func (h *Async) Dropped() int64 { return h.dropped.Load() }
 
 // Close drains what is queued and stops the writer. Records logged afterwards
-// are discarded; shutdown messages should be written before it is called.
+// are accepted and discarded rather than written, so a late log line from a
+// deferred shutdown step is harmless.
 func (h *Async) Close() {
 	h.shared.closed.Do(func() {
-		close(h.shared.queue)
+		close(h.shared.stop)
 		h.shared.wg.Wait()
 	})
 }

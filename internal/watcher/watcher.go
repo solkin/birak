@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,8 +40,9 @@ type Watcher struct {
 	ignorePatterns    []string
 
 	// scrubRate is the byte budget per second for continuous verification.
-	// Zero disables it.
-	scrubRate int64
+	// Zero disables it. Atomic because an operator-facing setter that quietly
+	// races the loop reading it is a trap, not a knob.
+	scrubRate atomic.Int64
 
 	statusMu    sync.Mutex
 	lastScan    time.Time
@@ -98,8 +100,8 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 		work:              make(chan []string, workQueueDepth),
 		rescan:            make(chan struct{}, 1),
 		integrity:         make(map[string]bool),
-		scrubRate:         DefaultScrubRate,
 	}
+	w.scrubRate.Store(DefaultScrubRate)
 	fileops.SetNotifier(dir, w.requestRescan)
 	fileops.SetHooks(dir, fileops.Hooks{Validate: w.prepareStorageLocked, CheckSources: w.checkSourcesLocked, Begin: w.beginCommitLocked, Finish: w.finishCommitLocked})
 	return w
@@ -107,9 +109,9 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 
 // SetScrubRate sets the continuous verification budget in bytes per second.
 // Zero disables the scrub, which leaves silent corruption to be found by a peer
-// or not at all. Call it before Run.
+// or not at all.
 func (w *Watcher) SetScrubRate(bytesPerSecond int64) {
-	w.scrubRate = max(0, bytesPerSecond)
+	w.scrubRate.Store(max(0, bytesPerSecond))
 }
 
 // Ready returns a channel closed after the first complete, successful scan.

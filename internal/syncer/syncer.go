@@ -59,8 +59,9 @@ const (
 const manifestPageSize = 1000
 
 // reconcilePositionKey names where a peer's comparison stopped. Per peer,
-// because their manifests advance independently.
-func reconcilePositionKey(peerURL string) string { return "reconcile_position:" + peerURL }
+// because their manifests advance independently. The prefix is what lets the
+// store drop it when the peer leaves the configuration.
+func reconcilePositionKey(peerURL string) string { return store.PerPeerKeyPrefix + peerURL }
 
 // errContentChanged means the peer's bytes no longer match the metadata we were
 // given: the file was rewritten between the announcement and the download. It is

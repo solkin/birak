@@ -80,3 +80,45 @@ func TestPruneCursorsRetainsAcceptedRepairsAfterReopen(t *testing.T) {
 		})
 	}
 }
+
+// A peer that leaves the configuration must not leave a row behind. Its queued
+// work is deliberately kept, but its positions are its own and nothing will
+// ever read them again.
+func TestPruneDropsPerPeerPositionsButKeepsQueuedWork(t *testing.T) {
+	s := limitStore(t)
+	for _, peer := range []string{"http://a", "http://b"} {
+		if err := s.SetNodeValue(PerPeerKeyPrefix+peer, "somewhere"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.EnqueueChange(peer, queued("f"), "poll"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SetNodeValue("scrub_position", "keep-me"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.PruneCursors([]string{"http://a"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.NodeValue(PerPeerKeyPrefix + "http://a"); err != nil || got != "somewhere" {
+		t.Fatalf("a configured peer lost its position: %q %v", got, err)
+	}
+	if got, err := s.NodeValue(PerPeerKeyPrefix + "http://b"); err != nil || got != "" {
+		t.Fatalf("a removed peer kept its position: %q %v", got, err)
+	}
+	if got, err := s.NodeValue("scrub_position"); err != nil || got != "keep-me" {
+		t.Fatalf("pruning touched unrelated node state: %q %v", got, err)
+	}
+	// Accepted work survives; only positions are membership-scoped.
+	if n, err := s.PendingRepairCount("http://b"); err != nil || n != 1 {
+		t.Fatalf("a removed peer lost its queued work: %d %v", n, err)
+	}
+
+	if err := s.PruneCursors(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.NodeValue(PerPeerKeyPrefix + "http://a"); err != nil || got != "" {
+		t.Fatalf("an empty peer list kept a position: %q %v", got, err)
+	}
+}

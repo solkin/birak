@@ -2,6 +2,7 @@ package logging
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -105,6 +106,45 @@ func TestDerivedHandlersShareOneWriter(t *testing.T) {
 	async.Close()
 	if got := sink.written(); len(got) != 1 || got[0] != "from derived" {
 		t.Fatalf("written = %v", got)
+	}
+}
+
+// A deferred shutdown step that logs must not take the process down with it.
+// Closing the queue channel instead of signalling the writer made a late record
+// a send on a closed channel — a panic, over a log line.
+func TestLoggingAfterCloseIsHarmless(t *testing.T) {
+	sink := &blockingHandler{}
+	async := NewAsync(sink)
+	logger := slog.New(async)
+	logger.Info("before close")
+	async.Close()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("logging after Close panicked: %v", r)
+		}
+	}()
+	logger.Info("after close")
+	if err := async.Handle(context.Background(), slog.Record{}); err != nil {
+		t.Fatalf("Handle after Close: %v", err)
+	}
+	if got := sink.written(); len(got) != 1 || got[0] != "before close" {
+		t.Fatalf("written = %v, want only what was logged before Close", got)
+	}
+}
+
+// Close must write what was already queued, even behind a consumer that was
+// slow up to that moment.
+func TestCloseDrainsWhatIsQueued(t *testing.T) {
+	sink := &blockingHandler{}
+	async := NewAsync(sink)
+	logger := slog.New(async)
+	for i := range 100 {
+		logger.Info(fmt.Sprintf("record-%d", i))
+	}
+	async.Close()
+	if got := sink.written(); len(got) != 100 {
+		t.Fatalf("Close wrote %d of 100 queued records", len(got))
 	}
 }
 

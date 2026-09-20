@@ -383,6 +383,10 @@ func (s *Store) Epoch() string {
 // Incarnation changes on every open, including when a backup is restored.
 func (s *Store) Incarnation() string { return s.incarnation }
 
+// PerPeerKeyPrefix marks node_meta keys that belong to one peer and must be
+// dropped with it.
+const PerPeerKeyPrefix = "reconcile_position:"
+
 // NodeValue and SetNodeValue store node-local recovery state.
 func (s *Store) NodeValue(key string) (string, error) {
 	var value string
@@ -640,8 +644,10 @@ func (s *Store) PruneCursors(keep []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(keep) == 0 {
-		_, err := s.db.Exec("DELETE FROM cursors")
-		return err
+		if _, err := s.db.Exec("DELETE FROM cursors"); err != nil {
+			return err
+		}
+		return s.pruneNodeKeysLocked(nil)
 	}
 
 	placeholders := make([]string, len(keep))
@@ -651,9 +657,44 @@ func (s *Store) PruneCursors(keep []string) error {
 		args[i] = p
 	}
 	in := "(" + strings.Join(placeholders, ",") + ")"
-	_, err := s.db.Exec("DELETE FROM cursors WHERE peer_id NOT IN "+in, args...)
-	s.invalidateQueueStats()
-	return err
+	if _, err := s.db.Exec("DELETE FROM cursors WHERE peer_id NOT IN "+in, args...); err != nil {
+		return err
+	}
+	return s.pruneNodeKeysLocked(keep)
+}
+
+// pruneNodeKeysLocked drops per-peer positions for peers that are gone. They
+// are one row each and easy to forget, which is how "a few rows" becomes a
+// table nobody ever cleans.
+func (s *Store) pruneNodeKeysLocked(keep []string) error {
+	wanted := make(map[string]bool, len(keep))
+	for _, peer := range keep {
+		wanted[peer] = true
+	}
+	rows, err := s.db.Query("SELECT key FROM node_meta WHERE key LIKE ?", PerPeerKeyPrefix+"%")
+	if err != nil {
+		return err
+	}
+	var stale []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return err
+		}
+		if !wanted[strings.TrimPrefix(key, PerPeerKeyPrefix)] {
+			stale = append(stale, key)
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	for _, key := range stale {
+		if _, err := s.db.Exec("DELETE FROM node_meta WHERE key = ?", key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RecordAck records a legacy peer's most recently observed stream cursor.
