@@ -60,6 +60,10 @@ type Watcher struct {
 	// overflows, silently dropping changes.
 	work chan []string
 
+	// restamped counts files whose bytes match the index but whose timestamp
+	// does not. Reported once, after the first sweep: see warnAboutRestamping.
+	restamped atomic.Int64
+
 	// rescan requests an out-of-band full scan. It is the recovery path for
 	// anything the event stream may have dropped.
 	rescan chan struct{}
@@ -594,6 +598,13 @@ func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, err
 	if existing != nil && !existing.Deleted && existing.Hash == hash && existing.ModTime == info.ModTime().UnixNano() && existing.Size == info.Size() {
 		return nil, nil
 	}
+	if existing != nil && !existing.Deleted && existing.Hash == hash && existing.Size == info.Size() {
+		// Same bytes, different timestamp. One file is somebody running touch;
+		// a tree of them is a backup restored with a copy that dropped
+		// modification times, and every one of those files is about to outrank
+		// whatever the cluster holds — including a deletion.
+		w.restamped.Add(1)
+	}
 	return &FileEvent{Name: name, ModTime: info.ModTime().UnixNano(), Size: info.Size(), Hash: hash}, nil
 }
 
@@ -759,9 +770,13 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 			return
 		}
 		w.statusMu.Lock()
+		first := w.lastScan.IsZero()
 		w.lastScan = time.Now()
 		w.lastError = ""
 		w.statusMu.Unlock()
+		if first {
+			w.warnAboutRestamping()
+		}
 		w.readyOnce.Do(func() { close(w.ready) })
 	}()
 	if err := w.CheckStorage(); err != nil {
@@ -851,6 +866,28 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 		w.logger.Error("scan found damaged files awaiting repair", "error", integrityErr)
 	}
 	return integrityErr
+}
+
+// restampThreshold is where "somebody touched a few files" becomes "somebody
+// restored a backup without preserving timestamps". Low enough to catch a real
+// restore, high enough that ordinary editing never trips it.
+const restampThreshold = 8
+
+// warnAboutRestamping says the one thing an operator needs to hear after a bad
+// restore, while there is still time to act. Conflict resolution ranks a file
+// by its logical clock, which starts from its timestamp: a restored tree with
+// fresh timestamps outranks the cluster's newer state and will overwrite it —
+// silently, and on every node, including undoing deletions.
+func (w *Watcher) warnAboutRestamping() {
+	restamped := w.restamped.Load()
+	if restamped < restampThreshold {
+		return
+	}
+	w.logger.Warn("files have unchanged contents but new modification times",
+		"files", restamped,
+		"consequence", "these will outrank the cluster's current state, including deletions",
+		"likely_cause", "a backup restored with a copy that did not preserve timestamps",
+		"remedy", "restore again with cp -a, rsync -a or tar -p before this node replicates")
 }
 
 // safeSymlinkInfo follows a file symlink only when its target remains inside the

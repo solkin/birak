@@ -457,6 +457,19 @@ Run one daemon per data volume and metadata directory; OS-held leases reject a s
 
 The version high-water mark survives deletion of file records. Both `meta_dir` and `sync_dir`, including `.birak/storage-id`, should use persistent storage and be included in a consistent backup. Losing the metadata also loses deletion history, cursors, and repair work that might have no other surviving copy.
 
+**A backup must preserve modification times.** Conflict resolution ranks a file
+by a logical clock that starts from its timestamp, so a restored file with a
+fresh timestamp is indexed as a brand-new local write. It then outranks whatever
+the cluster holds and overwrites it — on every node, including undoing
+deletions, and without a single error anywhere. Use a tool that keeps
+timestamps: `cp -a`, `rsync -a`, `tar -p`, or any real backup product. Plain
+`cp -R` does not, and is enough to corrupt the cluster from one node.
+
+Stop the node before copying, so `meta_dir` and `sync_dir` come from the same
+moment, and restore both together. A node that starts up and finds many files
+with unchanged contents but new timestamps logs a warning naming this cause;
+restore again, properly, before it replicates.
+
 Removing a peer from configuration clears its polling cursor but retains its
 unfinished repairs in SQLite and in `/status.repairs`. Its queue is paused while
 that URL is unconfigured; re-adding the same peer URL resumes it. Before permanently
