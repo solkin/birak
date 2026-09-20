@@ -47,9 +47,13 @@ func run(configPath string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// Set up structured logger with node_id.
+	// Set up structured logger with node_id. Records are written synchronously,
+	// and some of them while the store's write mutex is held, so the level is a
+	// production setting rather than a preference: debug logs every indexed file
+	// and every cursor move, and a log consumer that stops reading stops this
+	// node's metadata writes with it.
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
+		Level: cfg.SlogLevel(),
 	})).With("node", cfg.NodeID)
 
 	logger.Info("starting birak daemon",
@@ -104,6 +108,8 @@ func run(configPath string) error {
 	}
 	defer st.Close()
 
+	st.SetRepairLimit(cfg.Sync.MaxRepairQueue)
+
 	logger.Info("store opened", "path", dbPath)
 
 	// Create context with cancellation on signals.
@@ -124,6 +130,8 @@ func run(configPath string) error {
 		cfg.Ignore,
 	)
 
+	w.SetScrubRate(cfg.Sync.ScrubBytesPerSecond)
+
 	// Validate the volume and recover interrupted replacements before cleanup,
 	// indexing, or exposing any gateway.
 	if err := w.CheckStorage(); err != nil {
@@ -131,8 +139,8 @@ func run(configPath string) error {
 	}
 	gateway.SweepTempFiles(cfg.SyncDir, 0, logger)
 
-	// Drop cursors and repair items for peers that are no longer configured, so
-	// a rotated peer list does not leave dead state behind forever.
+	// Forget stream positions for removed peers. Accepted repair work remains
+	// durable and visible even when its source is temporarily unconfigured.
 	if err := st.PruneCursors(cfg.Peers); err != nil {
 		logger.Error("prune stale peer state failed", "error", err)
 	}

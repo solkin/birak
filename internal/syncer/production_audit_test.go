@@ -274,7 +274,7 @@ func TestAuditSlowHeadersHaveBoundedWait(t *testing.T) {
 func TestAuditBodyStallWatchdogCancels(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	watch := watchStall(&progressReader{r: strings.NewReader("")}, 20*time.Millisecond, cancel)
+	watch := watchStall(&progressReader{r: strings.NewReader("")}, 1024, 20*time.Millisecond, cancel)
 	defer watch.stop()
 	select {
 	case <-ctx.Done():

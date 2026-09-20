@@ -124,8 +124,17 @@ func TestAuditScanQuarantinesRewriteWithPreservedAttributes(t *testing.T) {
 	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
 		t.Fatal(err)
 	}
-	for range 3 {
-		w.periodicScan(context.Background())
+	// The stat-only sweep deliberately cannot see this: size and timestamp are
+	// unchanged. Re-reading bytes is the scrub's budgeted job, and scanFile is
+	// the step it performs per name.
+	if err := w.periodicScan(context.Background()); err != nil {
+		t.Fatalf("sweep should ignore an unchanged size and timestamp: %v", err)
+	}
+	if w.NeedsRepair("restored") {
+		t.Fatal("the cheap sweep claimed to have verified bytes it never read")
+	}
+	if err := w.scanFile("restored"); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("scrub did not quarantine a same-attribute rewrite: %v", err)
 	}
 	want, err := hashFile(path)
 	if err != nil {
@@ -135,8 +144,16 @@ func TestAuditScanQuarantinesRewriteWithPreservedAttributes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta == nil || meta.Hash == want || !w.NeedsRepair("restored") || w.Status().Ready {
+	if meta == nil || meta.Hash == want || !w.NeedsRepair("restored") {
 		t.Fatalf("unexplained same-attribute rewrite was not quarantined: indexed=%+v diskHash=%s status=%+v", meta, want, w.Status())
+	}
+	// The damaged name is unavailable and counted, but the node keeps serving:
+	// readiness answers for the process and the volume, not for one file. When
+	// no peer holds a healthy copy, the old contract removed this node from
+	// service permanently.
+	status := w.Status()
+	if status.Quarantined != 1 || !status.Ready || status.LastError != "" {
+		t.Fatalf("one damaged file took the whole node out of rotation: %+v", status)
 	}
 }
 

@@ -102,6 +102,9 @@ func New(s *store.Store, syncDir, nodeID string, ignorePatterns []string, cfg Co
 	srv.mux.HandleFunc("GET /meta/{name...}", srv.guard(srv.handleMeta))
 	srv.mux.HandleFunc("GET /files/{name...}", srv.guard(srv.handleFile))
 	srv.mux.HandleFunc("GET /status", srv.guard(srv.handleStatus))
+	// Metrics carry the same information as /status, so they carry the same
+	// protection. A scrape needs the cluster secret when one is configured.
+	srv.mux.HandleFunc("GET /metrics", srv.guard(srv.handleMetrics))
 	// Liveness stays unauthenticated so a Kubernetes probe needs no secret.
 	srv.mux.HandleFunc("GET /healthz", srv.handleHealthz)
 	srv.mux.HandleFunc("GET /readyz", srv.handleReadyz)

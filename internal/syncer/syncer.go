@@ -29,17 +29,29 @@ import (
 	"github.com/birak/birak/internal/watcher"
 )
 
-// stallTimeout is the maximum time to wait for any data from a peer during a
-// file download. If no bytes arrive within this window, the transfer is
-// considered stalled and aborted. This replaces the old fixed 30s client
-// timeout that was too short for large files.
-const stallTimeout = 60 * time.Second
+// A download must keep delivering, not merely dribble. stallTimeout is the
+// window; minProgressBytes is how much must arrive inside it. "Any byte within
+// 60s" was not a bound at all: a peer sending one byte per window held a
+// download slot and a path lock indefinitely, and enough of them stop
+// replication from that peer entirely. 64 KiB per minute is roughly 1 KB/s —
+// below any link on which a transfer could finish anyway — and the requirement
+// drops to whatever is left when the file is nearly done, so a short file and a
+// final tail are never aborted at the finish line.
+const (
+	stallTimeout     = 60 * time.Second
+	minProgressBytes = 64 << 10
+)
 
-// Repair backoff bounds. A failing item is retried forever with growing delay —
+// Retry bounds for queued work. An item is retried forever with growing delay —
 // it is never dropped, because dropping it is exactly how a file goes missing
 // on one node and is never noticed.
+//
+// The floor is short because the queue is now the ordinary path, not just the
+// exception: a peer that restarts mid-transfer, or a momentary 503, should cost
+// a fraction of a second, not five. Growth is exponential, so anything actually
+// broken still backs off to the ceiling within a dozen attempts.
 const (
-	minRepairBackoff = 5 * time.Second
+	minRepairBackoff = 500 * time.Millisecond
 	maxRepairBackoff = 15 * time.Minute
 )
 
@@ -51,6 +63,45 @@ const manifestPageSize = 1000
 // not a failure of the file — the newer version simply has to be fetched — so it
 // must never block the change stream.
 var errContentChanged = errors.New("peer content changed during download")
+
+// Decoding a peer's reply is the one place where a peer, not this node, decides
+// how much memory to allocate. A page far larger than the one we asked for is a
+// broken or hostile peer, so it is refused while it streams rather than buffered
+// first: an unbounded reply would otherwise take the whole daemon down with it.
+const (
+	pageEntryBudget = 8 << 10 // per entry asked for; a long path plus its hash
+	pageBaseBudget  = 1 << 20 // framing, and enough for a single-entry reply
+)
+
+var errPageTooLarge = errors.New("peer reply exceeds the requested page size")
+
+// cappedReader fails the read instead of truncating, so an oversized reply
+// surfaces as itself rather than as a confusing "unexpected end of JSON".
+type cappedReader struct {
+	r    io.Reader
+	left int64
+}
+
+func (c *cappedReader) Read(p []byte) (int, error) {
+	if c.left <= 0 {
+		return 0, errPageTooLarge
+	}
+	if int64(len(p)) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.r.Read(p)
+	c.left -= int64(n)
+	return n, err
+}
+
+// decodePage decodes a peer reply sized for at most entries records.
+func decodePage(body io.Reader, entries int, target any) error {
+	if entries < 1 {
+		entries = 1
+	}
+	capped := &cappedReader{r: body, left: int64(entries)*pageEntryBudget + pageBaseBudget}
+	return json.NewDecoder(capped).Decode(target)
+}
 
 // Options bundles the syncer's tuning knobs.
 type Options struct {
@@ -109,8 +160,19 @@ type Syncer struct {
 	// advertise content it does not have.
 	paths *keyedMutex
 
+	// wake tells a peer's apply loop that new work is queued, so a change is
+	// applied as soon as it is discovered instead of waiting for the next
+	// rescan tick. One slot is enough: the loop re-reads the queue anyway.
+	wake map[string]chan struct{}
+
 	statsMu sync.Mutex
 	stats   map[string]*peerStat
+
+	// skipped counts entries dropped as unusable or excluded. Retrying cannot
+	// help them, so they leave no repair row — which is exactly why they need a
+	// counter: a peer whose ignore list differs diverges permanently, and that
+	// was previously visible only as a log line nobody reads.
+	skipped atomic.Int64
 
 	// Unexported checkpoint for process-boundary regression tests.
 	namespaceCheckpoint func(step, name string) error
@@ -154,8 +216,10 @@ func New(
 	peers = unique
 	w.SetRepairPeers(peers)
 	stats := make(map[string]*peerStat, len(peers))
+	wake := make(map[string]chan struct{}, len(peers))
 	for _, p := range peers {
 		stats[p] = &peerStat{}
+		wake[p] = make(chan struct{}, 1)
 	}
 
 	return &Syncer{
@@ -169,6 +233,7 @@ func New(
 		opts:           opts,
 		paths:          newKeyedMutex(),
 		downloads:      make(map[string]chan struct{}),
+		wake:           wake,
 		stats:          stats,
 		// Metadata requests: 30s is plenty.
 		client: &http.Client{
@@ -210,9 +275,11 @@ func (s *Syncer) Run(ctx context.Context) {
 
 	var wg sync.WaitGroup
 	for _, peer := range s.peers {
-		// Three independent loops per peer. Repair and reconciliation must not
-		// share a goroutine with polling: a slow full comparison would then
-		// delay live changes, which is how a "backstop" turns into a bottleneck.
+		// Two discovery loops and one apply loop per peer. Polling and manifest
+		// reconciliation only record what they find; repairPeer is the single
+		// place that transfers bytes and changes the filesystem. Separate
+		// goroutines keep a slow comparison — or a slow file — from delaying
+		// anything else.
 		for _, loop := range []func(context.Context, string){
 			s.pollPeer, s.repairPeer, s.reconcilePeer,
 		} {
@@ -230,6 +297,9 @@ func (s *Syncer) Run(ctx context.Context) {
 // ScanStatus and CheckStorage expose local readiness separately from peers.
 func (s *Syncer) ScanStatus() watcher.ScanStatus { return s.watcher.Status() }
 func (s *Syncer) CheckStorage() error            { return s.watcher.CheckStorage() }
+
+// SkippedEntries counts peer entries this node decided never to apply.
+func (s *Syncer) SkippedEntries() int64 { return s.skipped.Load() }
 
 // PeerStats implements server.StatsProvider.
 func (s *Syncer) PeerStats() []server.PeerStatus {
@@ -272,6 +342,14 @@ func (s *Syncer) PeerStats() []server.PeerStatus {
 	return out
 }
 
+// notifyApply nudges a peer's apply loop without blocking the caller.
+func (s *Syncer) notifyApply(peerURL string) {
+	select {
+	case s.wake[peerURL] <- struct{}{}:
+	default:
+	}
+}
+
 func (s *Syncer) withStat(peerURL string, fn func(*peerStat)) {
 	s.statsMu.Lock()
 	defer s.statsMu.Unlock()
@@ -299,6 +377,17 @@ func (s *Syncer) pollPeer(ctx context.Context, peerURL string) {
 		if err != nil {
 			if ctx.Err() != nil {
 				return
+			}
+			if errors.Is(err, store.ErrRepairQueueFull) {
+				// The apply loop has more work than it can hold. Stop reading
+				// rather than counting a peer error: the stream is fine, this
+				// node simply has to catch up first.
+				s.logger.Info("polling paused until queued work drains", "peer", peerURL)
+				s.notifyApply(peerURL)
+				if !sleepCtx(ctx, s.opts.PollInterval) {
+					return
+				}
+				continue
 			}
 			s.logger.Warn("sync with peer failed", "peer", peerURL, "error", err)
 			s.withStat(peerURL, func(st *peerStat) {
@@ -404,8 +493,11 @@ func (s *Syncer) syncBatch(ctx context.Context, peerURL string) (int, bool, erro
 	}
 
 	var changes []store.FileMeta
-	if err := json.NewDecoder(resp.Body).Decode(&changes); err != nil {
+	if err := decodePage(resp.Body, s.opts.BatchLimit, &changes); err != nil {
 		return 0, false, fmt.Errorf("decode changes from %s: %w", peerURL, err)
+	}
+	if len(changes) > s.opts.BatchLimit {
+		return 0, false, fmt.Errorf("peer %s returned %d changes for a limit of %d", peerURL, len(changes), s.opts.BatchLimit)
 	}
 	// Validate the entire page before applying any of it. Repeated or reordered
 	// pages must enter poll backoff, not advance over unseen work or spin forever
@@ -427,17 +519,13 @@ func (s *Syncer) syncBatch(ctx context.Context, peerURL string) (int, bool, erro
 	// cannot pass it — blocks that peer's entire stream permanently.
 	latest, batchMax := collapseByName(changes)
 
-	applied, err := s.applyBatch(ctx, peerURL, latest)
-	if err != nil {
-		return 0, false, err
-	}
-	if err := ctx.Err(); err != nil {
+	if err := s.enqueueBatch(ctx, peerURL, latest); err != nil {
 		return 0, false, err
 	}
 
-	// The cursor may advance past everything in the batch, including failures:
-	// each one is now durably recorded in the repair queue and retried out of
-	// band. Nothing is dropped, and one bad file cannot hold up the rest.
+	// The cursor advances once the whole page is durably recorded. It means
+	// "read this far", nothing more: applying is the queue's job, and a file
+	// that cannot be applied stays queued and visible instead of being dropped.
 	if batchMax > state.Version {
 		if err := s.store.SetPeerState(peerURL, store.PeerState{Version: batchMax, Epoch: epoch}); err != nil {
 			return 0, false, fmt.Errorf("update cursor for %s: %w", peerURL, err)
@@ -445,69 +533,40 @@ func (s *Syncer) syncBatch(ctx context.Context, peerURL string) (int, bool, erro
 		s.withStat(peerURL, func(st *peerStat) { st.cursor = batchMax })
 		s.logger.Debug("cursor updated", "peer", peerURL, "version", batchMax)
 	}
-
-	if applied > 0 {
-		s.logger.Debug("batch applied", "peer", peerURL, "applied", applied, "batch", len(changes))
-	}
+	s.notifyApply(peerURL)
 	return len(changes), false, nil
 }
 
-// applyBatch applies deduplicated changes, downloading up to
-// MaxConcurrentDownloads files at a time. Failures are queued for repair rather
-// than aborting the batch.
-func (s *Syncer) applyBatch(ctx context.Context, peerURL string, changes []store.FileMeta) (int, error) {
-	sem := make(chan struct{}, s.opts.MaxConcurrentDownloads)
-	var wg sync.WaitGroup
-	var applied atomic.Int64
-	var errorsMu sync.Mutex
-	var batchErr error
-
+// enqueueBatch records a polled page as durable work. Nothing is transferred
+// here: polling and reconciliation discover, and one loop per peer applies.
+//
+// That split is what removes head-of-line blocking from the change stream — a
+// single large, slow file no longer delays the next page — and it leaves exactly
+// one place that decides what wins and touches the filesystem, instead of two
+// that have to be kept in agreement by hand.
+//
+// A page that cannot be recorded in full leaves the cursor where it is. Nothing
+// is lost by re-reading it: every entry merges into the same (peer, name) row,
+// keeping whichever state is greater.
+func (s *Syncer) enqueueBatch(ctx context.Context, peerURL string, changes []store.FileMeta) error {
 	for _, change := range changes {
-		if ctx.Err() != nil {
-			break
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			wg.Wait()
-			return int(applied.Load()), ctx.Err()
+		if err := s.validateChange(change); err != nil {
+			// Unusable or excluded metadata is not transient; retrying cannot
+			// help, so it never enters the queue. The counter is what makes an
+			// ignore list that differs between nodes visible from outside.
+			s.skipped.Add(1)
+			s.logger.Warn("skipping unusable metadata from peer",
+				"name", change.Name, "peer", peerURL, "error", err)
+			continue
 		}
-
-		wg.Add(1)
-		go func(change store.FileMeta) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			if err := s.applyChange(ctx, peerURL, change); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				if errors.Is(err, errContentChanged) {
-					// The peer simply rewrote the file mid-transfer. Expected
-					// churn on a hot path, not a fault — the repair pass picks
-					// up whatever version the peer holds now.
-					s.logger.Info("peer content changed mid-download, queued for repair",
-						"name", change.Name, "peer", peerURL)
-				} else {
-					s.logger.Error("apply change failed, queued for repair",
-						"name", change.Name, "peer", peerURL, "error", err)
-				}
-				if qErr := s.store.EnqueueChange(peerURL, change, err.Error()); qErr != nil {
-					s.logger.Error("enqueue repair failed", "name", change.Name, "error", qErr)
-					errorsMu.Lock()
-					batchErr = errors.Join(batchErr, qErr)
-					errorsMu.Unlock()
-				}
-				return
-			}
-			applied.Add(1)
-			// The repair worker clears its own revision after verifying current
-			// state. An unconditional delete here could erase a concurrent enqueue.
-		}(change)
+		if err := s.store.EnqueueChange(peerURL, change, "polled"); err != nil {
+			return fmt.Errorf("record change %q from %s: %w", change.Name, peerURL, err)
+		}
 	}
-
-	wg.Wait()
-	return int(applied.Load()), errors.Join(batchErr, ctx.Err())
+	return nil
 }
 
 // applyChange brings one file in line with a peer's metadata. The decision and
@@ -516,8 +575,26 @@ func (s *Syncer) applyBatch(ctx context.Context, peerURL string, changes []store
 func (s *Syncer) applyChange(ctx context.Context, peerURL string, change store.FileMeta) error {
 	if err := s.validateChange(change); err != nil {
 		// Unusable metadata is not a transient failure; retrying cannot help.
+		s.skipped.Add(1)
 		s.logger.Warn("skipping unusable metadata from peer",
 			"name", change.Name, "peer", peerURL, "error", err)
+		return nil
+	}
+
+	// Entries this node already holds are the common case, not the exception: a
+	// peer restart resets our cursor and replays its whole manifest. Answering
+	// those from the index alone is what keeps a restart cheap — the check below
+	// re-reads and re-hashes the local file under the shared commit lock, so
+	// without this the replay costs one full pass over the dataset and stalls
+	// every gateway write behind it.
+	//
+	// Skipping is safe because indexing can only move a local name forward:
+	// re-reading it could make the local state win, never lose. Detecting bytes
+	// that changed underneath us with the same size and timestamp is the periodic
+	// checksum scan's job; a name it has quarantined still takes the full path,
+	// exactly as reconciliation does.
+	if indexed, err := s.store.GetFile(change.Name); err == nil &&
+		!remoteWins(indexed, change) && !s.watcher.NeedsRepair(change.Name) {
 		return nil
 	}
 
@@ -603,6 +680,12 @@ func validateMetadata(change store.FileMeta) error {
 	if !change.Deleted && (change.Size < 0 || change.Size == math.MaxInt64 || !isSHA256Hex(change.Hash)) {
 		return fmt.Errorf("malformed metadata (size=%d hash=%q)", change.Size, change.Hash)
 	}
+	// A saturated conflict clock can never be advanced past, so accepting one
+	// would leave every later local write at that name failing forever. No real
+	// timestamp reaches it; refusing the value keeps the path writable.
+	if change.Clock == math.MaxInt64 || change.ModTime == math.MaxInt64 {
+		return fmt.Errorf("saturated conflict clock for %q", change.Name)
+	}
 	if change.SupersededBy != "" {
 		if !change.Deleted || change.Size != 0 || !isSHA256Hex(change.Hash) || !store.NamespaceConflict(change.Name, change.SupersededBy) {
 			return fmt.Errorf("malformed namespace tombstone for %s", change.Name)
@@ -637,7 +720,9 @@ func validateSyncName(name string) error {
 	return nil
 }
 
-// repairPeer keeps a bounded set of independent repairs running. Rows stay in
+// repairPeer is the apply loop: the only place that acts on a peer's changes.
+// Polling and reconciliation feed the queue; this drains it, at most one worker
+// per name and no more than MaxConcurrentDownloads at a time. Rows stay in
 // SQLite until completion, so stopping this scheduler needs no recovery state.
 func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
 	limit := s.opts.MaxConcurrentDownloads
@@ -659,6 +744,11 @@ func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
 		case <-timer.C:
 			paused = false
 			timer.Reset(jitter(s.opts.RepairInterval))
+		case <-s.wake[peerURL]:
+			// New work was just discovered. Dispatch it now rather than at the
+			// next tick; a poll interval of latency per change would otherwise
+			// be the price of routing everything through the queue. A pause
+			// after failed bookkeeping is deliberately not cleared here.
 		case result := <-completed:
 			delete(active, result.name)
 			// If queue bookkeeping failed, the row is still immediately due.
@@ -740,7 +830,13 @@ func (s *Syncer) repairOne(ctx context.Context, peerURL string, item store.Repai
 		return s.deferRepair(peerURL, item, err.Error())
 	}
 
-	s.logger.Info("repair succeeded", "name", item.Name, "peer", peerURL, "attempts", item.Attempts+1)
+	return s.resolveRepair(peerURL, item)
+}
+
+// resolveRepair clears an item that was applied. It cannot erase an update
+// enqueued while this attempt ran: that row carries a newer revision.
+func (s *Syncer) resolveRepair(peerURL string, item store.RepairItem) error {
+	s.logger.Debug("queued change applied", "name", item.Name, "peer", peerURL, "attempts", item.Attempts+1)
 	if err := s.store.ResolveRepairItem(item); err != nil {
 		s.logger.Error("resolve repair failed", "name", item.Name, "error", err)
 		return err
@@ -826,10 +922,13 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
 		}
 
 		var page []store.FileMeta
-		decErr := json.NewDecoder(resp.Body).Decode(&page)
+		decErr := decodePage(resp.Body, manifestPageSize, &page)
 		resp.Body.Close()
 		if decErr != nil {
 			return fmt.Errorf("decode manifest from %s: %w", peerURL, decErr)
+		}
+		if len(page) > manifestPageSize {
+			return fmt.Errorf("manifest from %s returned %d entries for a limit of %d", peerURL, len(page), manifestPageSize)
 		}
 		if len(page) == 0 {
 			break
@@ -855,6 +954,7 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
 	}
 
 	if queued > 0 {
+		s.notifyApply(peerURL)
 		s.logger.Info("reconciliation queued repairs",
 			"peer", peerURL, "queued", queued, "scanned", scanned)
 	} else {
@@ -872,7 +972,9 @@ func (s *Syncer) reconcilePage(peerURL string, page []store.FileMeta) (int, erro
 		if s.validateChange(entry) == nil {
 			usable = append(usable, entry)
 			names = append(names, entry.Name)
+			continue
 		}
+		s.skipped.Add(1)
 	}
 	if len(names) == 0 {
 		return 0, nil
@@ -918,7 +1020,7 @@ func (s *Syncer) fetchMeta(ctx context.Context, peerURL, name string) (*store.Fi
 	}
 
 	var meta store.FileMeta
-	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+	if err := decodePage(resp.Body, 1, &meta); err != nil {
 		return nil, fmt.Errorf("decode meta for %s: %w", name, err)
 	}
 	// A malformed or misrouted reply must not supersede durable accepted work.
@@ -1042,14 +1144,14 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	// Stop one byte beyond the advertised size. Without this bound a malicious
 	// peer could stream forever while continually avoiding the stall timeout.
 	src := &progressReader{r: io.LimitReader(resp.Body, meta.Size+1)}
-	stalled := watchStall(src, stallTimeout, cancelReq)
+	stalled := watchStall(src, meta.Size, stallTimeout, cancelReq)
 	written, copyErr := io.CopyBuffer(io.MultiWriter(tmpFile, hasher), src, make([]byte, 256*1024))
 	stalled.stop()
 
 	if copyErr != nil {
 		cleanup()
 		if stalled.fired() {
-			return fmt.Errorf("write file %s: transfer stalled, no data for %v", meta.Name, stallTimeout)
+			return fmt.Errorf("write file %s: transfer below %d bytes per %v", meta.Name, minProgressBytes, stallTimeout)
 		}
 		return fmt.Errorf("write file %s: %w", meta.Name, copyErr)
 	}
@@ -1358,39 +1460,37 @@ type stallWatch struct {
 func (w *stallWatch) stop()       { w.once.Do(func() { close(w.done) }) }
 func (w *stallWatch) fired() bool { return w.tripped.Load() }
 
-// watchStall cancels the transfer when no byte arrives for the whole timeout.
+// watchStall cancels a transfer that fails to deliver minProgressBytes within
+// one timeout window, or the remainder of the file when less than that is left.
 // Cancelling the request context makes the in-flight Read return an error, so
 // the copy unwinds normally — no goroutine is left writing into a buffer its
 // caller has already abandoned.
-func watchStall(src *progressReader, timeout time.Duration, cancel context.CancelFunc) *stallWatch {
+func watchStall(src *progressReader, total int64, timeout time.Duration, cancel context.CancelFunc) *stallWatch {
 	w := &stallWatch{done: make(chan struct{})}
-	tick := timeout / 4
-	if tick <= 0 {
-		tick = time.Second
+	if timeout <= 0 {
+		timeout = time.Second
 	}
 
 	go func() {
-		ticker := time.NewTicker(tick)
+		ticker := time.NewTicker(timeout)
 		defer ticker.Stop()
 		last := src.n.Load()
-		idle := time.Duration(0)
 		for {
 			select {
 			case <-w.done:
 				return
 			case <-ticker.C:
 				cur := src.n.Load()
-				if cur != last {
-					last = cur
-					idle = 0
-					continue
+				need := int64(minProgressBytes)
+				if remaining := total - cur; remaining < need {
+					need = remaining
 				}
-				idle += tick
-				if idle >= timeout {
+				if cur-last < need {
 					w.tripped.Store(true)
 					cancel()
 					return
 				}
+				last = cur
 			}
 		}
 	}()

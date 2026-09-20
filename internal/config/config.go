@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// defaultMaxRepairQueue mirrors store.DefaultRepairLimit. It is duplicated
+// rather than imported so that config stays free of the storage layer.
+const defaultMaxRepairQueue = 100_000
+
+// defaultScrubBytesPerSecond mirrors watcher.DefaultScrubRate, duplicated so
+// that config stays free of the indexing layer.
+const defaultScrubBytesPerSecond = 8 << 20
+
 // Config holds all daemon configuration.
 type Config struct {
 	NodeID     string   `yaml:"node_id"`
@@ -19,6 +28,11 @@ type Config struct {
 	ListenAddr string   `yaml:"listen_addr"`
 	Peers      []string `yaml:"peers"`
 	Ignore     []string `yaml:"ignore"`
+	// LogLevel is debug, info, warn or error. Every indexed file and every
+	// cursor move is a debug record written synchronously, some of it while the
+	// store's write mutex is held, so debug logging on a busy node is a
+	// throughput cost and a stalled log consumer is a replication outage.
+	LogLevel string `yaml:"log_level"`
 	// ClusterSecret, when set, is required in the X-Birak-Secret header of
 	// every peer-to-peer request. Empty leaves the sync API open, which is only
 	// safe when the listen address is unreachable from outside the cluster.
@@ -103,11 +117,21 @@ type SyncConfig struct {
 	PollInterval           time.Duration `yaml:"poll_interval"`
 	BatchLimit             int           `yaml:"batch_limit"`
 	MaxConcurrentDownloads int           `yaml:"max_concurrent_downloads"`
+	// MaxRepairQueue caps queued repair entries per peer; 0 disables the cap.
+	// A full queue stops that peer's cursor instead of growing the database.
+	MaxRepairQueue int64 `yaml:"max_repair_queue"`
 	// TombstoneTTL is retained for config compatibility. Automatic tombstone
 	// GC is disabled until a membership/application-acknowledgement protocol exists.
-	TombstoneTTL   time.Duration `yaml:"tombstone_ttl"`
-	ScanInterval   time.Duration `yaml:"scan_interval"`
-	DebounceWindow time.Duration `yaml:"debounce_window"`
+	TombstoneTTL time.Duration `yaml:"tombstone_ttl"`
+	// ScanInterval is the stat-only sweep: it notices anything whose size or
+	// timestamp moved. It no longer re-reads file bytes, so it is cheap enough
+	// to run often on a large tree.
+	ScanInterval time.Duration `yaml:"scan_interval"`
+	// ScrubBytesPerSecond is the continuous byte budget for re-verifying stored
+	// checksums. It replaces "read everything every scan_interval", whose cost
+	// grew with the data and could not be bounded. 0 disables verification.
+	ScrubBytesPerSecond int64         `yaml:"scrub_bytes_per_second"`
+	DebounceWindow      time.Duration `yaml:"debounce_window"`
 	// RepairInterval is the periodic rescan for new or due repairs. Repair
 	// workers also refill on completion while preserving per-item backoff.
 	RepairInterval time.Duration `yaml:"repair_interval"`
@@ -125,6 +149,7 @@ func DefaultConfig() Config {
 		MetaDir:    "./meta",
 		ListenAddr: ":9100",
 		Ignore:     []string{},
+		LogLevel:   "info",
 		// Unlike the other multipart limits, zero means unlimited for the active
 		// upload cap. Seed its documented default here so an omitted setting is
 		// distinguishable from an explicit max_active_uploads: 0 in YAML.
@@ -151,8 +176,10 @@ func DefaultConfig() Config {
 			PollInterval:           3 * time.Second,
 			BatchLimit:             1000,
 			MaxConcurrentDownloads: 5,
+			MaxRepairQueue:         defaultMaxRepairQueue,
 			TombstoneTTL:           168 * time.Hour, // 7 days
 			ScanInterval:           5 * time.Minute,
+			ScrubBytesPerSecond:    defaultScrubBytesPerSecond,
 			DebounceWindow:         300 * time.Millisecond,
 			RepairInterval:         30 * time.Second,
 			ReconcileInterval:      time.Hour,
@@ -213,6 +240,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("BIRAK_CLUSTER_SECRET"); v != "" {
 		c.ClusterSecret = v
 	}
+	if v := os.Getenv("BIRAK_LOG_LEVEL"); v != "" {
+		c.LogLevel = v
+	}
 	if v := os.Getenv("BIRAK_MAX_UPLOAD_BYTES"); v != "" {
 		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
 			c.MaxUploadBytes = n
@@ -230,6 +260,11 @@ func applyEnv(c *Config) {
 			c.Sync.BatchLimit = n
 		}
 	}
+	if v := os.Getenv("BIRAK_SYNC_MAX_REPAIR_QUEUE"); v != "" {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
+			c.Sync.MaxRepairQueue = n
+		}
+	}
 	if v := os.Getenv("BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Sync.MaxConcurrentDownloads = n
@@ -238,6 +273,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("BIRAK_SYNC_TOMBSTONE_TTL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			c.Sync.TombstoneTTL = d
+		}
+	}
+	if v := os.Getenv("BIRAK_SYNC_SCRUB_BYTES_PER_SECOND"); v != "" {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
+			c.Sync.ScrubBytesPerSecond = n
 		}
 	}
 	if v := os.Getenv("BIRAK_SYNC_SCAN_INTERVAL"); v != "" {
@@ -367,7 +407,27 @@ func parseBool(s string) bool {
 	return s == "true" || s == "1" || s == "yes"
 }
 
+// logLevels are the accepted log_level names, in increasing severity.
+var logLevels = map[string]slog.Level{
+	"debug": slog.LevelDebug,
+	"info":  slog.LevelInfo,
+	"warn":  slog.LevelWarn,
+	"error": slog.LevelError,
+}
+
+// SlogLevel is the configured level. validate rejects every other spelling, so
+// a typo cannot silently leave the daemon logging at a level nobody asked for.
+func (c Config) SlogLevel() slog.Level {
+	if level, ok := logLevels[strings.ToLower(strings.TrimSpace(c.LogLevel))]; ok {
+		return level
+	}
+	return slog.LevelInfo
+}
+
 func (c *Config) validate() error {
+	if _, ok := logLevels[strings.ToLower(strings.TrimSpace(c.LogLevel))]; !ok && c.LogLevel != "" {
+		return fmt.Errorf("log_level must be one of debug, info, warn, error (got %q)", c.LogLevel)
+	}
 	seen := make(map[string]bool)
 	for i, peer := range c.Peers {
 		key := strings.TrimRight(strings.TrimSpace(peer), "/")
@@ -399,11 +459,17 @@ func (c *Config) validate() error {
 	if c.Sync.MaxConcurrentDownloads <= 0 {
 		return fmt.Errorf("sync.max_concurrent_downloads must be positive")
 	}
+	if c.Sync.MaxRepairQueue < 0 {
+		return fmt.Errorf("sync.max_repair_queue must not be negative")
+	}
 	if c.Sync.TombstoneTTL <= 0 {
 		return fmt.Errorf("sync.tombstone_ttl must be positive")
 	}
 	if c.Sync.ScanInterval <= 0 {
 		return fmt.Errorf("sync.scan_interval must be positive")
+	}
+	if c.Sync.ScrubBytesPerSecond < 0 {
+		return fmt.Errorf("sync.scrub_bytes_per_second must not be negative")
 	}
 	if c.Sync.RepairInterval < 0 {
 		return fmt.Errorf("sync.repair_interval must not be negative")

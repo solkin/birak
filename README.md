@@ -125,6 +125,7 @@ node_id: "node-1"
 sync_dir: "/data/sync"
 meta_dir: "/data/meta"
 listen_addr: ":9100"
+log_level: "info"           # debug | info | warn | error
 peers:
   - "http://192.168.1.2:9100"
   - "http://192.168.1.3:9100"
@@ -148,7 +149,9 @@ sync:
   batch_limit: 1000
   max_concurrent_downloads: 5
   tombstone_ttl: 168h       # legacy setting; automatic tombstone GC is disabled
-  scan_interval: 5m
+  scan_interval: 5m           # stat-only sweep; no longer re-reads file bytes
+  scrub_bytes_per_second: 8388608  # continuous checksum verification budget; 0 disables
+  max_repair_queue: 100000    # queued entries per peer; 0 = unlimited
   debounce_window: 300ms
   repair_interval: 30s      # how often failed changes are retried
   reconcile_interval: 1h    # full manifest comparison with every peer
@@ -199,6 +202,7 @@ export BIRAK_HTTP_ENABLED=true
 | `peers` | `BIRAK_PEERS` | `[]` | Peer URLs (comma-separated in env) |
 | `ignore` | `BIRAK_IGNORE` | `[]` | Ignore patterns (comma-separated in env) |
 | `cluster_secret` | `BIRAK_CLUSTER_SECRET` | _(empty)_ | Shared secret required on peer-to-peer requests; empty leaves the sync API open |
+| `log_level` | `BIRAK_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 | `max_upload_bytes` | `BIRAK_MAX_UPLOAD_BYTES` | `0` | Max upload bytes; 0 = unlimited for S3/WebDAV/SFTP, 1 GiB default for HTTP UI |
 | `multipart.min_part_bytes` | `BIRAK_MULTIPART_MIN_PART_BYTES` | `5242880` | Minimum size of every multipart part but the last |
 | `multipart.max_part_bytes` | `BIRAK_MULTIPART_MAX_PART_BYTES` | `5368709120` | Maximum size of a single multipart part |
@@ -212,7 +216,9 @@ export BIRAK_HTTP_ENABLED=true
 | `sync.batch_limit` | `BIRAK_SYNC_BATCH_LIMIT` | `1000` | Max entries per sync request |
 | `sync.max_concurrent_downloads` | `BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS` | `5` | Combined polling and repair downloads per peer; also bounds active repair operations |
 | `sync.tombstone_ttl` | `BIRAK_SYNC_TOMBSTONE_TTL` | `168h` | Legacy compatibility setting; tombstones are retained indefinitely |
-| `sync.scan_interval` | `BIRAK_SYNC_SCAN_INTERVAL` | `5m` | Full filesystem checksum scan interval; reads all visible file bytes |
+| `sync.scan_interval` | `BIRAK_SYNC_SCAN_INTERVAL` | `5m` | Stat-only sweep interval; indexes anything whose size or timestamp moved |
+| `sync.scrub_bytes_per_second` | `BIRAK_SYNC_SCRUB_BYTES_PER_SECOND` | `8388608` | Continuous checksum verification budget; 0 disables verification |
+| `sync.max_repair_queue` | `BIRAK_SYNC_MAX_REPAIR_QUEUE` | `100000` | Queued repair entries per peer; 0 = unlimited |
 | `sync.debounce_window` | `BIRAK_SYNC_DEBOUNCE_WINDOW` | `300ms` | Delay before processing file events |
 | `sync.repair_interval` | `BIRAK_SYNC_REPAIR_INTERVAL` | `30s` | Rescan interval for new or due repairs; free workers also refill on completion |
 | `sync.reconcile_interval` | `BIRAK_SYNC_RECONCILE_INTERVAL` | `1h` | Full manifest comparison interval (0 disables — not recommended) |
@@ -381,17 +387,25 @@ sftp> rm old-file.txt
 ## How Sync Works
 
 1. Every indexed create, modification, or deletion receives a new monotonic **version**. SQLite commits the file state and its persistent version counter in one transaction with `WAL + synchronous=FULL`.
-2. Each peer polls `GET /changes?since=<cursor>`. The batch is collapsed to the newest entry per name and applied with up to `max_concurrent_downloads` concurrent downloads.
+2. Each peer polls `GET /changes?since=<cursor>`. The batch is collapsed to the newest entry per name and recorded as queued work; nothing is transferred while reading.
 3. Incoming state is compared with current local bytes. A winning file is downloaded to a temporary file, checked against its size and SHA256, fsynced, and compared again before publication.
 4. Gateways, indexing, and replication share a filesystem commit lock. A gateway records its mutation intent before changing files and indexes the result before acknowledging success. Replica intents preserve the incoming conflict clock if a process stops between filesystem publication and SQLite commit. Writable SFTP handles use staging files: CLOSE publishes, disconnect aborts; aliases of an active inode are protected too.
-5. The cursor advances only when every operation has succeeded or its complete state has been persisted in the **repair queue**. Cancellation or a queue write failure prevents advancement.
+5. The cursor advances only once the whole page is durably recorded in the queue. It means "read this far", never "applied": cancellation or a queue write failure prevents advancement, and a full queue stops the cursor rather than dropping work.
 6. A new node starts at `since=0`, receiving both live files and deletion history.
 
-Repairs retry with exponential backoff. A queued deletion survives loss of the source's metadata and can be applied while that source is offline. A persistent permission, disk, or connectivity failure stays visible in `/status`. A valid peer name blocked by a local symlink also remains queued until the obstruction is resolved; malformed or misrouted `/meta` replies cannot erase accepted work. Explicitly ignored names are skipped. **Full reconciliation** compares peer manifests every `reconcile_interval`; `0` disables it.
+Each peer may hold at most `max_repair_queue` queued names. A full queue refuses new names, which stops that peer's cursor instead of growing the database without bound; entries already queued can still record newer state, and the backlog is visible in `/status`. Repairs retry with exponential backoff. A queued deletion survives loss of the source's metadata and can be applied while that source is offline. A persistent permission, disk, or connectivity failure stays visible in `/status`. A valid peer name blocked by a local symlink also remains queued until the obstruction is resolved; malformed or misrouted `/meta` replies cannot erase accepted work. Explicitly ignored names are skipped. **Full reconciliation** compares peer manifests every `reconcile_interval`; `0` disables it.
 
-Repairs run concurrently up to `max_concurrent_downloads`, with at most one active repair per name and peer. A slow repair leaves other worker slots available, including for work queued while it is running. Completed workers immediately pick up due work; periodic rescans discover new arrivals and elapsed backoffs. Polling and repairs share the same per-peer file-transfer limit. Queue write failures pause new repair dispatch until the next rescan. Shutdown waits for workers; unfinished operations remain in SQLite for restart.
+The apply loop runs up to `max_concurrent_downloads` transfers, with at most one active operation per name and peer, so every transfer for a peer comes out of one budget. A slow transfer leaves the other slots available, including for work queued while it runs. Newly discovered work wakes the loop at once; completed workers immediately pick up the next due entry, and periodic rescans catch elapsed backoffs. A retry starts at half a second and doubles to a fifteen-minute ceiling. Queue write failures pause new dispatch until the next rescan. Shutdown waits for workers; unfinished operations remain in SQLite for restart.
 
-Connect and TLS establishment are limited to 10 seconds each, response headers to 15 seconds, and inactivity during a file body to 60 seconds. Large transfers have no short overall timeout while bytes continue arriving.
+Polling and reconciliation only *discover* work: each records what it finds in
+the queue and moves on. One loop per peer applies it, which is the only place
+that transfers bytes or changes the filesystem. A large, slow file therefore no
+longer delays later pages — the stream keeps advancing while the transfer runs.
+Transfers with continuing progress still have no overall deadline, so neither
+the queue nor the inactivity floor bounds replication lag. Include large files
+and constrained bandwidth when measuring the cluster's convergence time.
+
+Connect and TLS establishment are limited to 10 seconds each, and response headers to 15 seconds. A file transfer must deliver at least 64 KiB per minute — roughly 1 KB/s, and only the remaining bytes once a file is nearly done — otherwise it is aborted and requeued. A peer that trickles bytes therefore cannot hold a download slot and a path lock indefinitely. Large transfers still have no overall deadline while they keep making progress.
 
 The peer file endpoint serves regular files only. Pipes and other special files are rejected without waiting for a writer.
 
@@ -409,11 +423,13 @@ Conflict copies are accessible through the file browser, WebDAV, SFTP, or the ho
 
 ### Indexing and Storage Readiness
 
-The watcher compares hash, size, and timestamp with the store; no timed suppression marks are needed. The initial scan and every periodic scan read and hash all visible regular files, including files whose size and timestamp did not change. This costs I/O proportional to the stored bytes; tune `scan_interval` for the volume and monitor scan freshness.
+Two separate jobs, with separate costs. The **sweep** runs every `scan_interval`: it stats every visible file and indexes anything whose size or timestamp disagrees with the store, which is every change except a rewrite that preserves both. It costs I/O proportional to the number of files, not to the stored bytes, so it stays cheap on a large tree. The first sweep on an unindexed tree necessarily reads everything.
+
+The **scrub** re-reads and re-hashes stored files continuously at `scrub_bytes_per_second`, cycling through the tree in name order and persisting its position, so it resumes where it stopped after a restart. It is what detects a rewrite that preserved size and timestamp, and bit rot. Set the budget from the storage you have: at the 8 MiB/s default a 100 GB node completes a cycle in about three hours. `0` disables verification entirely, which leaves silent corruption to be found by a peer or not at all. Hashing happens outside the shared commit lock; only the short index update holds it.
 
 An incomplete or unreadable directory walk never triggers the scan's deletion pass. A persistent marker at `sync_dir/.birak/storage-id` binds the data volume to its metadata database. A missing or mismatched marker makes local storage unready and prevents indexing, gateway mutations, and applying peer changes. Preserve this file with the data volume; do not delete it to bypass a storage fault. A legacy database is bound on first successful validation; an empty data root with existing live metadata is rejected.
 
-`/readyz` reports local scan and storage readiness; `/healthz` reports process liveness. `/status.local` exposes scan age and the last error. Peer outages and queued repairs must be monitored separately.
+`/readyz` answers whether this node can serve and accept writes: storage is bound and the last sweep completed recently. `/healthz` reports process liveness. A quarantined file is *not* a node fault — it is unavailable by name, counted in `/status.local.quarantined` and in `birak_quarantined_files`, and repaired from a peer. One damaged file therefore no longer removes a node from a load balancer, which it previously did permanently when no peer held a healthy copy. Alert on the quarantine count. `/status.local` also exposes sweep age, scrub cycle age and the last error. Peer outages and queued repairs must be monitored separately.
 
 Direct external filesystem writers do not acquire Birak's commit lock. Publish their files with atomic replacement and a changed mtime, and avoid concurrent external writes to names being changed through gateways or replication. Unexpected same-size/same-mtime checksum changes retain the last verified metadata, keep readiness false, and queue repair from peers. Without a healthy copy, the error remains visible; Birak does not guess which bytes are correct.
 
@@ -438,6 +454,12 @@ Run one daemon per data volume and metadata directory; OS-held leases reject a s
 **Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 3`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds `superseded_by` and `conflict_of` automatically. Keep a pre-upgrade metadata backup if a binary rollback is required.
 
 The version high-water mark survives deletion of file records. Both `meta_dir` and `sync_dir`, including `.birak/storage-id`, should use persistent storage and be included in a consistent backup. Losing the metadata also loses deletion history, cursors, and repair work that might have no other surviving copy.
+
+Removing a peer from configuration clears its polling cursor but retains its
+unfinished repairs in SQLite and in `/status.repairs`. Its queue is paused while
+that URL is unconfigured; re-adding the same peer URL resumes it. Before permanently
+retiring a peer, drain its repairs and verify convergence. Removing a source is
+not evidence that its already accepted operations have completed.
 
 ## Peer-to-Peer HTTP API
 
@@ -520,6 +542,30 @@ curl 'http://localhost:9100/status'
 
 Watch `local.ready`, `local.last_scan_ms_ago`, `peers[].lag`, `peers[].healthy` and `repairs.total` to spot a stalled peer: a stream that has stopped moving shows up here rather than only as a file-count drift between nodes.
 
+### GET /metrics
+
+Prometheus text format, carrying the same information as `/status` and behind
+the same `cluster_secret`. Scrape it instead of parsing JSON.
+
+```
+birak_repairs_queued 0
+birak_repair_oldest_seconds 0
+birak_quarantined_files 0
+birak_skipped_entries_total 0
+birak_local_ready 1
+birak_last_scan_seconds 0.8
+birak_peer_lag{peer="http://192.168.1.2:9100"} 0
+birak_peer_healthy{peer="http://192.168.1.2:9100"} 1
+birak_peer_pending_repairs{peer="http://192.168.1.2:9100"} 0
+```
+
+Alert on `birak_peer_healthy`, `birak_repair_oldest_seconds`,
+`birak_quarantined_files` and `birak_last_scan_seconds`.
+`birak_skipped_entries_total` counts peer entries this node decided never to
+apply — malformed metadata, or names excluded by an `ignore` rule that differs
+between nodes. Those leave no repair row, so a node that diverges this way is
+visible here and nowhere else.
+
 ### GET /healthz
 
 Liveness probe. Always unauthenticated — it reports only whether this process is running, never whether a peer is reachable, so a peer outage does not restart a healthy pod.
@@ -539,6 +585,13 @@ readinessProbe:
 ```
 
 ### Authentication
+
+### Logging
+
+`log_level` defaults to `info`. Records are written synchronously to stdout, and
+`debug` emits one per indexed file and per cursor move, so on a busy node it
+costs throughput — and a log consumer that stops reading stalls the daemon with
+it. Raise the level to `debug` for diagnosis, not as a standing setting.
 
 Set `cluster_secret` and every endpoint above except `/healthz` and `/readyz` requires the `X-Birak-Secret` header. Peers send it automatically. Without it the sync API serves every file to anyone who can reach `listen_addr`, so either set the secret or keep the port off any untrusted network.
 

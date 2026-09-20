@@ -94,6 +94,27 @@ func (s *Store) ReplicaIntent(name string) (*FileMeta, error) {
 	}
 	return &meta, nil
 }
+
+// ReplicaIntents lists names with an unresolved replica intent, so recovery is
+// an explicit pass at startup rather than something that happens only if the
+// name happens to be indexed again later.
+func (s *Store) ReplicaIntents() ([]string, error) {
+	rows, err := s.db.Query("SELECT name FROM replica_intents ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 func (s *Store) ClearReplicaIntent(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

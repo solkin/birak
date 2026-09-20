@@ -176,6 +176,12 @@ func TestParentChangeDuringDownloadRemainsInRepair(t *testing.T) {
 				if _, err := dest.syncOnce(context.Background(), peer.URL); err != nil {
 					t.Fatal(err)
 				}
+				// Transfers happen in the apply loop now. Drive one attempt
+				// directly so the hooked transport still observes the download,
+				// and so the queued item keeps its original backoff.
+				if err := dest.applyChange(context.Background(), peer.URL, meta); err == nil {
+					t.Fatal("publication through a changed parent succeeded")
+				}
 				if count, err := dest.store.PendingRepairCount(peer.URL); err != nil || count != 1 {
 					t.Fatalf("path change erased accepted work: %d %v", count, err)
 				}

@@ -143,14 +143,18 @@ func TestSlowRepairDoesNotBlockOtherNames(t *testing.T) {
 	}
 }
 
-func TestPollingAndRepairShareDownloadLimit(t *testing.T) {
+// Every transfer for a peer comes out of one budget, because every transfer now
+// happens in one place. What this protects is the waiting: a third item must
+// wait for a slot, must stay durable if the loop is cancelled while it waits,
+// and must take the slot as soon as it frees up.
+func TestAllTransfersShareOnePerPeerDownloadLimit(t *testing.T) {
 	source, _ := auditSyncer(t)
 	dest, _ := auditSyncer(t)
 	dest.opts.RepairInterval = 10 * time.Millisecond
 	dest.opts.MaxConcurrentDownloads = 2
 	var metas []store.FileMeta
 	releases := map[string]chan struct{}{}
-	for _, name := range []string{"poll-a", "poll-b", "repair"} {
+	for _, name := range []string{"first", "second", "third"} {
 		meta := auditMeta(name, "bytes", 200)
 		auditIndex(t, source, meta, "bytes")
 		metas = append(metas, meta)
@@ -180,50 +184,66 @@ func TestPollingAndRepairShareDownloadLimit(t *testing.T) {
 		}
 	}))
 	t.Cleanup(peer.Close)
-	ctx, cancel := context.WithCancel(context.Background())
-	batchDone := make(chan error, 1)
-	go func() { _, err := dest.applyBatch(ctx, peer.URL, metas[:2]); batchDone <- err }()
-	t.Cleanup(func() { cancel(); <-batchDone })
+	for _, meta := range metas[:2] {
+		if err := dest.store.EnqueueChange(peer.URL, meta, "discovered"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stopFirst, firstDone := runRepairLoop(t, dest, peer.URL)
+	// Which two names start first is not specified; only that exactly two do.
 	for i := 0; i < 2; i++ {
 		select {
 		case <-arrived:
 		case <-time.After(3 * time.Second):
-			t.Fatal("poll downloads did not fill both slots")
+			t.Fatal("transfers did not fill both slots")
 		}
 	}
-	if err := dest.store.EnqueueChange(peer.URL, metas[2], "queued repair"); err != nil {
+	if err := dest.store.EnqueueChange(peer.URL, metas[2], "discovered later"); err != nil {
 		t.Fatal(err)
 	}
-	stopRepair, repairDone := runRepairLoop(t, dest, peer.URL)
 	select {
 	case name := <-arrived:
-		t.Fatalf("download limit exceeded while polling slots occupied: %s", name)
+		t.Fatalf("download limit exceeded while both slots were occupied: %s", name)
 	case <-time.After(200 * time.Millisecond):
 	}
-	// A repair waiting for a polling slot must also be cancellable and stay
-	// durable. Restarting only the repair loop must find that same operation.
+	// Cancelling while an item waits for a slot must keep its work durable.
+	stopFirst()
+	select {
+	case <-firstDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("loop could not cancel while a transfer waited for a slot")
+	}
+	if count, err := dest.store.PendingRepairCount(peer.URL); err != nil || count != 3 {
+		t.Fatalf("cancelled waiters lost work: %d %v", count, err)
+	}
+	stopRepair, repairDone := runRepairLoop(t, dest, peer.URL)
 	stopRepair()
 	select {
 	case <-repairDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("repair could not cancel while waiting for a download slot")
 	}
-	if count, err := dest.store.PendingRepairCount(peer.URL); err != nil || count != 1 {
+	if count, err := dest.store.PendingRepairCount(peer.URL); err != nil || count != 3 {
 		t.Fatalf("cancelled waiter lost work: %d %v", count, err)
 	}
 	runRepairLoop(t, dest, peer.URL)
-	close(releases["poll-a"])
+	// The restarted loop fills the budget again and the remaining name waits.
+	awaitRepairCondition(t, "both slots busy after the restart", func() bool {
+		return active.Load() == 2
+	})
 	select {
 	case name := <-arrived:
-		if name != "repair" {
-			t.Fatalf("unexpected request: %s", name)
+		if active.Load() > 2 {
+			t.Fatalf("download limit exceeded after the restart: %s", name)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("repair did not use the released download slot")
+	case <-time.After(200 * time.Millisecond):
 	}
-	close(releases["repair"])
-	close(releases["poll-b"])
-	awaitRepairCondition(t, "repair sharing the download budget", func() bool {
+	// Releasing every transfer lets the waiter take a freed slot; it can only
+	// finish by getting one, which is what the final assertions check.
+	for _, meta := range metas {
+		close(releases[meta.Name])
+	}
+	awaitRepairCondition(t, "every queued transfer to finish", func() bool {
 		count, err := dest.store.PendingRepairCount(peer.URL)
 		return err == nil && count == 0
 	})

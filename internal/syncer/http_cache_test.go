@@ -1,7 +1,6 @@
 package syncer
 
 import (
-	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -50,7 +49,7 @@ func TestReplicationBypassesPreviouslyCachedFile(t *testing.T) {
 		forward.ServeHTTP(w, r)
 	}))
 	defer proxy.Close()
-	if _, err := dest.syncOnce(context.Background(), proxy.URL); err != nil {
+	if _, err := pullPeer(t, dest, proxy.URL); err != nil {
 		t.Fatal(err)
 	}
 	if n := cachedHits.Load(); n != 0 {

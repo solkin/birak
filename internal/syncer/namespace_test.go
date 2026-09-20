@@ -69,9 +69,27 @@ func TestFreshNodeReceivesNamespaceTransitionsInAnyOrder(t *testing.T) {
 	check := func(t *testing.T, order []store.FileMeta, concurrency int) {
 		s, _ := auditSyncer(t)
 		s.opts.MaxConcurrentDownloads = concurrency
-		applied, err := s.applyBatch(context.Background(), peer.URL, order)
-		if err != nil || applied != len(order) {
-			t.Fatalf("batch stuck: applied=%d/%d error=%v", applied, len(order), err)
+		s.opts.RepairInterval = 5 * time.Millisecond
+		// Arrival order is what this test varies. Polling records what it finds
+		// and the apply loop drains it, so the order under test is the order
+		// entries enter the queue.
+		for _, meta := range order {
+			if err := s.store.EnqueueChange(peer.URL, meta, "arrival"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		stopApply, applyDone := runRepairLoop(t, s, peer.URL)
+		awaitRepairCondition(t, "queued namespace transitions to drain", func() bool {
+			stats, err := s.store.RepairQueueStats()
+			return err == nil && stats.Total == 0
+		})
+		// Stop applying before the test queues work of its own, or the loop
+		// would race it to the queue and the assertions below would be timing.
+		stopApply()
+		select {
+		case <-applyDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("apply loop did not stop")
 		}
 		for _, want := range changes {
 			got, err := s.store.GetFile(want.Name)

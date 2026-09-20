@@ -64,7 +64,7 @@ func TestInvalidChangePageDoesNotApplyOrAdvance(t *testing.T) {
 				t.Fatalf("invalid page queued: %d %v", count, err)
 			}
 			healthy.Store(true)
-			if n, err := s.syncOnce(context.Background(), peer.URL); err != nil || n != 2 {
+			if n, err := pullPeer(t, s, peer.URL); err != nil || n != 2 {
 				t.Fatalf("healthy retry: n=%d err=%v", n, err)
 			}
 			if state, err := s.store.GetPeerState(peer.URL); err != nil || state.Version != 10 {
@@ -185,7 +185,7 @@ func TestValidPagesAllowConcurrentWritesAboveAdvertisedMaximum(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(page)
 	}))
 	defer peer.Close()
-	if n, err := s.syncOnce(context.Background(), peer.URL); err != nil || n != 2 {
+	if n, err := pullPeer(t, s, peer.URL); err != nil || n != 2 {
 		t.Fatalf("valid increasing versions rejected: n=%d err=%v", n, err)
 	}
 	if meta, err := s.store.GetFile("file"); err != nil || meta == nil || meta.Clock != 200 {

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -72,6 +73,18 @@ type RepairStats struct {
 	OldestAgeMS int64 `json:"oldest_age_ms"`
 }
 
+// DefaultRepairLimit caps how many distinct names one peer may have queued.
+// A peer that diverges wholesale — a wrong ignore list, a restored backup, a
+// broken build — would otherwise grow this database without any bound. The cap
+// turns that into back-pressure: enqueue fails, the cursor stops advancing, and
+// the backlog is visible in /status instead of filling the disk.
+const DefaultRepairLimit = 100_000
+
+// ErrRepairQueueFull reports that cap. It is a signal to stop consuming more
+// work from that peer, never a reason to drop the change: the caller must not
+// advance its cursor past an entry it could not record.
+var ErrRepairQueueFull = errors.New("repair queue is full")
+
 // Store manages the SQLite database for file metadata and peer cursors.
 type Store struct {
 	db            *sql.DB
@@ -80,6 +93,14 @@ type Store struct {
 	cachedNextVer int64 // next version to assign, protected by mu
 	epoch         string
 	incarnation   string
+	repairLimit   int64 // 0 disables the cap; protected by mu
+}
+
+// SetRepairLimit changes the per-peer queue cap. Zero disables it.
+func (s *Store) SetRepairLimit(limit int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.repairLimit = max(0, limit)
 }
 
 // New creates a new Store, initializing the database schema.
@@ -107,7 +128,7 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	db.SetMaxIdleConns(8)
 	db.SetConnMaxLifetime(0)
 
-	s := &Store{db: db, logger: logger}
+	s := &Store{db: db, logger: logger, repairLimit: DefaultRepairLimit}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -347,7 +368,20 @@ func (s *Store) PutLocal(meta FileMeta) (int64, error) { return s.put(meta, true
 // PutRemote preserves the source conflict clock; Version remains node-local.
 func (s *Store) PutRemote(meta FileMeta) (int64, error) { return s.put(meta, false) }
 
+// put commits one file state and logs it afterwards. Logging is synchronous, so
+// doing it under s.mu would let a log consumer that stops reading stall every
+// metadata write on this node — including the ones peers are waiting for.
 func (s *Store) put(meta FileMeta, local bool) (int64, error) {
+	ver, err := s.commitPut(meta, local)
+	if err != nil {
+		return 0, err
+	}
+	s.logger.Debug("store: file updated", "name", meta.Name, "version", ver,
+		"hash", meta.Hash[:min(12, len(meta.Hash))], "deleted", meta.Deleted)
+	return ver, nil
+}
+
+func (s *Store) commitPut(meta FileMeta, local bool) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	name, modTime, size, hash, deleted := meta.Name, meta.ModTime, meta.Size, meta.Hash, meta.Deleted
@@ -413,8 +447,6 @@ func (s *Store) put(meta FileMeta, local bool) (int64, error) {
 		return 0, fmt.Errorf("commit file %q: %w", name, err)
 	}
 	s.cachedNextVer = ver + 1
-
-	s.logger.Debug("store: file updated", "name", name, "version", ver, "hash", hash[:min(12, len(hash))], "deleted", deleted)
 	return ver, nil
 }
 
@@ -550,13 +582,15 @@ func (s *Store) SetCursor(peerID string, version int64) error {
 	return err
 }
 
-// PruneCursors drops cursor and repair rows for peers that are no longer
-// configured, so a rotated peer list does not accumulate dead state forever.
+// PruneCursors drops stream positions for peers that are no longer configured.
+// Accepted repairs are independent of membership: a removed source may hold
+// the only queued deletion or file state. Keep that work durable and visible
+// until it is resolved; re-adding the peer resumes its existing queue.
 func (s *Store) PruneCursors(keep []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(keep) == 0 {
-		_, err := s.db.Exec("DELETE FROM cursors; DELETE FROM repair_queue")
+		_, err := s.db.Exec("DELETE FROM cursors")
 		return err
 	}
 
@@ -567,10 +601,7 @@ func (s *Store) PruneCursors(keep []string) error {
 		args[i] = p
 	}
 	in := "(" + strings.Join(placeholders, ",") + ")"
-	if _, err := s.db.Exec("DELETE FROM cursors WHERE peer_id NOT IN "+in, args...); err != nil {
-		return err
-	}
-	_, err := s.db.Exec("DELETE FROM repair_queue WHERE peer_id NOT IN "+in, args...)
+	_, err := s.db.Exec("DELETE FROM cursors WHERE peer_id NOT IN "+in, args...)
 	return err
 }
 
@@ -726,6 +757,17 @@ func (s *Store) enqueueRepair(peerID, name string, version int64, reason string,
 	err := s.db.QueryRow("SELECT metadata FROM repair_queue WHERE peer_id=? AND name=?", peerID, name).Scan(&encoded)
 	if err != nil && err != sql.ErrNoRows {
 		return err
+	}
+	// Only a new name can grow the queue; updating a row already in it must
+	// always be allowed, or a full queue could never record newer state.
+	if err == sql.ErrNoRows && s.repairLimit > 0 {
+		var queued int64
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM repair_queue WHERE peer_id=?", peerID).Scan(&queued); err != nil {
+			return err
+		}
+		if queued >= s.repairLimit {
+			return fmt.Errorf("%w: peer %s holds %d entries", ErrRepairQueueFull, peerID, queued)
+		}
 	}
 	if meta != nil {
 		var previous FileMeta

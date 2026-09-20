@@ -38,8 +38,13 @@ type Watcher struct {
 	scanInterval      time.Duration
 	ignorePatterns    []string
 
+	// scrubRate is the byte budget per second for continuous verification.
+	// Zero disables it.
+	scrubRate int64
+
 	statusMu    sync.Mutex
 	lastScan    time.Time
+	lastScrub   time.Time
 	lastError   string
 	readyOnce   sync.Once
 	recovered   bool
@@ -67,6 +72,11 @@ type Watcher struct {
 // rather than blocking the event loop.
 const workQueueDepth = 256
 
+// DefaultScrubRate verifies roughly 28 GiB per hour. It is a background budget
+// chosen so a large node finishes cycles in hours instead of trying, and
+// failing, to re-read everything every scan interval.
+const DefaultScrubRate = 8 << 20
+
 // New creates a new Watcher.
 func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanInterval time.Duration, ignorePatterns []string) *Watcher {
 	dir, _ = filepath.Abs(dir)
@@ -88,10 +98,18 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 		work:              make(chan []string, workQueueDepth),
 		rescan:            make(chan struct{}, 1),
 		integrity:         make(map[string]bool),
+		scrubRate:         DefaultScrubRate,
 	}
 	fileops.SetNotifier(dir, w.requestRescan)
 	fileops.SetHooks(dir, fileops.Hooks{Validate: w.prepareStorageLocked, CheckSources: w.checkSourcesLocked, Begin: w.beginCommitLocked, Finish: w.finishCommitLocked})
 	return w
+}
+
+// SetScrubRate sets the continuous verification budget in bytes per second.
+// Zero disables the scrub, which leaves silent corruption to be found by a peer
+// or not at all. Call it before Run.
+func (w *Watcher) SetScrubRate(bytesPerSecond int64) {
+	w.scrubRate = max(0, bytesPerSecond)
 }
 
 // Ready returns a channel closed after the first complete, successful scan.
@@ -140,6 +158,13 @@ func (w *Watcher) Run(ctx context.Context) error {
 	go func() {
 		defer workers.Done()
 		w.processLoop(ctx)
+	}()
+	// Verification runs on its own goroutine at its own budget: it must never
+	// delay indexing, and indexing must never wait for it.
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		w.scrubLoop(ctx)
 	}()
 	defer func() {
 		close(w.work)
@@ -390,10 +415,24 @@ func (w *Watcher) addDirsRecursive(fsw *fsnotify.Watcher, root string) (failCoun
 // store entry at the end of a long scan.
 func (w *Watcher) processBatch(names []string) {
 	for _, name := range names {
-		if err := w.Refresh(name); err != nil {
-			w.setError(err)
-			w.logger.Error("inspect file failed", "name", name, "error", err)
+		err := w.Refresh(name)
+		if err == nil {
+			continue
 		}
+		if errors.Is(err, fileops.ErrBusy) {
+			// The writer holding this name indexes it when it commits. Recording
+			// that as a local fault would fail readiness for a healthy node.
+			w.logger.Debug("deferred indexing a file being written", "name", name)
+			continue
+		}
+		if errors.Is(err, ErrIntegrity) {
+			// Already quarantined and queued for repair, and counted in status.
+			// One damaged name is not a reason to stop serving the rest.
+			w.logger.Error("file quarantined", "name", name, "error", err)
+			continue
+		}
+		w.setError(err)
+		w.logger.Error("inspect file failed", "name", name, "error", err)
 	}
 }
 
@@ -409,16 +448,40 @@ func (w *Watcher) RefreshLocked(name string) error {
 	if err := w.prepareStorageLocked(); err != nil {
 		return err
 	}
-	return w.refreshFileLocked(name)
+	return w.refreshFileLocked(name, nil)
 }
-func (w *Watcher) refreshFileLocked(name string) error {
+
+// hashed carries bytes read outside the commit lock. It is used only while the
+// file's generation is provably unchanged; otherwise the file is read again.
+type hashed struct {
+	info os.FileInfo
+	hash string
+}
+
+// scanFile indexes one name, reading and hashing it *before* taking the commit
+// lock. Hashing under that lock made every gateway write wait for the largest
+// file in the tree; a file rewritten mid-read is detected and simply re-read.
+func (w *Watcher) scanFile(name string) error {
+	path := filepath.Join(w.dir, filepath.FromSlash(name))
+	info, hash, err := fileops.Snapshot(path)
+	if err != nil {
+		// Not a stable regular file right now — missing, replaced, a directory,
+		// a symlink, or held by a writer. The locked path classifies all of that.
+		return w.Refresh(name)
+	}
+	unlock := fileops.Lock(w.dir)
+	defer unlock()
+	return w.refreshFileLocked(name, &hashed{info: info, hash: hash})
+}
+
+func (w *Watcher) refreshFileLocked(name string, precomputed *hashed) error {
 	if fileops.BusyLocked(w.dir, filepath.Join(w.dir, filepath.FromSlash(name))) {
 		return fileops.ErrBusy
 	}
 	if err := w.recoverReplicaLocked(name); err != nil {
 		return err
 	}
-	ev, err := w.inspectFile(name)
+	ev, err := w.inspectFile(name, precomputed)
 	if err != nil || ev == nil {
 		return err
 	}
@@ -441,7 +504,7 @@ func (w *Watcher) refreshFileLocked(name string) error {
 	return err
 }
 
-func (w *Watcher) inspectFile(name string) (*FileEvent, error) {
+func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, error) {
 	if isOutsideSyncDir(name) || w.shouldIgnore(name) {
 		return nil, nil
 	}
@@ -486,7 +549,7 @@ func (w *Watcher) inspectFile(name string) (*FileEvent, error) {
 		}
 		if targets[0] != name {
 			// An alias without history must not publish a known damaged target.
-			if err := w.refreshFileLocked(targets[0]); err != nil {
+			if err := w.refreshFileLocked(targets[0], nil); err != nil {
 				return nil, err
 			}
 		}
@@ -504,7 +567,7 @@ func (w *Watcher) inspectFile(name string) (*FileEvent, error) {
 		}
 		return nil, nil
 	}
-	info, hash, err := fileops.Snapshot(fullPath)
+	info, hash, err := w.snapshot(fullPath, precomputed)
 	if err != nil {
 		return nil, err
 	}
@@ -522,21 +585,48 @@ func (w *Watcher) inspectFile(name string) (*FileEvent, error) {
 	return &FileEvent{Name: name, ModTime: info.ModTime().UnixNano(), Size: info.Size(), Hash: hash}, nil
 }
 
+// snapshot returns the file's current size, timestamp and hash, reusing bytes
+// already read outside the commit lock when the path still names that exact
+// generation. Anything else is read again here.
+func (w *Watcher) snapshot(path string, precomputed *hashed) (os.FileInfo, string, error) {
+	if precomputed != nil {
+		if current, err := os.Stat(path); err == nil && fileops.SameGeneration(precomputed.info, current) {
+			return precomputed.info, precomputed.hash, nil
+		}
+	}
+	return fileops.Snapshot(path)
+}
+
 // ScanStatus describes the last complete checksum scan, independent of peers.
 // A failed or incomplete scan never opens readiness.
 type ScanStatus struct {
 	Ready         bool   `json:"ready"`
 	LastScanAgoMS int64  `json:"last_scan_ms_ago"`
 	LastError     string `json:"last_error,omitempty"`
+	// Quarantined counts names whose bytes changed without a write timestamp.
+	// They are individually unavailable and awaiting repair from a peer.
+	Quarantined int `json:"quarantined"`
+	// LastScrubAgoMS is the age of the last completed verification cycle, or -1
+	// when no cycle has finished yet. Readiness does not depend on it: the scrub
+	// is a continuous background budget, not a deadline.
+	LastScrubAgoMS int64 `json:"last_scrub_ms_ago"`
 }
 
 func (w *Watcher) Status() ScanStatus {
 	w.statusMu.Lock()
 	defer w.statusMu.Unlock()
-	status := ScanStatus{LastError: w.lastError, LastScanAgoMS: -1}
+	status := ScanStatus{LastError: w.lastError, LastScanAgoMS: -1, LastScrubAgoMS: -1, Quarantined: len(w.integrity)}
+	if !w.lastScrub.IsZero() {
+		status.LastScrubAgoMS = time.Since(w.lastScrub).Milliseconds()
+	}
 	if !w.lastScan.IsZero() {
 		status.LastScanAgoMS = time.Since(w.lastScan).Milliseconds()
-		status.Ready = len(w.integrity) == 0 && w.lastError == "" && time.Since(w.lastScan) < 2*w.scanInterval+time.Minute
+		// Readiness answers "can this node serve and accept writes", which is a
+		// property of the process and the volume. A damaged file is unavailable
+		// by name and counted in Quarantined; it does not take the other million
+		// files out of rotation, and — when no peer holds a healthy copy — it
+		// used to take them out permanently.
+		status.Ready = w.lastError == "" && time.Since(w.lastScan) < 2*w.scanInterval+time.Minute
 	}
 	return status
 }
@@ -645,10 +735,15 @@ func (w *Watcher) checkStorageLocked() error {
 // are published one by one using fresh snapshots; memory holds only names.
 // Any traversal error suppresses the entire deletion pass.
 func (w *Watcher) periodicScan(ctx context.Context) (result error) {
+	// complete distinguishes "the scan could not finish" from "the scan
+	// finished and found damaged files". Only the first is a storage fault.
+	complete := false
 	defer func() {
-		if result != nil {
-			w.setError(result)
-			w.logger.Error("scan incomplete", "error", result)
+		if !complete {
+			if result != nil {
+				w.setError(result)
+				w.logger.Error("scan incomplete", "error", result)
+			}
 			return
 		}
 		w.statusMu.Lock()
@@ -689,10 +784,16 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 			return nil
 		}
 		onDisk[name] = struct{}{}
-		if err := w.Refresh(name); err != nil {
-			if errors.Is(err, ErrIntegrity) {
+		if err := w.sweepFile(name); err != nil {
+			switch {
+			case errors.Is(err, ErrIntegrity):
 				integrityErr = errors.Join(integrityErr, err)
-			} else {
+			case errors.Is(err, fileops.ErrBusy):
+				// A gateway owns this name right now. Its own commit indexes the
+				// result, so an upload in flight is not an incomplete scan — and
+				// must not take a node that is serving traffic out of rotation.
+				w.logger.Debug("scan skipped a file being written", "name", name)
+			default:
 				scanErr = errors.Join(scanErr, err)
 			}
 		}
@@ -720,7 +821,7 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 			}
 			// A file may have appeared since the walk. Refresh rechecks disk and store
 			// under the commit lock, so it cannot publish a stale deletion.
-			if err := w.Refresh(meta.Name); err != nil {
+			if err := w.Refresh(meta.Name); err != nil && !errors.Is(err, fileops.ErrBusy) {
 				return err
 			}
 		}
@@ -728,8 +829,9 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 	if err := w.CheckStorage(); err != nil {
 		return err
 	}
+	complete = true
 	if integrityErr != nil {
-		w.readyOnce.Do(func() { close(w.ready) })
+		w.logger.Error("scan found damaged files awaiting repair", "error", integrityErr)
 	}
 	return integrityErr
 }

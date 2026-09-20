@@ -130,7 +130,7 @@ func (w *Watcher) indexPathsLocked(paths []string, allowIntegrity bool) error {
 		}
 	}
 	for name := range names {
-		err := w.refreshFileLocked(name)
+		err := w.refreshFileLocked(name, nil)
 		if allowIntegrity && errors.Is(err, ErrIntegrity) {
 			continue
 		}
@@ -161,6 +161,18 @@ func (w *Watcher) prepareStorageLocked() error {
 		if err = w.store.EndLocal(paths); err != nil {
 			return err
 		}
+		// Replica intents are resolved here too, not only when a name happens to
+		// be indexed again. A cheap stat-only sweep may never touch an unchanged
+		// name, which would leave an interrupted replica commit unresolved.
+		replicas, err := w.store.ReplicaIntents()
+		if err != nil {
+			return err
+		}
+		for _, name := range replicas {
+			if err := w.recoverReplicaLocked(name); err != nil {
+				return err
+			}
+		}
 		w.recovered = true
 	}
 	return nil
@@ -185,9 +197,11 @@ func (w *Watcher) clearIntegrity(name string) {
 }
 func (w *Watcher) quarantine(meta *store.FileMeta) error {
 	err := fmt.Errorf("%w: %s", ErrIntegrity, meta.Name)
+	// The name is recorded and repaired from a peer; it is reported as a count
+	// rather than as this node's last error, so one damaged file does not claim
+	// the whole node is faulty.
 	w.statusMu.Lock()
 	w.integrity[meta.Name] = true
-	w.lastError = err.Error()
 	w.statusMu.Unlock()
 	for _, peer := range w.repairPeers {
 		if qerr := w.store.EnqueueChange(peer, *meta, "local checksum mismatch"); qerr != nil {

@@ -420,6 +420,11 @@ func Snapshot(path string) (os.FileInfo, string, error) {
 	return after, hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// SameGeneration reports whether two stat results name the same unchanged file.
+// A caller that hashed a file outside the commit lock uses this to prove, under
+// the lock, that the bytes it read are still the ones at that path.
+func SameGeneration(a, b os.FileInfo) bool { return a != nil && b != nil && same(a, b) }
+
 func same(a, b os.FileInfo) bool {
 	return os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime()) && a.Mode() == b.Mode()
 }
