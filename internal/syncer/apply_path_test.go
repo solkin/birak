@@ -9,8 +9,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,6 +21,7 @@ import (
 
 	"github.com/birak/birak/internal/server"
 	"github.com/birak/birak/internal/store"
+	"github.com/birak/birak/internal/watcher"
 )
 
 func writeJSONMeta(w http.ResponseWriter, v any) {
@@ -217,5 +221,36 @@ func TestSlowTransferDoesNotStallTheChangeStream(t *testing.T) {
 	count, err := s.store.PendingRepairCount(peer.URL)
 	if err != nil || count != pages {
 		t.Fatalf("stream was read but its work was not recorded: %d %v", count, err)
+	}
+}
+
+// A syncer built without a batch limit must still work. A page is refused when
+// it carries more entries than were asked for, so a zero limit would otherwise
+// refuse every page a peer ever sends.
+func TestZeroBatchLimitStillAcceptsPages(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	st, err := store.New(filepath.Join(t.TempDir(), "limits.db"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	w := watcher.New(dir, st, logger, time.Millisecond, time.Hour, nil)
+	s := New(st, w, dir, "node", nil, nil, logger, Options{})
+	if s.opts.BatchLimit <= 0 {
+		t.Fatalf("batch limit = %d, want a usable default", s.opts.BatchLimit)
+	}
+
+	meta := auditMeta("wanted.txt", "payload", time.Now().UnixNano())
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(server.HeaderProtocol, server.ProtocolVersion)
+		w.Header().Set(server.HeaderEpoch, "peer-epoch")
+		writeJSONMeta(w, []store.FileMeta{meta})
+	}))
+	t.Cleanup(peer.Close)
+
+	n, _, err := s.syncBatch(context.Background(), peer.URL)
+	if err != nil || n != 1 {
+		t.Fatalf("page refused with a defaulted batch limit: n=%d err=%v", n, err)
 	}
 }

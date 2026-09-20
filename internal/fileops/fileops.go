@@ -397,8 +397,8 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 			syncErr := f.Sync()
 			var published map[string]Published
 			if syncErr == nil {
-				if info, hash, err := Snapshot(f.Name()); err == nil {
-					published = map[string]Published{dest: {Info: info, Hash: hash}}
+				if staged, hash, err := Snapshot(f.Name()); err == nil {
+					published = map[string]Published{dest: {Info: staged, Hash: hash}}
 				}
 			}
 			u := Lock(dir)

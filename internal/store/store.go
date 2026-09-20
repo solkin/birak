@@ -98,11 +98,14 @@ type Store struct {
 	// Queue summaries are read by monitoring, not by replication, and cost a
 	// scan. They are remembered under their own mutex so a scrape never queues
 	// behind a write, and dropped whenever the queue changes.
-	statsMu      sync.Mutex
-	statsCache   RepairStats
-	statsValid   bool
-	statsGen     uint64
-	pendingCache map[string]int64
+	statsMu    sync.Mutex
+	statsCache RepairStats
+	statsValid bool
+	statsGen   uint64
+	// queueSize is the per-peer queue length, kept up to date as rows come and
+	// go. Counting rows to answer "is there room for one more" turned a bulk
+	// sync into O(n²): every new name scanned the whole queue first.
+	queueSize map[string]int64
 }
 
 // SetRepairLimit changes the per-peer queue cap. Zero disables it.
@@ -137,7 +140,7 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	db.SetMaxIdleConns(8)
 	db.SetConnMaxLifetime(0)
 
-	s := &Store{db: db, logger: logger, repairLimit: DefaultRepairLimit}
+	s := &Store{db: db, logger: logger, repairLimit: DefaultRepairLimit, queueSize: make(map[string]int64)}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -158,6 +161,11 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	}
 	s.cachedNextVer = maxVer + 1
 
+	if err := s.loadQueueSizes(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("count queued repairs: %w", err)
+	}
+
 	epoch, err := s.loadOrCreateEpoch()
 	if err != nil {
 		db.Close()
@@ -175,6 +183,39 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	s.incarnation = epoch + "-" + hex.EncodeToString(buf)
 
 	return s, nil
+}
+
+// loadQueueSizes counts the queue once, at open, so nothing else has to.
+func (s *Store) loadQueueSizes() error {
+	rows, err := s.db.Query("SELECT peer_id, COUNT(*) FROM repair_queue GROUP BY peer_id")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var peer string
+		var count int64
+		if err := rows.Scan(&peer, &count); err != nil {
+			return err
+		}
+		s.queueSize[peer] = count
+	}
+	return rows.Err()
+}
+
+// addQueueSize adjusts a peer's queue length and drops the cached summary.
+func (s *Store) addQueueSize(peerID string, delta int64) {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	s.queueSize[peerID] = max(0, s.queueSize[peerID]+delta)
+	s.statsGen++
+	s.statsValid = false
+}
+
+func (s *Store) queuedFor(peerID string) int64 {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	return s.queueSize[peerID]
 }
 
 func (s *Store) migrate() error {
@@ -770,12 +811,9 @@ func (s *Store) enqueueRepair(peerID, name string, version int64, reason string,
 	}
 	// Only a new name can grow the queue; updating a row already in it must
 	// always be allowed, or a full queue could never record newer state.
-	if err == sql.ErrNoRows && s.repairLimit > 0 {
-		var queued int64
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM repair_queue WHERE peer_id=?", peerID).Scan(&queued); err != nil {
-			return err
-		}
-		if queued >= s.repairLimit {
+	fresh := err == sql.ErrNoRows
+	if fresh && s.repairLimit > 0 {
+		if queued := s.queuedFor(peerID); queued >= s.repairLimit {
 			return fmt.Errorf("%w: peer %s holds %d entries", ErrRepairQueueFull, peerID, queued)
 		}
 	}
@@ -815,7 +853,11 @@ func (s *Store) enqueueRepair(peerID, name string, version int64, reason string,
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.invalidateQueueStats()
+	if fresh {
+		s.addQueueSize(peerID, 1)
+	} else {
+		s.invalidateQueueStats()
+	}
 	return nil
 }
 
@@ -855,17 +897,29 @@ func (s *Store) ResolveRepair(peerID, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.Exec("DELETE FROM repair_queue WHERE peer_id = ? AND name = ?", peerID, name)
-	s.invalidateQueueStats()
+	result, err := s.db.Exec("DELETE FROM repair_queue WHERE peer_id = ? AND name = ?", peerID, name)
+	s.trackDeletion(peerID, result)
 	return err
+}
+
+// trackDeletion keeps the queue length honest after a delete that may or may
+// not have matched a row.
+func (s *Store) trackDeletion(peerID string, result sql.Result) {
+	removed := int64(0)
+	if result != nil {
+		if n, err := result.RowsAffected(); err == nil {
+			removed = n
+		}
+	}
+	s.addQueueSize(peerID, -removed)
 }
 
 // ResolveRepairItem cannot erase an update enqueued while this retry ran.
 func (s *Store) ResolveRepairItem(item RepairItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec("DELETE FROM repair_queue WHERE peer_id=? AND name=? AND revision=?", item.PeerID, item.Name, item.Revision)
-	s.invalidateQueueStats()
+	result, err := s.db.Exec("DELETE FROM repair_queue WHERE peer_id=? AND name=? AND revision=?", item.PeerID, item.Name, item.Revision)
+	s.trackDeletion(item.PeerID, result)
 	return err
 }
 
@@ -932,7 +986,6 @@ func (s *Store) invalidateQueueStats() {
 	defer s.statsMu.Unlock()
 	s.statsGen++
 	s.statsValid = false
-	clear(s.pendingCache)
 }
 
 func (s *Store) queryRepairStats() (RepairStats, error) {
@@ -1013,27 +1066,7 @@ func (s *Store) ListNonDeleted(afterName string, limit int) ([]FileMeta, error) 
 }
 
 // PendingRepairCount returns how many items are queued for a peer, due or not.
-// Remembered and invalidated on the same terms as RepairQueueStats.
+// Answered from the counter the queue maintains, not by counting rows.
 func (s *Store) PendingRepairCount(peerID string) (int64, error) {
-	s.statsMu.Lock()
-	count, ok := s.pendingCache[peerID]
-	generation := s.statsGen
-	s.statsMu.Unlock()
-	if ok {
-		return count, nil
-	}
-
-	var n int64
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM repair_queue WHERE peer_id = ?", peerID).Scan(&n); err != nil {
-		return 0, err
-	}
-	s.statsMu.Lock()
-	if s.statsGen == generation {
-		if s.pendingCache == nil {
-			s.pendingCache = make(map[string]int64)
-		}
-		s.pendingCache[peerID] = n
-	}
-	s.statsMu.Unlock()
-	return n, nil
+	return s.queuedFor(peerID), nil
 }

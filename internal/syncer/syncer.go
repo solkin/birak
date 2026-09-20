@@ -209,6 +209,11 @@ func New(
 	if opts.MaxConcurrentDownloads <= 0 {
 		opts.MaxConcurrentDownloads = 1
 	}
+	if opts.BatchLimit <= 0 {
+		// A page is refused when it carries more entries than were asked for,
+		// so a zero limit would refuse every page rather than ask for none.
+		opts.BatchLimit = 1000
+	}
 	if opts.RepairInterval <= 0 {
 		opts.RepairInterval = 30 * time.Second
 	}

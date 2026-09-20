@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func limitStore(t *testing.T) *Store {
@@ -131,5 +132,85 @@ func TestQueueSummaryFollowsTheQueue(t *testing.T) {
 	}
 	if n, err := s.PendingRepairCount("peer"); err != nil || n != 3 {
 		t.Fatalf("a new item was not counted: %d, %v", n, err)
+	}
+}
+
+// The queue length is a counter, not a query: asking the database how many rows
+// a peer has, on every new name, turned a bulk sync into O(n²). The counter has
+// to survive a reopen and stay exact through every path that adds or removes a
+// row.
+func TestQueueLengthIsExactAndSurvivesReopen(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	path := filepath.Join(t.TempDir(), "queue.db")
+	s, err := New(path, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 10; i++ {
+		if err := s.EnqueueChange("peer-a", queued(fmt.Sprintf("a-%d", i)), "poll"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		if err := s.EnqueueChange("peer-b", queued(fmt.Sprintf("b-%d", i)), "poll"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Re-enqueueing an existing name must not inflate the count.
+	if err := s.EnqueueChange("peer-a", queued("a-0"), "again"); err != nil {
+		t.Fatal(err)
+	}
+	// Deferring does not change it either.
+	items, err := s.DueRepairs("peer-a", 1)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("due: %v %v", items, err)
+	}
+	if err := s.DeferRepairItem(items[0], time.Minute, "later"); err != nil {
+		t.Fatal(err)
+	}
+	// Resolving does, and resolving a stale revision does not.
+	if err := s.ResolveRepair("peer-a", "a-1"); err != nil {
+		t.Fatal(err)
+	}
+	stale := items[0]
+	stale.Revision = 999999
+	if err := s.ResolveRepairItem(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	assertQueued := func(what string, store *Store) {
+		t.Helper()
+		if n, err := store.PendingRepairCount("peer-a"); err != nil || n != 9 {
+			t.Fatalf("%s: peer-a holds %d entries, want 9 (%v)", what, n, err)
+		}
+		if n, err := store.PendingRepairCount("peer-b"); err != nil || n != 4 {
+			t.Fatalf("%s: peer-b holds %d entries, want 4 (%v)", what, n, err)
+		}
+		rows, err := store.DueRepairs("peer-a", 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// One of peer-a's entries is deferred, so it is not due.
+		if len(rows) != 8 {
+			t.Fatalf("%s: %d due rows, want 8", what, len(rows))
+		}
+	}
+	assertQueued("before reopen", s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(path, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	assertQueued("after reopen", reopened)
+
+	// And the cap is enforced against the reloaded count.
+	reopened.SetRepairLimit(9)
+	if err := reopened.EnqueueChange("peer-a", queued("a-new"), "poll"); !errors.Is(err, ErrRepairQueueFull) {
+		t.Fatalf("cap was not enforced against the reloaded count: %v", err)
 	}
 }
