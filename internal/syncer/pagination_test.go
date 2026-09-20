@@ -233,3 +233,79 @@ func TestReconciliationTraversesRealManifestPages(t *testing.T) {
 		names[item.Name] = true
 	}
 }
+
+// A manifest comparison is a backstop, not a deadline. On a large tree it is
+// paced: each pass consumes a budget of pages and the next one carries on where
+// it stopped, so the comparison happens continuously instead of as an hourly
+// burst — and an interrupted pass does not start over from the beginning.
+func TestReconciliationResumesWhereItsBudgetRanOut(t *testing.T) {
+	dest, _ := auditSyncer(t)
+	const total = 5
+	var manifest []store.FileMeta
+	for i := 0; i < total; i++ {
+		manifest = append(manifest, auditMeta(fmt.Sprintf("file-%02d", i), "body", int64(100+i)))
+	}
+
+	// One entry per page, however many were asked for: the page budget is about
+	// requests, not entries, and a short page is a legitimate reply.
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(server.HeaderProtocol, server.ProtocolVersion)
+		after := r.URL.Query().Get("after")
+		out := []store.FileMeta{}
+		for _, entry := range manifest {
+			if entry.Name > after {
+				out = append(out, entry)
+				break
+			}
+		}
+		json.NewEncoder(w).Encode(out)
+	}))
+	defer peer.Close()
+
+	dest.opts.ReconcilePageBudget = 1
+	var queued int64
+	for pass := 0; pass < total; pass++ {
+		if err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		got, err := dest.store.PendingRepairCount(peer.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != queued+1 {
+			t.Fatalf("pass %d queued %d entries in total, want %d", pass, got, queued+1)
+		}
+		queued = got
+	}
+
+	// The cycle completes and the next one starts from the beginning.
+	if err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
+		t.Fatal(err)
+	}
+	position, err := dest.store.NodeValue(reconcilePositionKey(peer.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if position != "" {
+		t.Fatalf("finished cycle left position %q", position)
+	}
+}
+
+// With no budget the whole manifest is compared in one pass, which is what a
+// small deployment wants and what every other test here assumes.
+func TestReconciliationWithoutABudgetComparesEverything(t *testing.T) {
+	source, _ := auditSyncer(t)
+	dest, _ := auditSyncer(t)
+	for i := 0; i < 5; i++ {
+		auditIndex(t, source, auditMeta(fmt.Sprintf("file-%02d", i), "body", int64(100+i)), "body")
+	}
+	peer := httptest.NewServer(server.New(source.store, source.syncDir, "source", nil, server.Config{}, source.logger).Handler())
+	defer peer.Close()
+
+	if err := dest.reconcileOnce(context.Background(), peer.URL); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := dest.store.PendingRepairCount(peer.URL); err != nil || got != 5 {
+		t.Fatalf("queued %d of 5 entries in one pass (%v)", got, err)
+	}
+}

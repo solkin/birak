@@ -58,6 +58,10 @@ const (
 // manifestPageSize is how many entries one reconciliation page carries.
 const manifestPageSize = 1000
 
+// reconcilePositionKey names where a peer's comparison stopped. Per peer,
+// because their manifests advance independently.
+func reconcilePositionKey(peerURL string) string { return "reconcile_position:" + peerURL }
+
 // errContentChanged means the peer's bytes no longer match the metadata we were
 // given: the file was rewritten between the announcement and the download. It is
 // not a failure of the file — the newer version simply has to be fetched — so it
@@ -113,10 +117,15 @@ type Options struct {
 	// RepairInterval is the rescan interval for newly queued/due work. Completing
 	// a repair immediately makes its worker slot available to the next due row.
 	RepairInterval time.Duration
-	// ReconcileInterval is how often a full manifest comparison runs against
-	// each peer. It rediscovers divergence independently of the stream cursor.
-	// Zero disables full reconciliation.
+	// ReconcileInterval is how often a manifest comparison runs against each
+	// peer. It rediscovers divergence independently of the stream cursor.
+	// Zero disables reconciliation.
 	ReconcileInterval time.Duration
+	// ReconcilePageBudget caps how many manifest pages one pass consumes, so a
+	// large tree is compared continuously instead of in an hourly burst. The
+	// position is persisted, so successive passes carry on where the last one
+	// stopped. Zero compares the whole manifest in a single pass.
+	ReconcilePageBudget int
 	// Secret is the optional cluster shared secret sent to peers.
 	Secret string
 }
@@ -895,13 +904,27 @@ func (s *Syncer) reconcilePeer(ctx context.Context, peerURL string) {
 func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
 	s.logger.Debug("reconciliation started", "peer", peerURL)
 
-	var after string
-	queued, scanned := 0, 0
+	// Resume where the last pass stopped. A comparison of a large manifest is
+	// worth pacing — it is a backstop, not a deadline — and restarting it from
+	// the beginning after every interruption would mean a big tree never
+	// finishes a full comparison at all.
+	after, err := s.store.NodeValue(reconcilePositionKey(peerURL))
+	if err != nil {
+		return err
+	}
+	queued, scanned, pages := 0, 0, 0
 
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if s.opts.ReconcilePageBudget > 0 && pages >= s.opts.ReconcilePageBudget {
+			// Budget spent. Remember the position and continue next interval.
+			s.logger.Debug("reconciliation paused on its page budget",
+				"peer", peerURL, "after", after, "scanned", scanned)
+			return s.store.SetNodeValue(reconcilePositionKey(peerURL), after)
+		}
+		pages++
 
 		reqURL := fmt.Sprintf("%s/manifest?after=%s&limit=%d",
 			peerURL, url.QueryEscape(after), manifestPageSize)
@@ -914,7 +937,7 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
 			// simply unavailable against it; the change stream still works.
 			resp.Body.Close()
 			s.logger.Debug("peer does not support reconciliation", "peer", peerURL)
-			return nil
+			return s.store.SetNodeValue(reconcilePositionKey(peerURL), "")
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
@@ -931,6 +954,10 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) error {
 			return fmt.Errorf("manifest from %s returned %d entries for a limit of %d", peerURL, len(page), manifestPageSize)
 		}
 		if len(page) == 0 {
+			// A full cycle is complete; the next one starts at the beginning.
+			if err := s.store.SetNodeValue(reconcilePositionKey(peerURL), ""); err != nil {
+				return err
+			}
 			break
 		}
 		// The manifest contract is strict name order beyond `after`. Checking

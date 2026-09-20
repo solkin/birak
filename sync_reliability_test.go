@@ -218,8 +218,10 @@ func TestReliability_SupersededVersionDoesNotBlockStream(t *testing.T) {
 	peerURL := peer.start(t)
 	st, syncDir := startSyncer(t, []string{peerURL})
 
-	waitFor(t, 15*time.Second, "b.txt behind a superseded version", func() bool {
-		return fileExists(syncDir, "b.txt")
+	// Entries from one page are applied concurrently, so the arrival of one
+	// says nothing about the other. Wait for both before reading either.
+	waitFor(t, 15*time.Second, "both names behind a superseded version", func() bool {
+		return fileExists(syncDir, "b.txt") && fileExists(syncDir, "a.txt")
 	})
 	if got := readFile(t, syncDir, "a.txt"); got != "NEW" {
 		t.Fatalf("a.txt = %q, want the newest content", got)

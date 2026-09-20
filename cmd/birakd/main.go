@@ -20,6 +20,7 @@ import (
 	s3gw "github.com/birak/birak/internal/gateway/s3"
 	sftpgw "github.com/birak/birak/internal/gateway/sftp"
 	webdavgw "github.com/birak/birak/internal/gateway/webdav"
+	"github.com/birak/birak/internal/logging"
 	"github.com/birak/birak/internal/multipart"
 	"github.com/birak/birak/internal/server"
 	"github.com/birak/birak/internal/store"
@@ -52,9 +53,13 @@ func run(configPath string) error {
 	// production setting rather than a preference: debug logs every indexed file
 	// and every cursor move, and a log consumer that stops reading stops this
 	// node's metadata writes with it.
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+	// Writing is asynchronous and bounded: a log consumer that stops reading
+	// drops records instead of stopping the goroutine that logged them, which
+	// is routinely one holding the volume's commit lock.
+	logs := logging.NewAsync(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: cfg.SlogLevel(),
-	})).With("node", cfg.NodeID)
+	}))
+	logger := slog.New(logs).With("node", cfg.NodeID)
 
 	logger.Info("starting birak daemon",
 		"sync_dir", cfg.SyncDir,
@@ -160,6 +165,7 @@ func run(configPath string) error {
 			MaxConcurrentDownloads: cfg.Sync.MaxConcurrentDownloads,
 			RepairInterval:         cfg.Sync.RepairInterval,
 			ReconcileInterval:      cfg.Sync.ReconcileInterval,
+			ReconcilePageBudget:    cfg.Sync.ReconcilePageBudget,
 			Secret:                 cfg.ClusterSecret,
 		},
 	)
@@ -379,5 +385,9 @@ func run(configPath string) error {
 
 	wg.Wait()
 	logger.Info("birak daemon stopped")
+	if dropped := logs.Dropped(); dropped > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d log records were dropped; the log consumer could not keep up\n", dropped)
+	}
+	logs.Close()
 	return nil
 }

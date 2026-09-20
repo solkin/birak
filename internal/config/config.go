@@ -139,6 +139,10 @@ type SyncConfig struct {
 	// every peer. This is the backstop that catches anything the version
 	// cursor has already moved past; set it to 0 to disable (not recommended).
 	ReconcileInterval time.Duration `yaml:"reconcile_interval"`
+	// ReconcilePageBudget caps manifest pages per comparison pass, so a large
+	// tree is compared continuously instead of in a burst. 0 compares it all
+	// in one pass.
+	ReconcilePageBudget int `yaml:"reconcile_page_budget"`
 }
 
 // DefaultConfig returns a config with sensible defaults.
@@ -183,6 +187,7 @@ func DefaultConfig() Config {
 			DebounceWindow:         300 * time.Millisecond,
 			RepairInterval:         30 * time.Second,
 			ReconcileInterval:      time.Hour,
+			ReconcilePageBudget:    64,
 		},
 	}
 }
@@ -293,6 +298,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("BIRAK_SYNC_REPAIR_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			c.Sync.RepairInterval = d
+		}
+	}
+	if v := os.Getenv("BIRAK_SYNC_RECONCILE_PAGE_BUDGET"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			c.Sync.ReconcilePageBudget = n
 		}
 	}
 	if v := os.Getenv("BIRAK_SYNC_RECONCILE_INTERVAL"); v != "" {
@@ -476,6 +486,9 @@ func (c *Config) validate() error {
 	}
 	if c.Sync.ReconcileInterval < 0 {
 		return fmt.Errorf("sync.reconcile_interval must not be negative")
+	}
+	if c.Sync.ReconcilePageBudget < 0 {
+		return fmt.Errorf("sync.reconcile_page_budget must not be negative")
 	}
 	if c.MaxUploadBytes < 0 {
 		return fmt.Errorf("max_upload_bytes must not be negative")

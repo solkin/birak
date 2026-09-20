@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 var ErrBusy = errors.New("file is being written")
@@ -22,6 +24,30 @@ type rootState struct {
 	writers map[*os.File]*writer
 	hooks   Hooks
 	notify  func()
+
+	// Every commit on a volume queues behind mu, so how long it is held is the
+	// one number that explains write latency under load — and the only way to
+	// tell "this node is slow" from "this node is serialized".
+	lockCount atomic.Int64
+	lockHeld  atomic.Int64 // nanoseconds
+	lockWorst atomic.Int64 // nanoseconds
+}
+
+// LockLoad reports how much time commits have spent holding a volume's lock.
+type LockLoad struct {
+	Acquisitions int64
+	Held         time.Duration
+	Worst        time.Duration
+}
+
+// LockStats returns the accumulated hold time for a volume.
+func LockStats(dir string) LockLoad {
+	r := root(dir)
+	return LockLoad{
+		Acquisitions: r.lockCount.Load(),
+		Held:         time.Duration(r.lockHeld.Load()),
+		Worst:        time.Duration(r.lockWorst.Load()),
+	}
 }
 
 var roots sync.Map
@@ -54,7 +80,22 @@ func root(dir string) *rootState {
 func Lock(dir string) func() {
 	r := root(dir)
 	r.mu.Lock()
-	return r.mu.Unlock
+	return r.release(time.Now())
+}
+
+// release unlocks and accounts for the time the lock was held.
+func (r *rootState) release(acquired time.Time) func() {
+	return func() {
+		held := time.Since(acquired).Nanoseconds()
+		r.mu.Unlock()
+		r.lockCount.Add(1)
+		r.lockHeld.Add(held)
+		for worst := r.lockWorst.Load(); held > worst; worst = r.lockWorst.Load() {
+			if r.lockWorst.CompareAndSwap(worst, held) {
+				break
+			}
+		}
+	}
 }
 
 func Do(dir string, fn func() error) error {
@@ -88,9 +129,11 @@ type Hooks struct {
 	Validate     func() error
 	CheckSources func([]string) error
 	Begin        func([]string) error
-	// Finish indexes the result. Every commit fsyncs what it publishes before
-	// publishing it, so Finish is told the bytes are durable and need no second
-	// fsync, and is handed whatever the commit already hashed.
+	// Finish indexes the result. Every commit fsyncs both what it publishes and
+	// the directories it changes before Finish runs, so Finish is told the
+	// result is durable and needs no second pass over the disk, and is handed
+	// whatever the commit already hashed. A new commit path that publishes
+	// without flushing owes both of those before it calls Finish.
 	Finish func(paths []string, published map[string]Published) error
 }
 
@@ -284,11 +327,12 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 	// from the current one, so it is not held across a whole file copy.
 	r := root(dir)
 	r.mu.Lock()
+	release := r.release(time.Now())
 	locked := true
 	unlock := func() {
 		if locked {
 			locked = false
-			r.mu.Unlock()
+			release()
 		}
 	}
 	defer unlock()

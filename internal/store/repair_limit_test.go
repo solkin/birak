@@ -97,3 +97,39 @@ func TestRepairQueueCapCanBeDisabled(t *testing.T) {
 		}
 	}
 }
+
+// Queue summaries are remembered so a large backlog is not rescanned on every
+// scrape — but a caller must still read back what it just wrote.
+func TestQueueSummaryFollowsTheQueue(t *testing.T) {
+	s := limitStore(t)
+	for i := 0; i < 3; i++ {
+		if err := s.EnqueueChange("peer", queued(fmt.Sprintf("f-%d", i)), "poll"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats, err := s.RepairQueueStats()
+	if err != nil || stats.Total != 3 {
+		t.Fatalf("stats = %+v, %v", stats, err)
+	}
+	if n, err := s.PendingRepairCount("peer"); err != nil || n != 3 {
+		t.Fatalf("pending = %d, %v", n, err)
+	}
+
+	if err := s.ResolveRepair("peer", "f-1"); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = s.RepairQueueStats()
+	if err != nil || stats.Total != 2 {
+		t.Fatalf("a resolved item was still summarised: %+v, %v", stats, err)
+	}
+	if n, err := s.PendingRepairCount("peer"); err != nil || n != 2 {
+		t.Fatalf("a resolved item was still counted: %d, %v", n, err)
+	}
+
+	if err := s.EnqueueChange("peer", queued("f-9"), "poll"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.PendingRepairCount("peer"); err != nil || n != 3 {
+		t.Fatalf("a new item was not counted: %d, %v", n, err)
+	}
+}

@@ -152,6 +152,7 @@ sync:
   scan_interval: 5m           # stat-only sweep; no longer re-reads file bytes
   scrub_bytes_per_second: 8388608  # continuous checksum verification budget; 0 disables
   max_repair_queue: 100000    # queued entries per peer; 0 = unlimited
+  reconcile_page_budget: 64   # manifest pages per pass; 0 = the whole manifest at once
   debounce_window: 300ms
   repair_interval: 30s      # how often failed changes are retried
   reconcile_interval: 1h    # full manifest comparison with every peer
@@ -219,6 +220,7 @@ export BIRAK_HTTP_ENABLED=true
 | `sync.scan_interval` | `BIRAK_SYNC_SCAN_INTERVAL` | `5m` | Stat-only sweep interval; indexes anything whose size or timestamp moved |
 | `sync.scrub_bytes_per_second` | `BIRAK_SYNC_SCRUB_BYTES_PER_SECOND` | `8388608` | Continuous checksum verification budget; 0 disables verification |
 | `sync.max_repair_queue` | `BIRAK_SYNC_MAX_REPAIR_QUEUE` | `100000` | Queued repair entries per peer; 0 = unlimited |
+| `sync.reconcile_page_budget` | `BIRAK_SYNC_RECONCILE_PAGE_BUDGET` | `64` | Manifest pages per comparison pass; 0 compares the whole manifest at once |
 | `sync.debounce_window` | `BIRAK_SYNC_DEBOUNCE_WINDOW` | `300ms` | Delay before processing file events |
 | `sync.repair_interval` | `BIRAK_SYNC_REPAIR_INTERVAL` | `30s` | Rescan interval for new or due repairs; free workers also refill on completion |
 | `sync.reconcile_interval` | `BIRAK_SYNC_RECONCILE_INTERVAL` | `1h` | Full manifest comparison interval (0 disables — not recommended) |
@@ -393,7 +395,7 @@ sftp> rm old-file.txt
 5. The cursor advances only once the whole page is durably recorded in the queue. It means "read this far", never "applied": cancellation or a queue write failure prevents advancement, and a full queue stops the cursor rather than dropping work.
 6. A new node starts at `since=0`, receiving both live files and deletion history.
 
-Each peer may hold at most `max_repair_queue` queued names. A full queue refuses new names, which stops that peer's cursor instead of growing the database without bound; entries already queued can still record newer state, and the backlog is visible in `/status`. Repairs retry with exponential backoff. A queued deletion survives loss of the source's metadata and can be applied while that source is offline. A persistent permission, disk, or connectivity failure stays visible in `/status`. A valid peer name blocked by a local symlink also remains queued until the obstruction is resolved; malformed or misrouted `/meta` replies cannot erase accepted work. Explicitly ignored names are skipped. **Full reconciliation** compares peer manifests every `reconcile_interval`; `0` disables it.
+Each peer may hold at most `max_repair_queue` queued names. A full queue refuses new names, which stops that peer's cursor instead of growing the database without bound; entries already queued can still record newer state, and the backlog is visible in `/status`. A manifest comparison resumes where the last one stopped and consumes at most `reconcile_page_budget` pages per pass, so a large tree is compared continuously instead of in a burst every `reconcile_interval`. The position is per peer and persisted; finishing a cycle starts the next one from the beginning. Repairs retry with exponential backoff. A queued deletion survives loss of the source's metadata and can be applied while that source is offline. A persistent permission, disk, or connectivity failure stays visible in `/status`. A valid peer name blocked by a local symlink also remains queued until the obstruction is resolved; malformed or misrouted `/meta` replies cannot erase accepted work. Explicitly ignored names are skipped. **Full reconciliation** compares peer manifests every `reconcile_interval`; `0` disables it.
 
 The apply loop runs up to `max_concurrent_downloads` transfers, with at most one active operation per name and peer, so every transfer for a peer comes out of one budget. A slow transfer leaves the other slots available, including for work queued while it runs. Newly discovered work wakes the loop at once; completed workers immediately pick up the next due entry, and periodic rescans catch elapsed backoffs. A retry starts at half a second and doubles to a fifteen-minute ceiling. Queue write failures pause new dispatch until the next rescan. Shutdown waits for workers; unfinished operations remain in SQLite for restart.
 
@@ -557,10 +559,17 @@ birak_last_scan_seconds 0.8
 birak_peer_lag{peer="http://192.168.1.2:9100"} 0
 birak_peer_healthy{peer="http://192.168.1.2:9100"} 1
 birak_peer_pending_repairs{peer="http://192.168.1.2:9100"} 0
+birak_commit_lock_held_seconds_total 41.7
+birak_commit_lock_acquisitions_total 9182
+birak_commit_lock_worst_seconds 0.098
 ```
 
 Alert on `birak_peer_healthy`, `birak_repair_oldest_seconds`,
-`birak_quarantined_files` and `birak_last_scan_seconds`.
+`birak_quarantined_files` and `birak_last_scan_seconds`. The commit-lock
+counters answer the question a latency graph cannot: every write on a volume
+queues behind one lock, so `rate(birak_commit_lock_held_seconds_total[5m])`
+approaching 1 means the node is serialized rather than slow — a difference that
+is fixed in completely different places.
 `birak_skipped_entries_total` counts peer entries this node decided never to
 apply — malformed metadata, or names excluded by an `ignore` rule that differs
 between nodes. Those leave no repair row, so a node that diverges this way is
@@ -588,10 +597,12 @@ readinessProbe:
 
 ### Logging
 
-`log_level` defaults to `info`. Records are written synchronously to stdout, and
-`debug` emits one per indexed file and per cursor move, so on a busy node it
-costs throughput — and a log consumer that stops reading stalls the daemon with
-it. Raise the level to `debug` for diagnosis, not as a standing setting.
+`log_level` defaults to `info`; `debug` emits a record per indexed file and per
+cursor move. Writing is asynchronous and bounded: records go to a writer
+goroutine through a fixed queue, and a log consumer that stops reading makes the
+daemon drop records and count them rather than stall. Dropped records are
+reported in the log and on exit. That makes `debug` safe to turn on for
+diagnosis, though it still costs throughput on a busy node.
 
 Set `cluster_secret` and every endpoint above except `/healthz` and `/readyz` requires the `X-Birak-Secret` header. Peers send it automatically. Without it the sync API serves every file to anyone who can reach `listen_addr`, so either set the secret or keep the port off any untrusted network.
 

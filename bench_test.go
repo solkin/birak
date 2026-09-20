@@ -246,6 +246,7 @@ func TestBenchSyncUnderLoad(t *testing.T) {
 	report.writes = load.writes.Load()
 	report.readyFailures = load.notReady.Load()
 	report.scrubbed = benchScrubProgress(t, nodeA)
+	report.lockLoad = fileops.LockStats(nodeA.syncDir)
 
 	// --- Phase 3: a peer dies, falls behind, and catches up ----------------
 	benchAwait(t, 30*time.Minute, "node B to catch up before the outage", func() bool {
@@ -633,6 +634,7 @@ type benchReport struct {
 	options            benchOptions
 	floor              time.Duration
 	quietWrite         benchStats
+	lockLoad           fileops.LockLoad
 	largeWrite         benchStats
 	seedBytes          int64
 	seedWrite          time.Duration
@@ -646,6 +648,13 @@ type benchReport struct {
 	writesDuringOutage int64
 	convergence        time.Duration
 	convergedFiles     int64
+}
+
+func benchPerAcquisition(load fileops.LockLoad) time.Duration {
+	if load.Acquisitions == 0 {
+		return 0
+	}
+	return (load.Held / time.Duration(load.Acquisitions)).Round(time.Microsecond)
 }
 
 func (r *benchReport) String() string {
@@ -667,6 +676,7 @@ func (r *benchReport) String() string {
   write, under load    %s
   large-file overwrite %s
   commit-lock wait     %s
+  commit-lock held     %s over %d acquisitions (avg %s, worst %s)
   writes accepted      %d in %s (%s)
   readiness failures   %d
   scrub                %s
@@ -685,6 +695,8 @@ func (r *benchReport) String() string {
 		r.floor.Round(time.Microsecond),
 		r.indexTime.Round(time.Millisecond), r.indexedFiles, rate(r.indexedFiles, r.indexTime),
 		r.quietWrite, r.write, r.largeWrite, r.lock,
+		r.lockLoad.Held.Round(time.Millisecond), r.lockLoad.Acquisitions,
+		benchPerAcquisition(r.lockLoad), r.lockLoad.Worst.Round(time.Microsecond),
 		r.writes, r.options.duration, rate(r.writes, r.options.duration),
 		r.readyFailures,
 		r.scrubbed,

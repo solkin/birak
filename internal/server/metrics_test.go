@@ -64,6 +64,9 @@ func TestMetricsExposeWhatOperatorsAlertOn(t *testing.T) {
 		"birak_peer_pending_repairs{peer=",
 		"# TYPE birak_skipped_entries_total counter",
 		"# TYPE birak_peer_lag gauge",
+		"birak_commit_lock_held_seconds_total",
+		"birak_commit_lock_acquisitions_total",
+		"birak_commit_lock_worst_seconds",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing %q in:\n%s", want, body)

@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/birak/birak/internal/fileops"
 )
 
 type skipCounter interface{ SkippedEntries() int64 }
@@ -61,6 +63,17 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			out.gauge("birak_peer_last_reconcile_seconds", "Time since the last manifest comparison with a peer.", labels, float64(peer.LastReconcileMS)/1000)
 		}
 	}
+	// Write throughput on a volume is bounded by how long its one commit lock
+	// is held. Without this an operator cannot tell a slow disk from a
+	// serialized node, which are fixed in completely different places.
+	lock := fileops.LockStats(s.syncDir)
+	out.counter("birak_commit_lock_held_seconds_total",
+		"Time commits have spent holding this volume's lock.", lock.Held.Seconds())
+	out.counter("birak_commit_lock_acquisitions_total",
+		"Commits that have taken this volume's lock.", float64(lock.Acquisitions))
+	out.gauge("birak_commit_lock_worst_seconds",
+		"Longest single hold of this volume's lock.", nil, lock.Worst.Seconds())
+
 	out.gauge("birak_uptime_seconds", "Time since this process started serving.", nil, time.Since(started).Seconds())
 
 	io.WriteString(w, out.body.String())

@@ -502,8 +502,13 @@ func (w *Watcher) refreshFileLocked(name string, opts indexOptions) error {
 			return err
 		}
 	}
-	if err := fileops.SyncSurvivingParent(path, w.dir); err != nil {
-		return err
+	// The directory entry needs the same treatment as the bytes: a commit has
+	// already flushed the directories it changed, and repeating that here was
+	// the second of two fsyncs held under the volume's one lock.
+	if !opts.durable {
+		if err := fileops.SyncSurvivingParent(path, w.dir); err != nil {
+			return err
+		}
 	}
 	_, err = w.store.PutLocal(store.FileMeta{Name: ev.Name, ModTime: ev.ModTime, Size: ev.Size, Hash: ev.Hash, Deleted: ev.Deleted})
 	return err

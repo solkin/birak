@@ -94,6 +94,15 @@ type Store struct {
 	epoch         string
 	incarnation   string
 	repairLimit   int64 // 0 disables the cap; protected by mu
+
+	// Queue summaries are read by monitoring, not by replication, and cost a
+	// scan. They are remembered under their own mutex so a scrape never queues
+	// behind a write, and dropped whenever the queue changes.
+	statsMu      sync.Mutex
+	statsCache   RepairStats
+	statsValid   bool
+	statsGen     uint64
+	pendingCache map[string]int64
 }
 
 // SetRepairLimit changes the per-peer queue cap. Zero disables it.
@@ -602,6 +611,7 @@ func (s *Store) PruneCursors(keep []string) error {
 	}
 	in := "(" + strings.Join(placeholders, ",") + ")"
 	_, err := s.db.Exec("DELETE FROM cursors WHERE peer_id NOT IN "+in, args...)
+	s.invalidateQueueStats()
 	return err
 }
 
@@ -802,7 +812,11 @@ func (s *Store) enqueueRepair(peerID, name string, version int64, reason string,
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateQueueStats()
+	return nil
 }
 
 // DueRepairs returns repair items for a peer whose backoff has elapsed.
@@ -842,6 +856,7 @@ func (s *Store) ResolveRepair(peerID, name string) error {
 	defer s.mu.Unlock()
 
 	_, err := s.db.Exec("DELETE FROM repair_queue WHERE peer_id = ? AND name = ?", peerID, name)
+	s.invalidateQueueStats()
 	return err
 }
 
@@ -850,6 +865,7 @@ func (s *Store) ResolveRepairItem(item RepairItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec("DELETE FROM repair_queue WHERE peer_id=? AND name=? AND revision=?", item.PeerID, item.Name, item.Revision)
+	s.invalidateQueueStats()
 	return err
 }
 
@@ -865,6 +881,7 @@ func (s *Store) DeferRepair(peerID, name string, retryAfter time.Duration, cause
 		SET attempts = attempts + 1, next_attempt = ?, last_error = ?
 		WHERE peer_id = ? AND name = ?
 	`, time.Now().Add(retryAfter).UnixNano(), cause, peerID, name)
+	s.invalidateQueueStats()
 	return err
 }
 
@@ -873,11 +890,52 @@ func (s *Store) DeferRepairItem(item RepairItem, retryAfter time.Duration, cause
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`UPDATE repair_queue SET attempts=attempts+1,next_attempt=?,last_error=? WHERE peer_id=? AND name=? AND revision=?`, time.Now().Add(retryAfter).UnixNano(), cause, item.PeerID, item.Name, item.Revision)
+	s.invalidateQueueStats()
 	return err
 }
 
 // RepairQueueStats summarizes outstanding repairs across all peers.
+//
+// Both /status and /metrics ask for this, monitoring scrapes them on a timer,
+// and answering costs a scan of the whole queue — worst exactly when the queue
+// is large, which is when it is looked at most. The answer is therefore
+// remembered until the queue changes, so a stuck backlog is scanned once rather
+// than on every scrape. Any write invalidates it, so a caller still reads back
+// what it just wrote.
 func (s *Store) RepairQueueStats() (RepairStats, error) {
+	s.statsMu.Lock()
+	cached, valid, generation := s.statsCache, s.statsValid, s.statsGen
+	s.statsMu.Unlock()
+	if valid {
+		return cached, nil
+	}
+
+	// Never hold a lock across a database call: a writer finishing its
+	// transaction has to be able to invalidate this immediately.
+	st, err := s.queryRepairStats()
+	if err != nil {
+		return st, err
+	}
+	s.statsMu.Lock()
+	if s.statsGen == generation {
+		s.statsCache, s.statsValid = st, true
+	}
+	s.statsMu.Unlock()
+	return st, nil
+}
+
+// invalidateQueueStats is called by every path that changes the repair queue.
+// The generation counter is what makes a slow reader unable to store an answer
+// that was already out of date when it arrived.
+func (s *Store) invalidateQueueStats() {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	s.statsGen++
+	s.statsValid = false
+	clear(s.pendingCache)
+}
+
+func (s *Store) queryRepairStats() (RepairStats, error) {
 	var st RepairStats
 	var oldest sql.NullInt64
 	err := s.db.QueryRow(`
@@ -955,8 +1013,27 @@ func (s *Store) ListNonDeleted(afterName string, limit int) ([]FileMeta, error) 
 }
 
 // PendingRepairCount returns how many items are queued for a peer, due or not.
+// Remembered and invalidated on the same terms as RepairQueueStats.
 func (s *Store) PendingRepairCount(peerID string) (int64, error) {
+	s.statsMu.Lock()
+	count, ok := s.pendingCache[peerID]
+	generation := s.statsGen
+	s.statsMu.Unlock()
+	if ok {
+		return count, nil
+	}
+
 	var n int64
-	err := s.db.QueryRow("SELECT COUNT(*) FROM repair_queue WHERE peer_id = ?", peerID).Scan(&n)
-	return n, err
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM repair_queue WHERE peer_id = ?", peerID).Scan(&n); err != nil {
+		return 0, err
+	}
+	s.statsMu.Lock()
+	if s.statsGen == generation {
+		if s.pendingCache == nil {
+			s.pendingCache = make(map[string]int64)
+		}
+		s.pendingCache[peerID] = n
+	}
+	s.statsMu.Unlock()
+	return n, nil
 }
