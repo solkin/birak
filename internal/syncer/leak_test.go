@@ -154,4 +154,3 @@ func TestDownloadSlotsAreBoundedByPeerCount(t *testing.T) {
 		t.Fatalf("%d download budgets for one peer", len(s.downloads))
 	}
 }
-
