@@ -6,7 +6,14 @@ on:
       - "v*"
 
 jobs:
+  # A tag used to publish :latest whether or not the tests passed on that
+  # commit — the Test workflow runs on branch pushes and this one on tags, and
+  # nothing connected them. Now the image is built only from a green commit.
+  test:
+    uses: ./.github/workflows/test.yaml
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

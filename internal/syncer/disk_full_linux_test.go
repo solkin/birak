@@ -118,7 +118,20 @@ func TestDiskFullReplicationRecoversAfterReopen(t *testing.T) {
 				if syncErr != nil || state.Version == 0 || count != 1 {
 					t.Fatalf("data-full work not durably queued: err=%v cursor=%+v pending=%d", syncErr, state, count)
 				}
+				// Reading the stream only records the work. The transfer — and
+				// so the full volume — is met when the queue is applied, which
+				// has to happen while the volume is still full.
 				items, err := db.DueRepairs(peer.URL, 10)
+				if err != nil || len(items) != 1 {
+					t.Fatalf("polled work was not queued: %+v %v", items, err)
+				}
+				if err := dest.repairOne(context.Background(), peer.URL, items[0]); err != nil {
+					t.Fatalf("a full volume broke queue bookkeeping: %v", err)
+				}
+				// The failed attempt is deferred; wait out its first retry delay
+				// so the row is visible again with the error it recorded.
+				time.Sleep(minRepairBackoff + 200*time.Millisecond)
+				items, err = db.DueRepairs(peer.URL, 10)
 				if err != nil || len(items) != 1 || !strings.Contains(items[0].LastError, syscall.ENOSPC.Error()) {
 					t.Fatalf("download did not encounter real ENOSPC: %+v %v", items, err)
 				}
@@ -149,6 +162,9 @@ func TestDiskFullReplicationRecoversAfterReopen(t *testing.T) {
 				if _, err := reopened.syncOnce(context.Background(), peer.URL); err != nil {
 					t.Fatalf("replay after disk-full: %v", err)
 				}
+				// Replaying the stream records the change; applying it is what
+				// puts the bytes back.
+				drainQueued(t, reopened, peer.URL)
 			}
 			assertNamespaceBytes(t, reopened, remote.Name, payload)
 			actual, err := reopened.store.GetFile(remote.Name)
