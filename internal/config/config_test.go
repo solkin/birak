@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,6 +51,31 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.Gateways.S3.AccessKey != "env-key" {
 		t.Fatalf("expected env-key, got %s", cfg.Gateways.S3.AccessKey)
+	}
+}
+
+func TestLoad_S3Buckets(t *testing.T) {
+	path := writeYAML(t, `
+gateways:
+  s3:
+    enabled: true
+    buckets: [files, backups]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := strings.Join(cfg.Gateways.S3.Buckets, ","); got != "files,backups" {
+		t.Fatalf("expected files,backups from YAML, got %q", got)
+	}
+
+	t.Setenv("BIRAK_S3_BUCKETS", " media, ,backups ,")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := strings.Join(cfg.Gateways.S3.Buckets, ","); got != "media,backups" {
+		t.Fatalf("expected media,backups from env, got %q", got)
 	}
 }
 

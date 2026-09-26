@@ -110,6 +110,9 @@ type S3GatewayConfig struct {
 	AccessKey  string `yaml:"access_key"`
 	SecretKey  string `yaml:"secret_key"`
 	Domain     string `yaml:"domain"`
+	// Buckets are created at startup when missing, so that they exist before a
+	// client that cannot create them, or should not, first asks for them.
+	Buckets []string `yaml:"buckets"`
 }
 
 // SyncConfig holds sync-specific tuning parameters.
@@ -327,6 +330,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("BIRAK_S3_DOMAIN"); v != "" {
 		c.Gateways.S3.Domain = v
 	}
+	if v := os.Getenv("BIRAK_S3_BUCKETS"); v != "" {
+		c.Gateways.S3.Buckets = splitList(v)
+	}
 
 	// WebDAV gateway.
 	if v := os.Getenv("BIRAK_WEBDAV_ENABLED"); v != "" {
@@ -410,6 +416,18 @@ func applyEnv(c *Config) {
 			}
 		}
 	}
+}
+
+// splitList reads a comma-separated list, dropping blanks around and between
+// its items.
+func splitList(s string) []string {
+	var items []string
+	for _, item := range strings.Split(s, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
 }
 
 func parseBool(s string) bool {

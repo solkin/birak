@@ -246,6 +246,9 @@ func run(configPath string) error {
 			},
 			logger,
 		)
+		if err := s3Gateway.CreateBuckets(cfg.Gateways.S3.Buckets); err != nil {
+			return fmt.Errorf("create buckets: %w", err)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

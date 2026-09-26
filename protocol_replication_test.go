@@ -18,17 +18,8 @@ import (
 )
 
 func TestMultipartReplicationPublishesOnlyCompletedObject(t *testing.T) {
-	reserve := func() string {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		ln.Close()
-		return addr
-	}
-	source := newTestNodeWithAddr(t, "upload-source", reserve(), nil)
-	peer := newTestNodeWithAddr(t, "upload-peer", reserve(), []string{"http://" + source.addr})
+	source := newTestNodeWithAddr(t, "upload-source", reserveAddr(t), nil)
+	peer := newTestNodeWithAddr(t, "upload-peer", reserveAddr(t), []string{"http://" + source.addr})
 	if err := os.Mkdir(filepath.Join(source.syncDir, "bucket"), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -37,40 +28,8 @@ func TestMultipartReplicationPublishesOnlyCompletedObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := reserve()
-	gw := s3.New(source.syncDir, nil, s3.Config{ListenAddr: addr, Multipart: store}, source.logger)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- gw.Start(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
-		defer stop()
-		if err := gw.Stop(ctx); err != nil {
-			t.Error(err)
-		}
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Error(err)
-			}
-		case <-ctx.Done():
-			t.Error("S3 did not stop")
-		}
-	})
+	addr := serveS3(t, source, store)
 	client := &http.Client{Timeout: 5 * time.Second}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		resp, err := client.Get("http://" + addr + "/")
-		if err == nil {
-			resp.Body.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("S3 did not start")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 	request := func(method, path, body string) ([]byte, http.Header) {
 		t.Helper()
 		req, err := http.NewRequest(method, "http://"+addr+path, strings.NewReader(body))
@@ -141,5 +100,122 @@ func assertNoStagingMetadata(t *testing.T, node *testNode) {
 				t.Fatalf("scratch indexed on %s: %s", node.id, entry.Name)
 			}
 		}
+	}
+}
+
+// DeleteObjects deletes each key through the same commit as DeleteObject, so
+// every deletion of a batch is indexed and replicated like any other, and the
+// directories it empties are cleaned up on both nodes.
+func TestDeleteObjectsReplicatesEveryDeletion(t *testing.T) {
+	source := newTestNodeWithAddr(t, "batch-source", reserveAddr(t), nil)
+	peer := newTestNodeWithAddr(t, "batch-peer", reserveAddr(t), []string{"http://" + source.addr})
+	bucket := filepath.Join(source.syncDir, "bucket")
+	if err := os.MkdirAll(filepath.Join(bucket, "nested"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	gone := []string{"one.txt", "two.txt", "nested/three.txt"}
+	for _, name := range append([]string{"keep.txt"}, gone...) {
+		writeFile(t, bucket, name, "contents of "+name)
+	}
+	waitForSync(t, 10*time.Second, func() bool {
+		for _, name := range append([]string{"keep.txt"}, gone...) {
+			if !fileExists(filepath.Join(peer.syncDir, "bucket"), name) {
+				return false
+			}
+		}
+		return true
+	})
+
+	addr := serveS3(t, source, nil)
+	var body strings.Builder
+	body.WriteString("<Delete>")
+	for _, name := range gone {
+		body.WriteString("<Object><Key>" + name + "</Key></Object>")
+	}
+	body.WriteString("</Delete>")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post("http://"+addr+"/bucket?delete", "application/xml", strings.NewReader(body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Deleted []struct {
+			Key string `xml:"Key"`
+		} `xml:"Deleted"`
+		Errors []struct {
+			Key  string `xml:"Key"`
+			Code string `xml:"Code"`
+		} `xml:"Error"`
+	}
+	if err := xml.Unmarshal(data, &result); err != nil || resp.StatusCode != http.StatusOK ||
+		len(result.Deleted) != len(gone) || len(result.Errors) != 0 {
+		t.Fatalf("DeleteObjects: %d %s %v", resp.StatusCode, data, err)
+	}
+
+	for _, name := range gone {
+		waitForDeletionMetadata(t, "bucket/"+name, source, peer)
+	}
+	waitForSync(t, 10*time.Second, func() bool {
+		return !fileExists(source.syncDir, "bucket/nested") && !fileExists(peer.syncDir, "bucket/nested")
+	})
+	if got := readFile(t, filepath.Join(peer.syncDir, "bucket"), "keep.txt"); got != "contents of keep.txt" {
+		t.Fatalf("an object not named changed on the peer: %q", got)
+	}
+}
+
+// reserveAddr returns a loopback address that nothing listens on yet.
+func reserveAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	return addr
+}
+
+// serveS3 runs an S3 gateway over a node's files until the test ends and
+// returns its address once it answers.
+func serveS3(t *testing.T, node *testNode, store *multipart.Store) string {
+	t.Helper()
+	addr := reserveAddr(t)
+	gw := s3.New(node.syncDir, nil, s3.Config{ListenAddr: addr, Multipart: store}, node.logger)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- gw.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if err := gw.Stop(ctx); err != nil {
+			t.Error(err)
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-ctx.Done():
+			t.Error("S3 did not stop")
+		}
+	})
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := client.Get("http://" + addr + "/")
+		if err == nil {
+			resp.Body.Close()
+			return addr
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("S3 did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

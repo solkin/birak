@@ -129,7 +129,7 @@ func (g *Gateway) extractBucketFromHost(host string) string {
 // Path-style:
 //
 //	/              → ListBuckets
-//	/{bucket}      → bucket operations (HEAD/GET/PUT/DELETE)
+//	/{bucket}      → bucket operations (HEAD/GET/PUT/DELETE; POST ?delete deletes objects)
 //	/{bucket}/{key} → object operations (HEAD/GET/PUT/DELETE)
 //
 // Virtual-hosted-style (bucket in Host header subdomain):
@@ -211,6 +211,10 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 			writeS3Error(w, http.StatusNotFound, "NoSuchBucketPolicy", "The bucket policy does not exist.")
 			return
 		}
+		if _, ok := query["delete"]; ok && r.Method == http.MethodPost {
+			g.handleDeleteObjects(w, r, bucket)
+			return
+		}
 
 		// Bucket-level operations.
 		switch r.Method {
@@ -228,16 +232,8 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	for _, segment := range strings.Split(key, "/") {
-		if gateway.IsScratchFile(segment) {
-			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
-			return
-		}
-	}
-
-	// Check ignore patterns on key.
-	if watcher.ShouldIgnore(bucket+"/"+key, g.ignorePatterns) {
-		writeS3Error(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
+	if failure := g.keyFailure(bucket, key); failure != nil {
+		writeS3Error(w, failure.status, failure.code, failure.message)
 		return
 	}
 
@@ -286,6 +282,21 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 	default:
 		writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "Method not allowed")
 	}
+}
+
+// keyFailure holds a key to the namespace rules before any operation looks at
+// it: a scratch name is refused, and an ignored one does not exist. The route
+// checks the key of the URL; DeleteObjects checks each key of its body.
+func (g *Gateway) keyFailure(bucket, key string) *objectFailure {
+	for _, segment := range strings.Split(key, "/") {
+		if gateway.IsScratchFile(segment) {
+			return &objectFailure{http.StatusBadRequest, "InvalidArgument", "Invalid key"}
+		}
+	}
+	if watcher.ShouldIgnore(bucket+"/"+key, g.ignorePatterns) {
+		return &objectFailure{http.StatusNotFound, "NoSuchKey", "The specified key does not exist."}
+	}
+	return nil
 }
 
 // authenticate checks the request for valid credentials.

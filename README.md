@@ -162,6 +162,7 @@ gateways:
     listen_addr: ":9200"
     access_key: "admin"
     secret_key: "secret123"
+    buckets: ["backups"]       # created at startup when missing
   webdav:
     enabled: true
     listen_addr: ":9300"
@@ -183,7 +184,7 @@ The `ignore`, `multipart`, and `sync` sections are optional — defaults will be
 
 ### Environment variables
 
-Every setting has a corresponding `BIRAK_*` environment variable. Useful for Docker and CI/CD. List values (peers, ignore) are comma-separated.
+Every setting has a corresponding `BIRAK_*` environment variable. Useful for Docker and CI/CD. List values (peers, ignore, S3 buckets) are comma-separated.
 
 ```bash
 export BIRAK_NODE_ID="node-1"
@@ -228,6 +229,7 @@ export BIRAK_HTTP_ENABLED=true
 | `gateways.s3.listen_addr` | `BIRAK_S3_LISTEN_ADDR` | `:9200` | S3 Gateway address |
 | `gateways.s3.access_key` | `BIRAK_S3_ACCESS_KEY` | _(empty)_ | S3 access key |
 | `gateways.s3.secret_key` | `BIRAK_S3_SECRET_KEY` | _(empty)_ | S3 secret key |
+| `gateways.s3.buckets` | `BIRAK_S3_BUCKETS` | `[]` | Buckets to create at startup when missing (comma-separated in env) |
 | `gateways.webdav.enabled` | `BIRAK_WEBDAV_ENABLED` | `false` | Enable WebDAV Gateway |
 | `gateways.webdav.listen_addr` | `BIRAK_WEBDAV_LISTEN_ADDR` | `:9300` | WebDAV Gateway address |
 | `gateways.webdav.username` | `BIRAK_WEBDAV_USERNAME` | _(empty)_ | WebDAV username |
@@ -283,6 +285,7 @@ S3-compatible API for use with AWS CLI, SDKs, and any S3 client.
 | `PutObject` | Upload file (PUT /{bucket}/{key}) |
 | `GetObject` | Download file (GET /{bucket}/{key}) |
 | `DeleteObject` | Delete file (DELETE /{bucket}/{key}) |
+| `DeleteObjects` | Delete up to 1000 files (POST /{bucket}?delete) |
 | `HeadObject` | File metadata (HEAD /{bucket}/{key}) |
 | `CreateMultipartUpload` | Start multipart upload (POST /{bucket}/{key}?uploads) |
 | `UploadPart` | Upload a part (PUT /{bucket}/{key}?partNumber={n}&uploadId={id}) |
@@ -307,6 +310,25 @@ aws --endpoint-url http://localhost:9200 s3 rm s3://photos/2024/image.jpg
 `sync_dir/.birak/` is reserved for Birak's own multipart staging state. It is
 hidden from every gateway and from replication, and cannot be read or written
 through any protocol.
+
+Buckets listed in `gateways.s3.buckets` (`BIRAK_S3_BUCKETS`) are created at
+startup when missing, so they exist before a client that does not create buckets,
+such as a backup tool, first uses one. A name that cannot be a bucket, including
+an ignored one, stops startup. A bucket is a directory: when deletions, local or
+replicated from a peer, leave it empty, sync-aware cleanup removes it, and a
+configured bucket is created again at the next start.
+
+#### S3 Batch Deletes
+
+DeleteObjects (`POST /{bucket}?delete`) deletes up to 1000 keys in one request,
+each exactly as DeleteObject would: a missing key counts as deleted, a key naming
+a directory removes nothing, emptied parent directories are cleaned up, and every
+deletion replicates like any other. A key that cannot be deleted — longer than
+S3's 1024 bytes, outside the bucket, a scratch or ignored name, or one the server
+cannot look at — is reported in the result without failing the others; `Quiet`
+leaves the deleted keys out. `Content-MD5` and a concrete `x-amz-content-sha256`
+are enforced when present, so a captured signed request cannot be replayed with
+other keys. `VersionId` is ignored, as buckets are not versioned.
 
 #### S3 Multipart Uploads
 
