@@ -215,26 +215,72 @@ func (w *Watcher) SetRepairPeers(peers []string) {
 	w.repairPeers = append([]string(nil), peers...)
 }
 func (w *Watcher) NeedsRepair(name string) bool {
-	w.statusMu.Lock()
-	defer w.statusMu.Unlock()
-	return w.integrity[name]
+	return w.store.IsQuarantined(name)
 }
-func (w *Watcher) clearIntegrity(name string) {
-	w.statusMu.Lock()
-	defer w.statusMu.Unlock()
-	if w.integrity[name] {
-		delete(w.integrity, name)
-		w.requestRescan()
+func (w *Watcher) clearIntegrity(name string, verifiedKey ...string) error {
+	key := ""
+	if len(verifiedKey) > 0 {
+		key = verifiedKey[0]
 	}
+	if !w.NeedsRepair(name) && !w.store.IsDamagedObject(key) {
+		return nil
+	}
+	if key == "" {
+		// Removing a quarantined name must also survive power loss before its
+		// fence is dropped, otherwise the damaged name can reappear unfenced.
+		if err := fileops.SyncSurvivingParent(filepath.Join(w.dir, filepath.FromSlash(name)), w.dir); err != nil {
+			return err
+		}
+	}
+	if err := w.store.ClearQuarantine(name, key); err != nil {
+		return err
+	}
+	w.requestRescan()
+	return nil
+}
+
+func (w *Watcher) checkReadLocked(path string, info os.FileInfo) error {
+	key, err := fileops.GenerationKey(path, info)
+	if err != nil {
+		return err
+	}
+	if w.store.IsDamagedObject(key) {
+		return fileops.ErrUnreadable
+	}
+	for _, name := range w.store.QuarantinedNames() {
+		damaged := filepath.Join(w.dir, filepath.FromSlash(name))
+		if path == damaged {
+			return fileops.ErrUnreadable
+		}
+		// A symlink or hard link must not bypass a name's quarantine.
+		if other, err := os.Stat(damaged); err == nil && os.SameFile(other, info) {
+			return fileops.ErrUnreadable
+		}
+	}
+	return nil
 }
 func (w *Watcher) quarantine(meta *store.FileMeta) error {
 	err := fmt.Errorf("%w: %s", ErrIntegrity, meta.Name)
 	// The name is recorded and repaired from a peer; it is reported as a count
 	// rather than as this node's last error, so one damaged file does not claim
 	// the whole node is faulty.
-	w.statusMu.Lock()
-	w.integrity[meta.Name] = true
-	w.statusMu.Unlock()
+	fileops.RevokeReadersLocked(w.dir, filepath.Join(w.dir, filepath.FromSlash(meta.Name)))
+	path := filepath.Join(w.dir, filepath.FromSlash(meta.Name))
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return statErr
+	}
+	key, keyErr := fileops.GenerationKey(path, info)
+	if keyErr != nil {
+		return keyErr
+	}
+	if qerr := w.store.SetQuarantined(meta.Name, key); qerr != nil {
+		return fmt.Errorf("persist quarantine %q: %w", meta.Name, qerr)
+	}
+	// An unindexed alias has no trusted version to request yet.
+	if meta.Hash == "" {
+		return err
+	}
 	for _, peer := range w.repairPeers {
 		if qerr := w.store.EnqueueChange(peer, *meta, "local checksum mismatch"); qerr != nil {
 			return errors.Join(err, qerr)
@@ -260,6 +306,21 @@ func (w *Watcher) recoverReplicaLocked(name string) error {
 		matches = hash == meta.Hash && info.Size() == meta.Size && info.ModTime().UnixNano() == meta.ModTime
 	}
 	if matches {
+		// A restart can observe a rename that was never flushed. Seeing matching
+		// bytes is not a durability barrier: repeat both flushes before the
+		// transaction that advertises the version and clears its replica intent.
+		if !meta.Deleted {
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			if err := errors.Join(f.Sync(), f.Close()); err != nil {
+				return err
+			}
+		}
+		if err := fileops.SyncSurvivingParent(path, w.dir); err != nil {
+			return err
+		}
 		_, err = w.store.PutRemote(*meta)
 		return err
 	}

@@ -410,17 +410,16 @@ func (g *Gateway) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	// Check if empty (ignoring ignored files).
 	entries, err := os.ReadDir(bp)
 	if err != nil {
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
 		return
 	}
-	for _, e := range entries {
-		if !watcher.ShouldIgnore(e.Name(), g.ignorePatterns) {
-			writeS3Error(w, http.StatusConflict, "BucketNotEmpty", "The bucket you tried to delete is not empty.")
-			return
-		}
+	// Exclusion from the object namespace never authorizes destroying the
+	// underlying data. This is the same physical emptiness rule as Sebastian.
+	if len(entries) != 0 {
+		writeS3Error(w, http.StatusConflict, "BucketNotEmpty", "The bucket you tried to delete is not empty.")
+		return
 	}
 
 	// Staged parts live outside the bucket directory, so an in-progress upload
@@ -438,11 +437,6 @@ func (g *Gateway) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 				"The bucket you tried to delete has in-progress multipart uploads.")
 			return
 		}
-	}
-
-	// Remove ignored files before removing the directory.
-	for _, e := range entries {
-		os.Remove(filepath.Join(bp, e.Name()))
 	}
 
 	if err := fileops.Remove(g.syncDir, bp, false); err != nil {
@@ -884,13 +878,18 @@ func (g *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	f, err := os.Open(op)
+	f, err := fileops.OpenReader(g.syncDir, op)
 	if err != nil {
 		g.logger.Error("get object: open failed", "bucket", bucket, "key", key, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
 		return
 	}
 	defer f.Close()
+	info, err = f.Stat()
+	if err != nil {
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))

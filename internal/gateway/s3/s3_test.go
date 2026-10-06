@@ -615,8 +615,8 @@ func TestDeleteBucket_WithOnlyIgnoredFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(bp, ".DS_Store"), []byte("apple"), 0o644)
 
 	w := serveRequest(g, http.MethodDelete, "/mybucket", nil, noAuth())
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

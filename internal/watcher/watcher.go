@@ -51,8 +51,7 @@ type Watcher struct {
 	readyOnce   sync.Once
 	recovered   bool
 	repairPeers []string
-	integrity   map[string]bool // protected by statusMu
-	storageID   string          // accessed under the shared filesystem commit lock
+	storageID   string // accessed under the shared filesystem commit lock
 
 	// work carries debounced batches from the fsnotify loop to the processing
 	// goroutine. Hashing and directory scans must never run on the event loop:
@@ -103,11 +102,10 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 		ready:             make(chan struct{}),
 		work:              make(chan []string, workQueueDepth),
 		rescan:            make(chan struct{}, 1),
-		integrity:         make(map[string]bool),
 	}
 	w.scrubRate.Store(DefaultScrubRate)
 	fileops.SetNotifier(dir, w.requestRescan)
-	fileops.SetHooks(dir, fileops.Hooks{Validate: w.prepareStorageLocked, CheckSources: w.checkSourcesLocked, Begin: w.beginCommitLocked, Finish: w.finishCommitLocked})
+	fileops.SetHooks(dir, fileops.Hooks{Validate: w.prepareStorageLocked, CheckSources: w.checkSourcesLocked, CheckRead: w.checkReadLocked, Begin: w.beginCommitLocked, Finish: w.finishCommitLocked})
 	return w
 }
 
@@ -535,10 +533,11 @@ func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, err
 	info, err := os.Lstat(fullPath)
 	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
 		if existing == nil || existing.Deleted {
-			w.clearIntegrity(name)
-			return nil, nil
+			return nil, w.clearIntegrity(name)
 		}
-		w.clearIntegrity(name)
+		if err := w.clearIntegrity(name); err != nil {
+			return nil, err
+		}
 		// The root was verified above; absence is a local deletion, not loss of a mount.
 		CleanEmptyParentsLocked(fullPath, w.dir, w.ignorePatterns, w.logger)
 		return &FileEvent{Name: name, ModTime: existing.ModTime + 1, Deleted: true}, nil
@@ -591,10 +590,36 @@ func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, err
 	if err != nil {
 		return nil, err
 	}
+	key, err := fileops.GenerationKey(fullPath, info)
+	if err != nil {
+		return nil, err
+	}
+	if !trusted && w.store.IsDamagedObject(key) && (existing == nil || existing.Hash != hash) {
+		if existing == nil {
+			existing = &store.FileMeta{Name: name}
+		}
+		return nil, w.quarantine(existing)
+	}
 	if existing != nil && !existing.Deleted && existing.Hash != hash && existing.ModTime == info.ModTime().UnixNano() && existing.Size == info.Size() && !trusted {
 		return nil, w.quarantine(existing)
 	}
-	w.clearIntegrity(name)
+	if w.NeedsRepair(name) || w.store.IsDamagedObject(key) {
+		// Do not drop durable quarantine based on merely visible replacement
+		// bytes: recovery may otherwise trust a repair lost to a later crash.
+		f, err := os.Open(fullPath)
+		if err != nil {
+			return nil, err
+		}
+		if err := errors.Join(f.Sync(), f.Close()); err != nil {
+			return nil, err
+		}
+		if err := fileops.SyncSurvivingParent(fullPath, w.dir); err != nil {
+			return nil, err
+		}
+		if err := w.clearIntegrity(name, key); err != nil {
+			return nil, err
+		}
+	}
 	if existing != nil && !existing.Deleted && existing.Hash == hash && existing.ModTime == info.ModTime().UnixNano() && existing.Size == info.Size() {
 		return nil, nil
 	}
@@ -638,7 +663,7 @@ type ScanStatus struct {
 func (w *Watcher) Status() ScanStatus {
 	w.statusMu.Lock()
 	defer w.statusMu.Unlock()
-	status := ScanStatus{LastError: w.lastError, LastScanAgoMS: -1, LastScrubAgoMS: -1, Quarantined: len(w.integrity)}
+	status := ScanStatus{LastError: w.lastError, LastScanAgoMS: -1, LastScrubAgoMS: -1, Quarantined: w.store.QuarantineCount()}
 	if !w.lastScrub.IsZero() {
 		status.LastScrubAgoMS = time.Since(w.lastScrub).Milliseconds()
 	}

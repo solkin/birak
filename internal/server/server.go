@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"syscall"
 
+	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/store"
 	"github.com/birak/birak/internal/watcher"
@@ -297,7 +297,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	// ServeContent has no such redirect logic and serves the bytes as-is.
 	// Nonblocking open prevents a file replaced by a FIFO between Stat and
 	// Open from stranding a handler after its client has already disconnected.
-	f, err := os.OpenFile(fullPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	f, err := fileops.OpenReader(s.syncDir, fullPath)
 	if err != nil {
 		s.logger.Error("open file failed", "name", cleaned, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)

@@ -885,9 +885,9 @@ func TestIntegration_PartialDirCleanup(t *testing.T) {
 	}
 
 	// a/b/c/ directory should have been removed.
-	if fileExists(filepath.Join(node2.syncDir, "a", "b"), "c") {
-		t.Fatal("a/b/c/ directory should have been removed")
-	}
+	waitForSync(t, 10*time.Second, func() bool {
+		return !fileExists(filepath.Join(node2.syncDir, "a", "b"), "c")
+	})
 
 	t.Log("partial directory cleanup works correctly")
 }

@@ -252,16 +252,22 @@ func New(
 		stats:          stats,
 		// Metadata requests: 30s is plenty.
 		client: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: transport,
+			Timeout:       30 * time.Second,
+			Transport:     transport,
+			CheckRedirect: refuseRedirect,
 		},
 		// File downloads: no global timeout — we rely on context
 		// cancellation and stall detection (stallTimeout) instead.
 		downloadClient: &http.Client{
-			Transport: transport,
+			Transport:     transport,
+			CheckRedirect: refuseRedirect,
 		},
 	}
 }
+
+// Peer URLs are explicit cluster configuration. A redirect is not permission
+// to disclose the shared secret to another endpoint, even on the same host.
+func refuseRedirect(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 
 // Run starts polling all peers. It blocks until ctx is cancelled.
 func (s *Syncer) Run(ctx context.Context) {

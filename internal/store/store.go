@@ -105,7 +105,10 @@ type Store struct {
 	// queueSize is the per-peer queue length, kept up to date as rows come and
 	// go. Counting rows to answer "is there room for one more" turned a bulk
 	// sync into O(n²): every new name scanned the whole queue first.
-	queueSize map[string]int64
+	queueSize      map[string]int64
+	integrityMu    sync.RWMutex
+	quarantined    map[string]bool
+	damagedObjects map[string]bool
 }
 
 // SetRepairLimit changes the per-peer queue cap. Zero disables it.
@@ -140,7 +143,7 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	db.SetMaxIdleConns(8)
 	db.SetConnMaxLifetime(0)
 
-	s := &Store{db: db, logger: logger, repairLimit: DefaultRepairLimit, queueSize: make(map[string]int64)}
+	s := &Store{db: db, logger: logger, repairLimit: DefaultRepairLimit, queueSize: make(map[string]int64), quarantined: make(map[string]bool), damagedObjects: make(map[string]bool)}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -182,6 +185,10 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	}
 	s.incarnation = epoch + "-" + hex.EncodeToString(buf)
 
+	if err := s.loadQuarantine(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -233,6 +240,8 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
 
 	CREATE TABLE IF NOT EXISTS local_intents (path TEXT PRIMARY KEY);
+	CREATE TABLE IF NOT EXISTS quarantine (name TEXT PRIMARY KEY);
+	CREATE TABLE IF NOT EXISTS damaged_objects (identity TEXT PRIMARY KEY);
  CREATE TABLE IF NOT EXISTS replica_intents (name TEXT PRIMARY KEY, metadata TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS cursors (
 		peer_id  TEXT PRIMARY KEY,

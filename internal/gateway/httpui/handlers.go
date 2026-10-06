@@ -162,12 +162,17 @@ func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := os.Open(fullPath)
+	f, err := fileops.OpenReader(g.syncDir, fullPath)
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
+	info, err = f.Stat()
+	if err != nil {
+		http.Error(w, "file unavailable", http.StatusInternalServerError)
+		return
+	}
 
 	// Build the header via mime.FormatMediaType so a filename containing quotes,
 	// control characters, or non-ASCII cannot break out of the header value

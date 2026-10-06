@@ -23,9 +23,19 @@ import (
 // client that opens handles without closing them.
 const maxHandlesPerSession = 1024
 
+type openFile interface {
+	io.ReaderAt
+	io.WriterAt
+	Stat() (os.FileInfo, error)
+	Close() error
+	Truncate(int64) error
+	Chmod(os.FileMode) error
+	Name() string
+}
+
 type handleEntry struct {
 	path        string
-	file        *os.File // regular-file handle (SSH_FXP_OPEN)
+	file        openFile // regular-file handle (SSH_FXP_OPEN)
 	dir         *os.File // directory handle (SSH_FXP_OPENDIR), read incrementally
 	closeWriter func() error
 	appendMode  bool
@@ -394,12 +404,12 @@ func (s *session) handleOpen(payload []byte) {
 		}
 	}
 
-	var f *os.File
+	var f openFile
 	var closeWriter func() error
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0 {
 		f, closeWriter, err = fileops.OpenWriter(s.g.syncDir, fullPath, flag, 0o644)
 	} else {
-		f, err = os.OpenFile(fullPath, flag, 0o644)
+		f, err = fileops.OpenReader(s.g.syncDir, fullPath)
 	}
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -415,7 +425,7 @@ func (s *session) handleOpen(payload []byte) {
 	handle, ok := s.addHandle(&handleEntry{path: fullPath, file: f, closeWriter: closeWriter, appendMode: flag&os.O_APPEND != 0})
 	if !ok {
 		if closeWriter != nil {
-			fileops.AbortWriter(s.g.syncDir, f)
+			fileops.AbortWriter(s.g.syncDir, f.(*os.File))
 		} else {
 			f.Close()
 		}
@@ -805,7 +815,7 @@ func (s *session) handleFsetstat(payload []byte) {
 
 // applyAttrs applies the supported attribute changes to a file, identified
 // either by an open *os.File (f, preferred when set) or by path.
-func applyAttrs(a fileAttrs, path string, f *os.File) error {
+func applyAttrs(a fileAttrs, path string, f openFile) error {
 	if a.hasSize {
 		if f != nil {
 			if err := f.Truncate(int64(a.size)); err != nil {
@@ -932,7 +942,7 @@ func (s *session) closeAllHandles() {
 	for _, entry := range s.handles {
 		if entry.file != nil {
 			if entry.closeWriter != nil {
-				fileops.AbortWriter(s.g.syncDir, entry.file)
+				fileops.AbortWriter(s.g.syncDir, entry.file.(*os.File))
 			} else {
 				entry.file.Close()
 			}

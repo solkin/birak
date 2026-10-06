@@ -168,13 +168,18 @@ func (g *Gateway) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := os.Open(fullPath)
+	f, err := fileops.OpenReader(g.syncDir, fullPath)
 	if err != nil {
 		g.logger.Error("get open failed", "path", relName, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
+	info, err = f.Stat()
+	if err != nil {
+		http.Error(w, "file unavailable", http.StatusInternalServerError)
+		return
+	}
 
 	g.logger.Debug("serving file", "path", relName, "size", info.Size())
 	w.Header().Set("Content-Type", "application/octet-stream")

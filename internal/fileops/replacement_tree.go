@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
 // Per-entry manifests permit interrupted deletion to resume: absent entries are
@@ -33,11 +32,11 @@ func replacementTree(r *os.Root, name string) ([]replacementEntry, error) {
 		if err != nil {
 			return err
 		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return fmt.Errorf("filesystem object identity unavailable: %s", path)
+		device, inode, err := objectIdentity(filepath.Join(r.Name(), path), info)
+		if err != nil {
+			return err
 		}
-		entry := replacementEntry{Name: rel, Device: uint64(stat.Dev), Inode: uint64(stat.Ino), Mode: info.Mode()}
+		entry := replacementEntry{Name: rel, Device: device, Inode: inode, Mode: info.Mode()}
 		switch {
 		case info.IsDir():
 			entries = append(entries, entry)

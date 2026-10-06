@@ -22,6 +22,7 @@ var ErrBusy = errors.New("file is being written")
 type rootState struct {
 	mu      sync.Mutex
 	writers map[*os.File]*writer
+	readers map[*Reader]struct{}
 	hooks   Hooks
 	notify  func()
 
@@ -128,6 +129,7 @@ type Published struct {
 type Hooks struct {
 	Validate     func() error
 	CheckSources func([]string) error
+	CheckRead    func(string, os.FileInfo) error
 	Begin        func([]string) error
 	// Finish indexes the result. Every commit fsyncs both what it publishes and
 	// the directories it changes before Finish runs, so Finish is told the
@@ -523,14 +525,6 @@ func SameGeneration(a, b os.FileInfo) bool { return a != nil && b != nil && same
 
 func same(a, b os.FileInfo) bool {
 	return os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime()) && a.Mode() == b.Mode()
-}
-
-func SyncDir(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	return errors.Join(f.Sync(), f.Close())
 }
 
 // SyncParents persists every directory entry up to and including the root,
