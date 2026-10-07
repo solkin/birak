@@ -25,6 +25,12 @@ A Birak cluster consists of one or more **nodes**. Each node has two directories
 
 Nodes know about each other through a **peers** list in the config. Each node polls its peers for changes and downloads new or updated files automatically. There is no central server — every node is a full replica.
 
+The current daemon acknowledges local writes before asynchronous replication completes.
+An isolated node's successful response does **not** guarantee that another node has
+the file. A new [quorum storage engine](docs/audits/quorum-core.md) is under
+development and tested separately; it is not enabled by this configuration or
+connected to the gateways yet.
+
 Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browser. For direct filesystem updates, publish atomically and change the mtime when replacing bytes. An unexplained checksum change with identical size and mtime is quarantined and repaired from a healthy peer; use a gateway when intentionally preserving both attributes. Once synced, files are accessible through any supported protocol.
 
 ## Quick Start

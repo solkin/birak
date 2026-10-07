@@ -25,14 +25,17 @@ jobs:
       - name: Run tests including replication fault scenarios
         run: |
           limited_volume="$RUNNER_TEMP/birak-enospc"
-          mkdir -p "$limited_volume"
+          quorum_volume="$RUNNER_TEMP/birak-quorum-enospc"
+          mkdir -p "$limited_volume" "$quorum_volume"
           sudo mount -t tmpfs -o size=16m,mode=1777 tmpfs "$limited_volume"
           trap 'sudo umount "$limited_volume"' EXIT
+          sudo mount -t tmpfs -o size=16m,mode=1777 tmpfs "$quorum_volume"
+          trap 'sudo umount "$limited_volume"; sudo umount "$quorum_volume"' EXIT
           # The suite now runs real daemon processes under -race: crash
           # consistency, backup restore, and a three-node partition model. On a
           # shared runner those are minutes, not seconds, and a timeout that
           # kills them looks exactly like a flaky test.
-          BIRAK_TEST_FULL_VOLUME="$limited_volume" go test -race -count=1 -v -timeout 900s ./...
+          BIRAK_TEST_FULL_VOLUME="$limited_volume" BIRAK_TEST_QUORUM_FULL_VOLUME="$quorum_volume" go test -race -count=1 -v -timeout 900s ./...
 
   windows-build:
     runs-on: windows-latest

@@ -21,6 +21,7 @@
 | [sync-simplification-round-1](sync-simplification-round-1.md) | Границы и стоимость, скраб с бюджетом, readiness ноды; затем единый путь применения |
 | [load-stand-and-crash-consistency](load-stand-and-crash-consistency.md) | Нагрузочный стенд, стоимость записи, сериализация, проверка аварийным завершением |
 | [integrity-read-fencing](integrity-read-fencing.md) | Персистентный карантин, защита чтения, fsync recovery, редиректы и паритет Windows/S3 |
+| [quorum-core](quorum-core.md) | Неизменяемые поколения, Raft, большинство по данным, online catch-up и безопасная смена состава |
 
 Замысел, из которого выросли последние три захода, — в
 [../sync-simplification-plan.md](../sync-simplification-plan.md): что именно
