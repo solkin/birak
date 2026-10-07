@@ -178,6 +178,9 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if g.config.Quorum != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), g.config.TransferTimeout)
+		defer cancel()
+		r = r.WithContext(ctx)
 		status := g.config.Quorum.Status()
 		if !status.Voter {
 			writeS3Error(w, 503, "SlowDown", "Node is not ready to serve requests")

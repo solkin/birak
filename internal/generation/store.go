@@ -1,6 +1,5 @@
 // Package generation stores immutable, content-addressed file generations.
-// It deliberately has no garbage collector: consensus references and retry
-// records must be accounted for before any acknowledged generation is removed.
+// Collection requires a committed publication freeze supplied by the quorum layer.
 package generation
 
 import (
@@ -36,15 +35,20 @@ func (r Ref) Validate() error {
 }
 
 type Store struct {
-	dir         string
-	directories map[string]os.FileInfo
-	life        sync.RWMutex // Close waits for in-flight installs before releasing lease
-	mu          sync.Mutex   // publishing/closing only; uploads do not hold this lock
-	release     func() error
-	proofMu     sync.Mutex
-	receipts    map[string]durableReceipt
-	proofID     string
-	proofEpoch  uint64
+	backupPins        map[string]int
+	dir               string
+	directories       map[string]os.FileInfo
+	life              sync.RWMutex // Close waits for in-flight installs before releasing lease
+	mu                sync.RWMutex // publishing/closing only; uploads do not hold this lock
+	release           func() error
+	proofMu           sync.Mutex
+	receipts          map[string]durableReceipt
+	proofID           string
+	proofEpoch        uint64
+	readersMu         sync.Mutex
+	readers           map[string]map[*Reader]struct{}
+	spaceMu           sync.Mutex
+	minFree, reserved uint64
 	// Explicit fault boundaries, also used by flush-failure/ENOSPC tests.
 	syncFile func(*os.File) error
 	syncDir  func(string) error
@@ -92,7 +96,7 @@ func New(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{receipts: make(map[string]durableReceipt), proofID: newProofID(), dir: dir, release: release, syncFile: (*os.File).Sync, syncDir: SyncDir, directories: make(map[string]os.FileInfo)}
+	s := &Store{backupPins: map[string]int{}, readers: map[string]map[*Reader]struct{}{}, receipts: make(map[string]durableReceipt), proofID: newProofID(), dir: dir, release: release, syncFile: (*os.File).Sync, syncDir: SyncDir, directories: make(map[string]os.FileInfo)}
 	for _, sub := range []string{"objects", "staging"} {
 		if err := MakeDir(filepath.Join(dir, sub)); err != nil {
 			release()
@@ -184,7 +188,7 @@ func (r contextReader) Read(p []byte) (int, error) {
 // Stage streams an upload with a mandatory byte limit. No object-sized buffer
 // or mutable pathname is used as a replication source.
 func (s *Store) Stage(ctx context.Context, r io.Reader, limit int64) (Ref, error) {
-	return s.put(ctx, r, limit, nil)
+	return s.put(ctx, r, limit, nil, false)
 }
 
 // Receive only acknowledges exact, verified bytes after flushing the file and
@@ -193,11 +197,19 @@ func (s *Store) Receive(ctx context.Context, ref Ref, r io.Reader) error {
 	if err := ref.Validate(); err != nil {
 		return err
 	}
-	_, err := s.put(ctx, r, ref.Size, &ref)
+	_, err := s.put(ctx, r, ref.Size, &ref, false)
 	return err
 }
 
-func (s *Store) put(ctx context.Context, r io.Reader, limit int64, expected *Ref) (Ref, error) {
+// Repair accepts only a fully verified replacement, installed as a new inode.
+func (s *Store) Repair(ctx context.Context, ref Ref, r io.Reader) error {
+	if err := ref.Validate(); err != nil {
+		return err
+	}
+	_, err := s.put(ctx, r, ref.Size, &ref, true)
+	return err
+}
+func (s *Store) put(ctx context.Context, r io.Reader, limit int64, expected *Ref, repair bool) (Ref, error) {
 	s.life.RLock()
 	defer s.life.RUnlock()
 	var zero Ref
@@ -207,6 +219,11 @@ func (s *Store) put(ctx context.Context, r io.Reader, limit int64, expected *Ref
 	if limit < 0 || limit == int64(^uint64(0)>>1) {
 		return zero, errors.New("invalid upload limit")
 	}
+	releaseSpace, err := s.reserve(limit)
+	if err != nil {
+		return zero, err
+	}
+	defer releaseSpace()
 	f, err := os.CreateTemp(filepath.Join(s.dir, "staging"), "upload-")
 	if err != nil {
 		return zero, err
@@ -244,16 +261,18 @@ func (s *Store) put(ctx context.Context, r io.Reader, limit int64, expected *Ref
 		return zero, err
 	}
 	if _, err := os.Lstat(dest); err == nil {
-		// Never replace a published inode, even to repair it: open readers and
-		// receipts refer to immutable bytes. Explicit repair is a separate step.
 		existing, err := s.open(ctx, ref)
-		if err != nil {
+		if errors.Is(err, ErrCorrupt) && repair {
+			s.revoke(ref)
+			if err = os.Rename(f.Name(), dest); err != nil {
+				return zero, err
+			}
+		} else if err != nil {
+			return zero, err
+		} else if err = errors.Join(s.syncFile(existing), existing.Close()); err != nil {
 			return zero, err
 		}
-		err = errors.Join(s.syncFile(existing), existing.Close())
-		if err != nil {
-			return zero, err
-		}
+
 	} else if !os.IsNotExist(err) {
 		return zero, err
 	} else if err := os.Rename(f.Name(), dest); err != nil {
@@ -274,16 +293,25 @@ func (s *Store) put(ctx context.Context, r io.Reader, limit int64, expected *Ref
 // Open verifies before exposing bytes. It fails closed on missing/truncated/
 // damaged generations. The returned descriptor must be closed by its caller.
 // The private storage directory must not be modified by external writers.
-func (s *Store) Open(ctx context.Context, ref Ref) (*os.File, error) {
+func (s *Store) Open(ctx context.Context, ref Ref) (*Reader, error) {
 	s.life.RLock()
 	defer s.life.RUnlock()
-	return s.open(ctx, ref)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	f, err := s.open(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	return s.pin(f, ref), nil
 }
 
 func (s *Store) open(ctx context.Context, ref Ref) (file *os.File, openErr error) {
 	defer func() {
 		if openErr != nil {
 			s.forget(ref)
+			if errors.Is(openErr, ErrCorrupt) || os.IsNotExist(openErr) {
+				s.revoke(ref)
+			}
 		}
 	}()
 	if err := s.checkStorage(); err != nil {

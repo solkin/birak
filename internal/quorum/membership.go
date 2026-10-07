@@ -28,6 +28,9 @@ func (n *Node) AddLearner(ctx context.Context, id raft.ServerID, address raft.Se
 		return err
 	}
 	s := n.fsm.control()
+	if s.Collection != nil {
+		return ErrMaintenance
+	}
 	if s.Transition != nil {
 		return ErrTransition
 	}
@@ -55,6 +58,9 @@ func (n *Node) CatchUp(ctx context.Context, id raft.ServerID) error {
 		return err
 	}
 	s := n.fsm.catchupState()
+	if s.Collection != nil {
+		return ErrMaintenance
+	}
 	if _, ok := member(s.Config, id); !ok {
 		return ErrMembership
 	}
@@ -101,6 +107,9 @@ func (n *Node) change(ctx context.Context, kind string, id raft.ServerID) error 
 		return err
 	}
 	s := n.fsm.catchupState()
+	if s.Collection != nil {
+		return ErrMaintenance
+	}
 	if kind == "remove" && id == n.id.Node {
 		return errors.New("transfer leadership before removing the leader")
 	}
@@ -172,6 +181,9 @@ func (n *Node) CancelChange(ctx context.Context, id raft.ServerID) error {
 		return err
 	}
 	s := n.fsm.control()
+	if s.Collection != nil {
+		return ErrMaintenance
+	}
 	if s.Transition == nil {
 		return nil
 	}

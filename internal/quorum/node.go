@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -41,35 +42,53 @@ type Peers interface {
 }
 
 type Options struct {
-	Dir        string
-	Identity   Identity
-	Bootstrap  bool // explicit, once, on a fresh state directory only
-	Transport  raft.Transport
-	Peers      Peers
-	RaftConfig *raft.Config
-	Timeout    time.Duration
+	TransferTimeout time.Duration
+	restoring       bool // private offline-restore startup, never a daemon option
+	Dir             string
+	Identity        Identity
+	Bootstrap       bool // explicit, once, on a fresh state directory only
+	Transport       raft.Transport
+	Peers           Peers
+	RaftConfig      *raft.Config
+	Timeout         time.Duration
 }
 
 type Node struct {
-	id        Identity
-	raft      *raft.Raft
-	objects   *generation.Store
-	fsm       *machine
-	log       *raftboltdb.BoltStore
-	peers     Peers
-	lease     func() error
-	ops       chan struct{}
-	timeout   time.Duration
-	closeOnce sync.Once
-	closeErr  error
+	dir             string
+	transferTimeout time.Duration
+	exporting       atomic.Bool
+	reconcileMu     sync.Mutex
+	replication     MaintenanceStatus
+	blobGate        sync.RWMutex
+	maintenanceMu   sync.Mutex
+	maintenance     MaintenanceStatus
+	id              Identity
+	raft            *raft.Raft
+	objects         *generation.Store
+	fsm             *machine
+	log             *raftboltdb.BoltStore
+	peers           Peers
+	lease           func() error
+	ops             chan struct{}
+	timeout         time.Duration
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 func Open(o Options) (_ *Node, err error) {
 	if o.Identity.Cluster == "" || len(o.Identity.Cluster) > 128 || !utf8.ValidString(o.Identity.Cluster) || o.Identity.Node == "" || len(o.Identity.Node) > 128 || !utf8.ValidString(string(o.Identity.Node)) || o.Identity.Format != Format || o.Transport == nil || o.Peers == nil {
 		return nil, errors.New("invalid quorum options")
 	}
+	if o.TransferTimeout <= 0 {
+		o.TransferTimeout = 30 * time.Minute
+	}
 	if o.Timeout <= 0 {
 		o.Timeout = 30 * time.Second
+	}
+	if _, e := os.Lstat(filepath.Join(o.Dir, "restore-incomplete")); e == nil && !o.restoring {
+		return nil, errors.New("incomplete offline restore; discard this destination and restore again")
+	} else if e != nil && !os.IsNotExist(e) {
+		return nil, e
 	}
 	if err := generation.MakeDir(o.Dir); err != nil {
 		return nil, err
@@ -78,7 +97,7 @@ func Open(o Options) (_ *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
-	n := &Node{id: o.Identity, peers: o.Peers, lease: lease, ops: make(chan struct{}, 1), timeout: o.Timeout, fsm: newMachine(o.Identity.Cluster)}
+	n := &Node{dir: o.Dir, transferTimeout: o.TransferTimeout, id: o.Identity, peers: o.Peers, lease: lease, ops: make(chan struct{}, 1), timeout: o.Timeout, fsm: newMachine(o.Identity.Cluster)}
 	defer func() {
 		if err != nil {
 			n.Close()
@@ -113,7 +132,7 @@ func Open(o Options) (_ *Node, err error) {
 			return nil, e
 		}
 		for _, entry := range entries {
-			if entry.Name() != "daemon.lock" {
+			if entry.Name() != "daemon.lock" && !(o.restoring && entry.Name() == "restore-incomplete") {
 				return nil, errors.New("refusing to adopt unrecognized quorum state")
 			}
 		}
@@ -299,6 +318,9 @@ func (n *Node) mutate(ctx context.Context, m Mutation) (Entry, error) {
 		}
 		return old.Entry, nil
 	}
+	if s.Collection != nil {
+		return Entry{}, ErrMaintenance
+	}
 	if s.Transition != nil {
 		return Entry{}, ErrTransition
 	}
@@ -308,7 +330,7 @@ func (n *Node) mutate(ctx context.Context, m Mutation) (Entry, error) {
 	if err != nil {
 		return Entry{}, err
 	}
-	c := command{Kind: "mutate", ConfigIndex: s.ConfigIndex, Mutation: m, Timestamp: time.Now().UnixNano(), Proofs: make(map[string][]raft.ServerID)}
+	c := command{Kind: "mutate", Epoch: s.Epoch, ConfigIndex: s.ConfigIndex, Mutation: m, Timestamp: time.Now().UnixNano(), Proofs: make(map[string][]raft.ServerID)}
 	for _, change := range m.changes() {
 		if change.Delete || change.MetaOnly {
 			continue
@@ -376,13 +398,16 @@ func (n *Node) checkPeer(ctx context.Context, id raft.ServerID) error {
 }
 
 func (n *Node) openGeneration(ctx context.Context, ref generation.Ref) (io.ReadCloser, error) {
-	if f, err := n.objects.Open(ctx, ref); err == nil {
+	ctx, cancel := context.WithTimeout(ctx, n.transferTimeout)
+	defer cancel()
+	f, localErr := n.objects.Open(ctx, ref)
+	if localErr == nil {
 		return f, nil
 	}
 	// The new leader may have the metadata but not the data. Fetch and verify
 	// from surviving members; never confuse an applied log with local readiness.
 	s := n.fsm.control()
-	var failures error
+	var failures error = localErr
 	for _, peer := range s.Config.Servers {
 		if peer.ID == n.id.Node {
 			continue
@@ -396,7 +421,7 @@ func (n *Node) openGeneration(ctx context.Context, ref generation.Ref) (io.ReadC
 			failures = errors.Join(failures, err)
 			continue
 		}
-		err = n.objects.Receive(ctx, ref, f)
+		err = n.ReceiveBlob(ctx, ref, f)
 		err = errors.Join(err, f.Close())
 		if err == nil {
 			return n.objects.Open(ctx, ref)
@@ -437,6 +462,6 @@ func (n *Node) Read(ctx context.Context, key string) (Entry, io.ReadCloser, erro
 	return e, f, err
 }
 
-// Snapshot persists metadata and deduplication state. Generation bytes are
-// deliberately retained separately, including overwritten/deleted generations.
+// Snapshot persists metadata and retained deduplication state. Generation
+// bytes live separately; use ExportS3 for an independent logical data backup.
 func (n *Node) Snapshot(ctx context.Context) error { return wait(ctx, n.raft.Snapshot()) }

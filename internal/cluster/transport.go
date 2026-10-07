@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/birak/birak/internal/quorum"
 	"github.com/hashicorp/raft"
 )
 
@@ -86,7 +87,13 @@ func (t *Transport) request(ctx context.Context, id raft.ServerID, address raft.
 	if err != nil {
 		return nil, err
 	}
-	return t.client(id).Do(req)
+	req.Header.Set("X-Birak-Format", quorum.Format)
+	resp, err := t.client(id).Do(req)
+	if err == nil && resp.Header.Get("X-Birak-Format") != quorum.Format {
+		resp.Body.Close()
+		return nil, errors.New("peer wire format mismatch; upgrade every node offline")
+	}
+	return resp, err
 }
 
 func (t *Transport) call(id raft.ServerID, address raft.ServerAddress, kind string, args, reply any, data io.Reader) error {

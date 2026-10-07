@@ -14,7 +14,12 @@ import (
 	"strings"
 	"time"
 
+	"errors"
 	"github.com/birak/birak/internal/cluster"
+	"github.com/birak/birak/internal/generation"
+	"github.com/birak/birak/internal/quorum"
+	"github.com/hashicorp/raft"
+	"path/filepath"
 )
 
 func main() {
@@ -25,10 +30,11 @@ func main() {
 }
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: birakctl ca|issue|status|ready|join|catch-up|promote|remove|cancel|transfer|snapshot [flags]")
+		return fmt.Errorf("usage: birakctl ca|issue|status|metrics|ready|join|catch-up|promote|remove|cancel|transfer|snapshot|scrub|collect|end-collection|backup|restore|upgrade-v2 [flags]")
 	}
 	op := args[0]
 	f := flag.NewFlagSet(op, flag.ContinueOnError)
+	backupFile := f.String("file", "", "backup archive path (new destination for backup)")
 	id := f.String("cluster", "", "cluster ID")
 	dir := f.String("dir", "", "offline CA directory")
 	node := f.String("node", "", "target server identity")
@@ -43,8 +49,28 @@ func run(args []string) error {
 	key := f.String("key", "", "operator private key file")
 	operator := f.String("operator", "", "operator certificate identity")
 	timeout := f.Duration("timeout", 30*time.Minute, "operation deadline")
+	grace := f.Duration("grace", 24*time.Hour, "minimum age of unreferenced bytes for collection")
 	if err := f.Parse(args[1:]); err != nil {
 		return err
+	}
+	if op == "restore" {
+		if !cluster.ValidID(*id) || !cluster.ValidID(*node) {
+			return fmt.Errorf("valid --cluster and --node required")
+		}
+		if *backupFile == "" || *timeout <= 0 {
+			return fmt.Errorf("--file and positive --timeout required")
+		}
+		file, err := os.Open(*backupFile)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+		defer cancel()
+		return quorum.RestoreS3(ctx, *dir, quorum.Identity{Cluster: *id, Node: raft.ServerID(*node), Format: quorum.Format}, raft.ServerAddress(*address), file)
+	}
+	if op == "upgrade-v2" {
+		return quorum.UpgradeV2(*dir, quorum.Identity{Cluster: *id, Node: raft.ServerID(*node), Format: quorum.Format})
 	}
 	if op == "ca" {
 		if *dir == "" {
@@ -59,9 +85,17 @@ func run(args []string) error {
 		return cluster.IssueCertificate(*dir, cluster.Principal{Cluster: *id, Role: *role, ID: *name}, strings.Split(*hosts, ","))
 	}
 	switch op {
-	case "status", "ready", "join", "catch-up", "promote", "remove", "cancel", "transfer", "snapshot":
+	case "metrics", "backup", "collect", "end-collection", "scrub", "status", "ready", "join", "catch-up", "promote", "remove", "cancel", "transfer", "snapshot":
 	default:
 		return fmt.Errorf("unknown command %s", op)
+	}
+	if op == "backup" {
+		if *backupFile == "" {
+			return fmt.Errorf("--file is required")
+		}
+		if _, err := os.Lstat(*backupFile); !os.IsNotExist(err) {
+			return fmt.Errorf("backup destination must not exist")
+		}
 	}
 	if _, _, err := net.SplitHostPort(*address); err != nil {
 		return fmt.Errorf("invalid --address: %w", err)
@@ -80,14 +114,14 @@ func run(args []string) error {
 	defer client.CloseIdleConnections()
 	method := "POST"
 	var body io.Reader
-	if op == "status" || op == "ready" {
+	if op == "status" || op == "ready" || op == "backup" || op == "metrics" {
 		method = "GET"
 	} else {
 		targetID := *member
-		if op == "snapshot" {
+		if op == "snapshot" || op == "collect" || op == "end-collection" || op == "scrub" {
 			targetID = *node
 		}
-		b, _ := json.Marshal(cluster.Member{ID: targetID, Address: *memberAddress})
+		b, _ := json.Marshal(cluster.Member{ID: targetID, Address: *memberAddress, Grace: *grace})
 		body = bytes.NewReader(b)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -101,6 +135,37 @@ func run(args []string) error {
 		return err
 	}
 	defer r.Body.Close()
+	if op == "backup" && r.StatusCode == 200 {
+		if *backupFile == "" {
+			return fmt.Errorf("--file is required")
+		}
+		if _, err := os.Lstat(*backupFile); !os.IsNotExist(err) {
+			return fmt.Errorf("backup destination must not exist")
+		}
+		file, err := os.CreateTemp(filepath.Dir(*backupFile), ".birak-backup-*")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(file.Name())
+		defer file.Close()
+		if _, err = io.Copy(file, r.Body); err != nil {
+			return err
+		}
+		if r.Trailer.Get("X-Birak-Backup-Complete") != "true" {
+			return fmt.Errorf("backup stream incomplete")
+		}
+		if err = file.Sync(); err != nil {
+			return err
+		}
+		if err = file.Close(); err != nil {
+			return err
+		}
+		// Link publishes exclusively; an existing archive can never be overwritten.
+		if err = os.Link(file.Name(), *backupFile); err != nil {
+			return err
+		}
+		return errors.Join(os.Remove(file.Name()), generation.SyncDir(filepath.Dir(*backupFile)))
+	}
 	b, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		return err

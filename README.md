@@ -30,8 +30,9 @@ replication completes. An isolated node's successful response does **not**
 guarantee that another node has the file. The opt-in
 [quorum mode](docs/quorum-operations.md) now connects S3 and multipart to durable
 majority writes, authenticated membership and failover. It is intended for
-supervised testing while the remaining [production work](docs/audits/quorum-service-s3.md)
-is completed. The following filesystem configuration and protocols apply to the
+supervised testing, with background repair, fenced garbage collection and verified
+S3 backup/restore. The remaining [production acceptance](docs/audits/quorum-maintenance-recovery.md)
+covers target hardware, capacity and client compatibility. The following filesystem configuration and protocols apply to the
 default mode; quorum mode has a separate private data layout and S3-only gateway.
 
 Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browser. For direct filesystem updates, publish atomically and change the mtime when replacing bytes. An unexplained checksum change with identical size and mtime is quarantined and repaired from a healthy peer; use a gateway when intentionally preserving both attributes. Once synced, files are accessible through any supported protocol.

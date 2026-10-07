@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -158,7 +157,7 @@ func (g *Gateway) routeQuorum(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !ok {
-			_, err = g.config.Quorum.Transact(r.Context(), operationID(), []quorum.Change{{Key: qBucket(bucket), MetaOnly: true}}, []quorum.Condition{{Key: qBucket(bucket)}})
+			_, err = g.config.Quorum.TransactOnce(r.Context(), operationID(), []quorum.Change{{Key: qBucket(bucket), MetaOnly: true}}, []quorum.Condition{{Key: qBucket(bucket)}})
 			if err != nil {
 				g.qError(w, err)
 				return
@@ -209,7 +208,7 @@ func (g *Gateway) routeQuorum(w http.ResponseWriter, r *http.Request) {
 			}
 			g.qListObjects(w, r, bucket)
 		case "DELETE":
-			_, err := g.config.Quorum.Transact(r.Context(), operationID(), []quorum.Change{{Key: qBucket(bucket), Delete: true}}, []quorum.Condition{{Key: qBucket(bucket), Index: be.Index}, {EmptyPrefix: qObjects(bucket)}, {EmptyPrefix: qUploads(bucket)}})
+			_, err := g.config.Quorum.TransactOnce(r.Context(), operationID(), []quorum.Change{{Key: qBucket(bucket), Delete: true}}, []quorum.Condition{{Key: qBucket(bucket), Index: be.Index}, {EmptyPrefix: qObjects(bucket)}, {EmptyPrefix: qUploads(bucket)}})
 			if errors.Is(err, quorum.ErrCondition) {
 				writeS3Error(w, 409, "BucketNotEmpty", "The bucket has objects or active uploads")
 				return
@@ -255,7 +254,7 @@ func (g *Gateway) routeQuorum(w http.ResponseWriter, r *http.Request) {
 	case "PUT":
 		g.qPut(w, r, bucket, key, be)
 	case "DELETE":
-		_, err := g.config.Quorum.Transact(r.Context(), operationID(), []quorum.Change{{Key: qObject(bucket, key), Delete: true}}, []quorum.Condition{{Key: qBucket(bucket), Index: be.Index}})
+		_, err := g.config.Quorum.TransactOnce(r.Context(), operationID(), []quorum.Change{{Key: qObject(bucket, key), Delete: true}}, []quorum.Condition{{Key: qBucket(bucket), Index: be.Index}})
 		if err != nil {
 			g.qError(w, err)
 			return
@@ -299,6 +298,9 @@ var errPayloadMD5 = errors.New("content MD5 mismatch")
 var errPayloadSHA = errors.New("content SHA256 mismatch")
 
 func (g *Gateway) qStage(ctx context.Context, r *http.Request, limit int64) (generation.Ref, string, error) {
+	if r.ContentLength >= 0 && r.ContentLength < limit {
+		limit = r.ContentLength
+	}
 	md := md5.New()
 	sha := sha256.New()
 	ref, err := g.config.Quorum.Stage(ctx, io.TeeReader(r.Body, io.MultiWriter(md, sha)), limit)
@@ -401,7 +403,7 @@ func (g *Gateway) qPut(w http.ResponseWriter, r *http.Request, bucket, key strin
 		}
 	}
 	attrs.ETag = tag
-	e, err := g.config.Quorum.Transact(r.Context(), operationID(), []quorum.Change{{Key: qObject(bucket, key), Ref: ref, Attributes: attrs}}, conditions)
+	e, err := g.config.Quorum.TransactOnce(r.Context(), operationID(), []quorum.Change{{Key: qObject(bucket, key), Ref: ref, Attributes: attrs}}, conditions)
 	if err != nil {
 		g.qError(w, err)
 		return
@@ -426,28 +428,6 @@ func (g *Gateway) qListObjects(w http.ResponseWriter, r *http.Request, bucket st
 	}
 	q := r.URL.Query()
 	prefix, delimiter := q.Get("prefix"), q.Get("delimiter")
-	records, err := g.config.Quorum.View(r.Context(), qObjects(bucket)+prefix)
-	if err != nil {
-		g.qError(w, err)
-		return
-	}
-	var objects []ObjectInfo
-	prefixes := map[string]bool{}
-	for _, rec := range records {
-		key := strings.TrimPrefix(rec.Key, qObjects(bucket))
-		if delimiter != "" {
-			if i := strings.Index(strings.TrimPrefix(key, prefix), delimiter); i >= 0 {
-				prefixes[key[:len(prefix)+i+len(delimiter)]] = true
-				continue
-			}
-		}
-		objects = append(objects, ObjectInfo{Key: key, Size: rec.Entry.Ref.Size, ETag: qETag(rec.Entry), LastModified: qTime(rec.Entry).Format(s3TimeFormat), StorageClass: "STANDARD"})
-	}
-	var cp []string
-	for p := range prefixes {
-		cp = append(cp, p)
-	}
-	sort.Strings(cp)
 	start := q.Get("marker")
 	if q.Get("list-type") == "2" {
 		start = q.Get("start-after")
@@ -455,7 +435,25 @@ func (g *Gateway) qListObjects(w http.ResponseWriter, r *http.Request, bucket st
 			start = q.Get("continuation-token")
 		}
 	}
-	objects, ps, truncated, next := paginate(objects, cp, start, maxKeys)
+	items, truncated, err := g.config.Quorum.ListPage(r.Context(), qObjects(bucket)+prefix, qObjects(bucket)+start, delimiter, maxKeys)
+	if err != nil {
+		g.qError(w, err)
+		return
+	}
+	var objects []ObjectInfo
+	var ps []CommonPrefix
+	next := ""
+	for _, item := range items {
+		key := strings.TrimPrefix(item.Key, qObjects(bucket))
+		if item.CommonPrefix {
+			ps = append(ps, CommonPrefix{Prefix: key})
+		} else {
+			objects = append(objects, ObjectInfo{Key: key, Size: item.Entry.Ref.Size, ETag: qETag(item.Entry), LastModified: qTime(item.Entry).Format(s3TimeFormat), StorageClass: "STANDARD"})
+		}
+		if truncated {
+			next = key
+		}
+	}
 	if q.Get("list-type") == "2" {
 		writeXML(w, 200, ListBucketResultV2{Xmlns: s3Xmlns, Name: bucket, Prefix: prefix, Delimiter: delimiter, MaxKeys: maxKeys, KeyCount: len(objects) + len(ps), Contents: objects, CommonPrefixes: ps, IsTruncated: truncated, NextContinuationToken: next, ContinuationToken: q.Get("continuation-token"), StartAfter: q.Get("start-after")})
 	} else {
@@ -490,7 +488,7 @@ func (g *Gateway) qDeleteObjects(w http.ResponseWriter, r *http.Request, bucket 
 			result.Errors = append(result.Errors, DeleteObjectError{Key: object.Key, Code: "InvalidArgument", Message: "Invalid key"})
 			continue
 		}
-		_, err := g.config.Quorum.Transact(r.Context(), operationID(), []quorum.Change{{Key: qObject(bucket, object.Key), Delete: true}}, []quorum.Condition{{Key: qBucket(bucket), Index: be.Index}})
+		_, err := g.config.Quorum.TransactOnce(r.Context(), operationID(), []quorum.Change{{Key: qObject(bucket, object.Key), Delete: true}}, []quorum.Condition{{Key: qBucket(bucket), Index: be.Index}})
 		if err != nil {
 			result.Errors = append(result.Errors, DeleteObjectError{Key: object.Key, Code: "SlowDown", Message: "Deletion not confirmed"})
 		} else if !request.Quiet {

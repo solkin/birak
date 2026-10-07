@@ -54,16 +54,20 @@ type QuorumSeed struct {
 	Address string `yaml:"address"`
 }
 type QuorumConfig struct {
-	ClusterID        string        `yaml:"cluster_id"`
-	StateDir         string        `yaml:"state_dir"`
-	ListenAddr       string        `yaml:"listen_addr"`
-	AdvertiseAddr    string        `yaml:"advertise_addr"`
-	CAFile           string        `yaml:"ca_file"`
-	CertFile         string        `yaml:"cert_file"`
-	KeyFile          string        `yaml:"key_file"`
-	Seeds            []QuorumSeed  `yaml:"seeds"`
-	OperationTimeout time.Duration `yaml:"operation_timeout"`
-	TransferTimeout  time.Duration `yaml:"transfer_timeout"`
+	BackupTimeout       time.Duration `yaml:"backup_timeout"`
+	MaintenanceInterval time.Duration `yaml:"maintenance_interval"`
+	ScrubBytesPerSecond int64         `yaml:"scrub_bytes_per_second"`
+	MinFreeBytes        uint64        `yaml:"min_free_bytes"`
+	ClusterID           string        `yaml:"cluster_id"`
+	StateDir            string        `yaml:"state_dir"`
+	ListenAddr          string        `yaml:"listen_addr"`
+	AdvertiseAddr       string        `yaml:"advertise_addr"`
+	CAFile              string        `yaml:"ca_file"`
+	CertFile            string        `yaml:"cert_file"`
+	KeyFile             string        `yaml:"key_file"`
+	Seeds               []QuorumSeed  `yaml:"seeds"`
+	OperationTimeout    time.Duration `yaml:"operation_timeout"`
+	TransferTimeout     time.Duration `yaml:"transfer_timeout"`
 }
 
 // MultipartConfig holds limits and retention settings for S3 multipart uploads.
@@ -175,7 +179,7 @@ type SyncConfig struct {
 func DefaultConfig() Config {
 	return Config{
 		StorageMode: "filesystem",
-		Quorum:      QuorumConfig{ListenAddr: ":9100", OperationTimeout: 2 * time.Minute, TransferTimeout: 30 * time.Minute},
+		Quorum:      QuorumConfig{BackupTimeout: 168 * time.Hour, MaintenanceInterval: time.Minute, ScrubBytesPerSecond: 64 << 20, MinFreeBytes: 1 << 30, ListenAddr: ":9100", OperationTimeout: 2 * time.Minute, TransferTimeout: 30 * time.Minute},
 		NodeID:      "node-1",
 		SyncDir:     "./sync",
 		MetaDir:     "./meta",
@@ -499,7 +503,10 @@ func (c *Config) validate() error {
 		if _, _, err := net.SplitHostPort(q.AdvertiseAddr); err != nil {
 			return fmt.Errorf("invalid quorum advertise_addr: %w", err)
 		}
-		if q.OperationTimeout <= 0 || q.TransferTimeout <= 0 {
+		if q.MaintenanceInterval <= 0 || q.ScrubBytesPerSecond <= 0 || q.MinFreeBytes == 0 {
+			return fmt.Errorf("quorum maintenance interval, scrub rate and free-space reserve must be positive")
+		}
+		if q.OperationTimeout <= 0 || q.TransferTimeout <= 0 || q.BackupTimeout <= 0 {
 			return fmt.Errorf("quorum timeouts must be positive")
 		}
 		if len(c.Peers) > 0 || len(c.Ignore) > 0 {

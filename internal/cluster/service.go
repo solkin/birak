@@ -22,10 +22,12 @@ import (
 )
 
 type Member struct {
-	ID      string `json:"id" yaml:"id"`
-	Address string `json:"address" yaml:"address"`
+	Grace   time.Duration `json:"grace,omitempty" yaml:"-"`
+	ID      string        `json:"id" yaml:"id"`
+	Address string        `json:"address" yaml:"address"`
 }
 type Options struct {
+	BackupTimeout                       time.Duration
 	Dir, ID, Cluster, Listen, Advertise string
 	Bootstrap                           bool
 	Seeds                               []Member
@@ -54,6 +56,9 @@ func Open(o Options) (_ *Service, err error) {
 	if !ValidID(o.ID) || !ValidID(o.Cluster) || o.Credentials == nil || o.Credentials.Principal != (Principal{Cluster: o.Cluster, Role: "node", ID: o.ID}) {
 		return nil, errors.New("invalid cluster service identity")
 	}
+	if o.BackupTimeout <= 0 {
+		o.BackupTimeout = 168 * time.Hour
+	}
 	if o.OperationTimeout <= 0 {
 		o.OperationTimeout = 2 * time.Minute
 	}
@@ -78,7 +83,7 @@ func Open(o Options) (_ *Service, err error) {
 	s := &Service{options: o, listener: ln, transfers: make(chan struct{}, 8), candidates: map[raft.ServerID]raft.ServerAddress{}, done: make(chan error, 1)}
 	s.Transport = NewTransport(raft.ServerID(o.ID), raft.ServerAddress(address), o.Credentials, 3*time.Second)
 	s.server = &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, ReadTimeout: o.TransferTimeout, MaxHeaderBytes: 64 << 10}
-	n, err := quorum.Open(quorum.Options{Dir: o.Dir, Identity: quorum.Identity{Cluster: o.Cluster, Node: raft.ServerID(o.ID), Format: quorum.Format}, Bootstrap: o.Bootstrap, Transport: s.Transport, Peers: s, RaftConfig: o.RaftConfig, Timeout: o.OperationTimeout})
+	n, err := quorum.Open(quorum.Options{Dir: o.Dir, Identity: quorum.Identity{Cluster: o.Cluster, Node: raft.ServerID(o.ID), Format: quorum.Format}, Bootstrap: o.Bootstrap, Transport: s.Transport, Peers: s, TransferTimeout: o.TransferTimeout, RaftConfig: o.RaftConfig, Timeout: o.OperationTimeout})
 	if err != nil {
 		s.Transport.Close()
 		ln.Close()
@@ -168,6 +173,7 @@ func (s *Service) authorized(p Principal) bool {
 }
 
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Birak-Format", quorum.Format)
 	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.PeerCertificates) == 0 {
 		http.Error(w, "client certificate required", 403)
 		return
@@ -193,6 +199,14 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.Role != "node" {
 		http.Error(w, "node certificate required", 403)
+		return
+	}
+	if r.URL.Path != "/v1/identity" && r.Header.Get("X-Birak-Format") != quorum.Format {
+		http.Error(w, "wire format mismatch", 409)
+		return
+	}
+	if r.URL.Path == "/v1/collect" && r.Method == "POST" {
+		s.collect(w, r, p)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/raft/") {
@@ -259,6 +273,20 @@ func decodeBody(r *http.Request, v any) error {
 	return nil
 }
 func (s *Service) admin(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/admin/metrics" && r.Method == "GET" {
+		s.metrics(w)
+		return
+	}
+	if r.URL.Path == "/v1/admin/backup" && r.Method == "GET" {
+		ctx, cancel := context.WithTimeout(r.Context(), s.options.BackupTimeout)
+		defer cancel()
+		w.Header().Set("Content-Type", "application/x-tar")
+		w.Header().Set("Trailer", "X-Birak-Backup-Complete")
+		if err := s.Node().ExportS3(ctx, w); err == nil {
+			w.Header().Set("X-Birak-Backup-Complete", "true")
+		}
+		return
+	}
 	if r.URL.Path == "/v1/admin/status" && r.Method == "GET" {
 		json.NewEncoder(w).Encode(s.Node().Status())
 		return
@@ -286,6 +314,21 @@ func (s *Service) admin(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	var err error
 	switch strings.TrimPrefix(r.URL.Path, "/v1/admin/") {
+	case "collect":
+		if m.Grace == 0 {
+			m.Grace = 24 * time.Hour
+		}
+		result, e := s.Node().Collect(ctx, m.Grace)
+		if e != nil {
+			http.Error(w, e.Error(), 503)
+			return
+		}
+		json.NewEncoder(w).Encode(result)
+		return
+	case "end-collection":
+		err = s.Node().EndCollection(ctx)
+	case "scrub":
+		err = s.Node().Scrub(ctx, 64<<20)
 	case "join":
 		if _, _, e := net.SplitHostPort(m.Address); e != nil {
 			http.Error(w, "invalid address", 400)
@@ -322,6 +365,8 @@ func (s *Service) admin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) Identity(ctx context.Context, id raft.ServerID) (quorum.Identity, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.options.OperationTimeout)
+	defer cancel()
 	address, err := s.peer(id)
 	if err != nil {
 		return quorum.Identity{}, err
@@ -342,6 +387,8 @@ func blobPath(ref generation.Ref) string {
 	return "/v1/blobs/" + ref.Hash + "?size=" + strconv.FormatInt(ref.Size, 10)
 }
 func (s *Service) Receive(ctx context.Context, id raft.ServerID, ref generation.Ref, body io.Reader) error {
+	ctx, cancel := context.WithTimeout(ctx, s.options.TransferTimeout)
+	defer cancel()
 	address, err := s.peer(id)
 	if err != nil {
 		return err
@@ -432,6 +479,7 @@ func (s *Service) ForwardS3(w http.ResponseWriter, r *http.Request) {
 			req.URL.RawPath = "/s3" + req.URL.RawPath
 		}
 		req.Header.Del("X-Forwarded-For")
+		req.Header.Set("X-Birak-Format", quorum.Format)
 	}
 	proxy.Transport = s.Transport.client(status.Leader).Transport
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) { http.Error(w, "leader unavailable", 503) }

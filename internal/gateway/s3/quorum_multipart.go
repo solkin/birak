@@ -95,7 +95,7 @@ func (g *Gateway) qMultipart(w http.ResponseWriter, r *http.Request, bucket, key
 		if l.MaxActiveUploads > 0 {
 			conditions = append(conditions, quorum.Condition{Prefix: "u/", MaxCount: l.MaxActiveUploads})
 		}
-		_, err := g.config.Quorum.Transact(r.Context(), "init:"+id, []quorum.Change{{Key: qUpload(bucket, id), MetaOnly: true, Attributes: quorum.Attributes{Value: recordJSON(up)}}}, conditions)
+		_, err := g.config.Quorum.TransactOnce(r.Context(), "init:"+id, []quorum.Change{{Key: qUpload(bucket, id), MetaOnly: true, Attributes: quorum.Attributes{Value: recordJSON(up)}}}, conditions)
 		if err != nil {
 			g.qError(w, err)
 			return
@@ -154,7 +154,7 @@ func (g *Gateway) qMultipart(w http.ResponseWriter, r *http.Request, bucket, key
 		// Updating the upload's index fences Complete/Abort against every part
 		// overwrite. Concurrent part uploads retry just the metadata transaction.
 		err = retryPartCommit(func() error {
-			_, e := g.config.Quorum.Transact(r.Context(), operationID(), []quorum.Change{{Key: qPart(id, number), Ref: ref, Attributes: quorum.Attributes{ETag: tag}}, {Key: qUpload(bucket, id), MetaOnly: true, Attributes: ue.Attributes}}, conditions)
+			_, e := g.config.Quorum.TransactOnce(r.Context(), operationID(), []quorum.Change{{Key: qPart(id, number), Ref: ref, Attributes: quorum.Attributes{ETag: tag}}, {Key: qUpload(bucket, id), MetaOnly: true, Attributes: ue.Attributes}}, conditions)
 			return e
 		}, func() error {
 			var e error
@@ -181,7 +181,7 @@ func (g *Gateway) qMultipart(w http.ResponseWriter, r *http.Request, bucket, key
 	case "POST":
 		g.qComplete(w, r, bucket, key, id, be, ue, up)
 	case "DELETE":
-		_, err := g.config.Quorum.Transact(r.Context(), operationID(), []quorum.Change{{Key: qUpload(bucket, id), Delete: true}}, conditions)
+		_, err := g.config.Quorum.TransactOnce(r.Context(), operationID(), []quorum.Change{{Key: qUpload(bucket, id), Delete: true}}, conditions)
 		if err != nil {
 			g.qError(w, err)
 			return
@@ -295,7 +295,7 @@ func (g *Gateway) qComplete(w http.ResponseWriter, r *http.Request, bucket, key,
 	}
 	sequence := &generationSequence{ctx: r.Context(), node: g.config.Quorum, refs: refs}
 	defer sequence.Close()
-	ref, err := g.config.Quorum.Stage(r.Context(), sequence, g.config.MaxUploadBytes)
+	ref, err := g.config.Quorum.Stage(r.Context(), sequence, sum)
 	if err != nil {
 		g.qError(w, err)
 		return
@@ -306,7 +306,7 @@ func (g *Gateway) qComplete(w http.ResponseWriter, r *http.Request, bucket, key,
 	}
 	tag := hex.EncodeToString(etagHash.Sum(nil)) + "-" + strconv.Itoa(len(refs))
 	receipt := completionRecord{Key: key, BucketIndex: be.Index, Digest: completionDigest(request), ETag: tag}
-	_, err = g.config.Quorum.Transact(r.Context(), "complete:"+id, []quorum.Change{
+	_, err = g.config.Quorum.TransactOnce(r.Context(), "complete:"+id, []quorum.Change{
 		{Key: qObject(bucket, key), Ref: ref, Attributes: quorum.Attributes{ETag: tag, ContentType: up.ContentType}},
 		{Key: qUpload(bucket, id), Delete: true},
 		{Key: qCompleted(bucket, id), MetaOnly: true, Attributes: quorum.Attributes{Value: recordJSON(receipt)}},

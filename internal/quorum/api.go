@@ -16,14 +16,21 @@ type Record struct {
 	Entry Entry
 }
 type Status struct {
-	Identity   Identity
-	State      string
-	Leader     raft.ServerID
-	Address    raft.ServerAddress
-	Members    raft.Configuration
-	Index      uint64
-	Transition string
-	Voter      bool
+	StorageError string
+	BackupActive bool
+	Replication  MaintenanceStatus
+	Collection   *CollectionFence
+	Maintenance  MaintenanceStatus
+	Space        generation.Space
+	SpaceError   string
+	Identity     Identity
+	State        string
+	Leader       raft.ServerID
+	Address      raft.ServerAddress
+	Members      raft.Configuration
+	Index        uint64
+	Transition   string
+	Voter        bool
 }
 
 func (n *Node) Identity() Identity { return n.id }
@@ -41,6 +48,18 @@ func (n *Node) Status() Status {
 	if s.Transition != nil {
 		status.Transition = s.Transition.Kind + ":" + string(s.Transition.ID)
 	}
+	status.Collection = s.Collection
+	status.Maintenance = n.MaintenanceStatus()
+	status.Replication = n.ReplicationStatus()
+	status.BackupActive = n.exporting.Load()
+	if e := n.objects.CheckStorage(); e != nil {
+		status.StorageError = e.Error()
+	}
+	var err error
+	status.Space, err = n.objects.Space()
+	if err != nil {
+		status.SpaceError = err.Error()
+	}
 	return status
 }
 func (n *Node) Ready(ctx context.Context) error {
@@ -48,6 +67,9 @@ func (n *Node) Ready(ctx context.Context) error {
 	defer cancel()
 	if err := n.barrier(ctx); err != nil {
 		return err
+	}
+	if n.fsm.control().Collection != nil {
+		return ErrMaintenance
 	}
 	if n.fsm.control().Transition != nil {
 		return ErrTransition
@@ -120,7 +142,12 @@ func (n *Node) Lookup(ctx context.Context, key string) (Entry, bool, error) {
 // Blob methods expose no mutable file path. The network adapter must authorize
 // each request before calling these, including on reused TLS connections.
 func (n *Node) ReceiveBlob(ctx context.Context, ref generation.Ref, r io.Reader) error {
-	return n.objects.Receive(ctx, ref, r)
+	n.blobGate.RLock()
+	defer n.blobGate.RUnlock()
+	if n.fsm.control().Collection != nil {
+		return ErrMaintenance
+	}
+	return n.objects.Repair(ctx, ref, r)
 }
 func (n *Node) LocalBlob(ctx context.Context, ref generation.Ref) (io.ReadCloser, error) {
 	return n.objects.Open(ctx, ref)
@@ -128,3 +155,15 @@ func (n *Node) LocalBlob(ctx context.Context, ref generation.Ref) (io.ReadCloser
 func (n *Node) OpenBlob(ctx context.Context, ref generation.Ref) (io.ReadCloser, error) {
 	return n.openGeneration(ctx, ref)
 }
+
+// TransactOnce uses application CAS instead of retaining an unbounded core
+// receipt. An uncertain result must be reconciled through application state.
+func (n *Node) TransactOnce(ctx context.Context, id string, changes []Change, conditions []Condition) (Entry, error) {
+	ctx, cancel := context.WithTimeout(ctx, n.timeout)
+	defer cancel()
+	if len(changes) == 0 {
+		return Entry{}, errors.New("empty transaction")
+	}
+	return n.mutate(ctx, Mutation{ID: id, Changes: changes, Conditions: conditions, NoReceipt: true})
+}
+func (n *Node) SetReserve(bytes uint64) { n.objects.SetReserve(bytes) }

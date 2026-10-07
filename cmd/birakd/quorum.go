@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,7 +33,7 @@ func runQuorum(cfg config.Config, bootstrap bool, logger *slog.Logger) error {
 		Dir: cfg.Quorum.StateDir, ID: cfg.NodeID, Cluster: cfg.Quorum.ClusterID,
 		Listen: cfg.Quorum.ListenAddr, Advertise: cfg.Quorum.AdvertiseAddr,
 		Credentials: credentials, Seeds: seeds, Bootstrap: bootstrap,
-		MaxBlobBytes: cfg.MaxUploadBytes, OperationTimeout: cfg.Quorum.OperationTimeout,
+		BackupTimeout: cfg.Quorum.BackupTimeout, MaxBlobBytes: cfg.MaxUploadBytes, OperationTimeout: cfg.Quorum.OperationTimeout,
 		TransferTimeout: cfg.Quorum.TransferTimeout, RaftConfig: raftConfig,
 	})
 	if err != nil {
@@ -40,6 +41,13 @@ func runQuorum(cfg config.Config, bootstrap bool, logger *slog.Logger) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	s.Node().SetReserve(cfg.Quorum.MinFreeBytes)
+	var maintenance sync.WaitGroup
+	maintenance.Add(1)
+	go func() {
+		defer maintenance.Done()
+		s.Node().RunMaintenance(ctx, cfg.Quorum.MaintenanceInterval, cfg.Quorum.ScrubBytesPerSecond, func(e error) { logger.Error("quorum maintenance failed", "error", e) })
+	}()
 	g := s3gw.New("", nil, s3gw.Config{
 		ListenAddr: cfg.Gateways.S3.ListenAddr,
 		AccessKey:  cfg.Gateways.S3.AccessKey, SecretKey: cfg.Gateways.S3.SecretKey,
@@ -53,8 +61,14 @@ func runQuorum(cfg config.Config, bootstrap bool, logger *slog.Logger) error {
 		},
 	}, logger)
 	s.SetS3(g.Handler())
+	maintenance.Add(1)
+	go func() {
+		defer maintenance.Done()
+		g.RunQuorumCleanup(ctx, cfg.Multipart.UploadTTL, cfg.Multipart.CleanupInterval)
+	}()
 	defer func() {
 		cancel()
+		maintenance.Wait()
 		shutdown, stop := context.WithTimeout(context.Background(), 10*time.Second)
 		defer stop()
 		g.Stop(shutdown)

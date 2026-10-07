@@ -78,7 +78,7 @@ func (w wire) Receive(ctx context.Context, id raft.ServerID, ref generation.Ref,
 			return ctx.Err()
 		}
 	}
-	return n.objects.Receive(ctx, ref, r)
+	return n.ReceiveBlob(ctx, ref, r)
 }
 func (w wire) Open(ctx context.Context, id raft.ServerID, ref generation.Ref) (io.ReadCloser, error) {
 	n, err := w.target(ctx, id)
@@ -111,11 +111,12 @@ func (l *lab) start(id raft.ServerID, bootstrap bool) *Node {
 	if l.dirs[id] == "" {
 		l.dirs[id] = filepath.Join(l.t.TempDir(), "node")
 	}
-	_, tr := raft.NewInmemTransportWithTimeout(raft.ServerAddress(id), 150*time.Millisecond)
+	_, tr := raft.NewInmemTransportWithTimeout(raft.ServerAddress(id), 500*time.Millisecond)
 	cfg := raft.DefaultConfig()
-	cfg.HeartbeatTimeout = 150 * time.Millisecond
-	cfg.ElectionTimeout = 150 * time.Millisecond
-	cfg.LeaderLeaseTimeout = 100 * time.Millisecond
+	// Leave scheduling headroom for parallel -race packages on shared runners.
+	cfg.HeartbeatTimeout = 500 * time.Millisecond
+	cfg.ElectionTimeout = 500 * time.Millisecond
+	cfg.LeaderLeaseTimeout = 400 * time.Millisecond
 	cfg.CommitTimeout = 5 * time.Millisecond
 	cfg.LogOutput = io.Discard
 	cfg.SnapshotThreshold = 1024
@@ -309,7 +310,7 @@ func TestPartitionRejectsMinorityAndLearnerVotes(t *testing.T) {
 		r.Close()
 		t.Fatal("minority served linearizable read")
 	}
-	read(t, majority, "key", "new")
+	read(t, l.leader(old.id.Node), "key", "new")
 }
 
 func TestLearnerNotCountedForDataQuorum(t *testing.T) {

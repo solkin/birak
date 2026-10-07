@@ -17,10 +17,12 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-const Format = "birak-quorum-v2"
+const Format = "birak-quorum-v3"
+const legacyFormat = "birak-quorum-v2"
 const maxCommandBytes = 64 << 10
 
 var (
+	ErrMaintenance = errors.New("collection in progress or obsolete publication epoch")
 	ErrMembership  = errors.New("membership changed; retry operation")
 	ErrTransition  = errors.New("membership transition in progress")
 	ErrOperationID = errors.New("operation ID was already used for another mutation")
@@ -55,6 +57,7 @@ type Condition struct {
 }
 
 type Mutation struct {
+	NoReceipt  bool           `json:"no_receipt,omitempty"`
 	ID         string         `json:"id"`
 	Key        string         `json:"key"`
 	Ref        generation.Ref `json:"ref"`
@@ -181,7 +184,14 @@ type transition struct {
 	ID      raft.ServerID
 	Address raft.ServerAddress
 }
+type CollectionFence struct {
+	Epoch  uint64
+	Before int64
+}
+
 type command struct {
+	Epoch       uint64 `json:",omitempty"`
+	Before      int64  `json:",omitempty"`
 	Format      string
 	Cluster     string
 	Kind        string
@@ -194,8 +204,10 @@ type command struct {
 }
 
 // state is reconstructed from committed log entries and snapshots, never from
-// filesystem mtimes. Generations and operation IDs are retained without GC.
+// filesystem mtimes. A persistent collection fence invalidates old byte proofs.
 type state struct {
+	Epoch       uint64
+	Collection  *CollectionFence
 	Format      string
 	Cluster     string
 	Index       uint64
@@ -220,6 +232,10 @@ func (f *machine) view() state {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	s := f.state
+	if s.Collection != nil {
+		c := *s.Collection
+		s.Collection = &c
+	}
 	s.Config = s.Config.Clone()
 	s.Entries = maps.Clone(s.Entries)
 	s.Operations = maps.Clone(s.Operations)
@@ -237,6 +253,10 @@ func (f *machine) control() state {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	s := f.state
+	if s.Collection != nil {
+		c := *s.Collection
+		s.Collection = &c
+	}
 	s.Config = s.Config.Clone()
 	s.Entries = nil
 	s.Operations = nil
@@ -266,6 +286,10 @@ func (f *machine) catchupState() state {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	s := f.state
+	if s.Collection != nil {
+		c := *s.Collection
+		s.Collection = &c
+	}
 	s.Config = s.Config.Clone()
 	s.Entries = nil
 	s.Operations = nil
@@ -316,7 +340,7 @@ func (f *machine) Apply(log *raft.Log) interface{} {
 	defer f.mu.Unlock()
 	s := &f.state
 	s.Index = log.Index
-	if c.Format != Format || c.Cluster != s.Cluster {
+	if (c.Format != Format && !(c.Format == legacyFormat && s.Epoch == 0)) || c.Cluster != s.Cluster {
 		return errors.New("wrong consensus format or cluster")
 	}
 	if c.Kind == "mutate" {
@@ -335,6 +359,9 @@ func (f *machine) Apply(log *raft.Log) interface{} {
 	}
 	switch c.Kind {
 	case "mutate":
+		if s.Collection != nil || c.Epoch != s.Epoch {
+			return ErrMaintenance
+		}
 		if s.Transition != nil {
 			return ErrTransition
 		}
@@ -376,9 +403,43 @@ func (f *machine) Apply(log *raft.Log) interface{} {
 				e = out
 			}
 		}
-		s.Operations[c.Mutation.ID] = receipt{Fingerprint: c.Mutation.fingerprint(), Entry: e}
+		if !c.Mutation.NoReceipt {
+			s.Operations[c.Mutation.ID] = receipt{Fingerprint: c.Mutation.fingerprint(), Entry: e}
+		}
 		return e
+	case "collect-begin":
+		if s.Transition != nil {
+			return ErrTransition
+		}
+		if s.Collection != nil || c.Epoch != s.Epoch || c.Before <= 0 || s.Epoch == ^uint64(0) {
+			return ErrMaintenance
+		}
+		s.Epoch++
+		s.Collection = &CollectionFence{Epoch: s.Epoch, Before: c.Before}
+		live := make(map[string]generation.Ref)
+		for key, e := range s.Entries {
+			if e.Deleted {
+				if e.Modified < c.Before {
+					delete(s.Entries, key)
+				}
+				continue
+			}
+			if !e.MetaOnly {
+				live[e.Ref.Hash] = e.Ref
+			}
+		}
+		s.Generations = live
+		return nil
+	case "collect-end":
+		if c.Epoch != s.Epoch {
+			return ErrMaintenance
+		}
+		s.Collection = nil
+		return nil
 	case "freeze":
+		if s.Collection != nil {
+			return ErrMaintenance
+		}
 		if c.Change == nil {
 			return errors.New("missing membership transition")
 		}
@@ -466,7 +527,7 @@ func (f *machine) Restore(r io.ReadCloser) error {
 	if err := d.Decode(&extra); err != io.EOF {
 		return errors.New("trailing snapshot data")
 	}
-	if s.Format != Format || s.Cluster != f.state.Cluster || s.Entries == nil || s.Operations == nil || s.Generations == nil || s.ConfigIndex == 0 || s.ConfigIndex > s.Index || len(voters(s.Config)) == 0 {
+	if (s.Format != Format && !(s.Format == legacyFormat && s.Epoch == 0 && s.Collection == nil)) || s.Cluster != f.state.Cluster || s.Entries == nil || s.Operations == nil || s.Generations == nil || s.ConfigIndex == 0 || s.ConfigIndex > s.Index || len(voters(s.Config)) == 0 {
 		return errors.New("invalid consensus snapshot")
 	}
 	for hash, ref := range s.Generations {
@@ -474,7 +535,7 @@ func (f *machine) Restore(r io.ReadCloser) error {
 			return errors.New("invalid snapshot generation")
 		}
 	}
-	checkEntry := func(e Entry) error {
+	checkEntry := func(e Entry, live bool) error {
 		if err := (Mutation{ID: "snapshot", Changes: []Change{{Key: "snapshot", Ref: e.Ref, Delete: e.Deleted, MetaOnly: e.MetaOnly, Attributes: e.Attributes}}}).validate(); err != nil {
 			return err
 		}
@@ -487,7 +548,7 @@ func (f *machine) Restore(r io.ReadCloser) error {
 			}
 			return nil
 		}
-		if ref, ok := s.Generations[e.Ref.Hash]; !ok || ref != e.Ref {
+		if ref, ok := s.Generations[e.Ref.Hash]; live && (!ok || ref != e.Ref) {
 			return errors.New("snapshot lost generation reference")
 		}
 		return nil
@@ -496,7 +557,7 @@ func (f *machine) Restore(r io.ReadCloser) error {
 		if k == "" || len(k) > 4096 || !utf8.ValidString(k) {
 			return errors.New("invalid snapshot key")
 		}
-		if err := checkEntry(e); err != nil {
+		if err := checkEntry(e, true); err != nil {
 			return err
 		}
 	}
@@ -508,7 +569,7 @@ func (f *machine) Restore(r io.ReadCloser) error {
 		if err != nil || len(b) != sha256.Size {
 			return errors.New("invalid snapshot operation fingerprint")
 		}
-		if err := checkEntry(op.Entry); err != nil {
+		if err := checkEntry(op.Entry, false); err != nil {
 			return err
 		}
 	}
@@ -517,6 +578,10 @@ func (f *machine) Restore(r io.ReadCloser) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if s.Collection != nil && (s.Collection.Epoch != s.Epoch || s.Epoch == 0 || s.Collection.Before <= 0 || s.Transition != nil) {
+		return errors.New("invalid collection fence")
+	}
+	s.Format = Format
 	f.state = s
 	return nil
 }
