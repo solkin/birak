@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"strings"
 	"sync"
 	"unicode/utf8"
 
@@ -16,7 +17,7 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-const Format = "birak-quorum-v1"
+const Format = "birak-quorum-v2"
 const maxCommandBytes = 64 << 10
 
 var (
@@ -24,26 +25,136 @@ var (
 	ErrTransition  = errors.New("membership transition in progress")
 	ErrOperationID = errors.New("operation ID was already used for another mutation")
 	ErrDataQuorum  = errors.New("insufficient durable generation copies")
+	ErrCondition   = errors.New("transaction precondition failed")
 )
 
+// Attributes are bounded metadata, not filesystem paths. Value holds small
+// application records (buckets/uploads); file bytes always live in generations.
+type Attributes struct {
+	ETag        string `json:"etag,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	Value       string `json:"value,omitempty"`
+}
+
+type Change struct {
+	Key        string         `json:"key"`
+	Ref        generation.Ref `json:"ref"`
+	Delete     bool           `json:"delete,omitempty"`
+	MetaOnly   bool           `json:"meta_only,omitempty"`
+	Attributes Attributes     `json:"attributes,omitempty"`
+}
+
+// Index=0 requires absence (a tombstone counts as absent). EmptyPrefix guards
+// bucket deletion against a concurrent object/upload creation in the FSM.
+type Condition struct {
+	Key         string `json:"key,omitempty"`
+	Index       uint64 `json:"index,omitempty"`
+	EmptyPrefix string `json:"empty_prefix,omitempty"`
+	Prefix      string `json:"prefix,omitempty"`
+	MaxCount    int    `json:"max_count,omitempty"`
+}
+
 type Mutation struct {
-	ID     string         `json:"id"`
-	Key    string         `json:"key"`
-	Ref    generation.Ref `json:"ref"`
-	Delete bool           `json:"delete,omitempty"`
+	ID         string         `json:"id"`
+	Key        string         `json:"key"`
+	Ref        generation.Ref `json:"ref"`
+	Delete     bool           `json:"delete,omitempty"`
+	Changes    []Change       `json:"changes,omitempty"`
+	Conditions []Condition    `json:"conditions,omitempty"`
 }
 
 func (m Mutation) validate() error {
-	if m.ID == "" || len(m.ID) > 128 || !utf8.ValidString(m.ID) || m.Key == "" || len(m.Key) > 4096 || !utf8.ValidString(m.Key) {
-		return errors.New("invalid operation ID or logical key")
+	if m.ID == "" || len(m.ID) > 128 || !utf8.ValidString(m.ID) {
+		return errors.New("invalid operation ID")
 	}
-	if m.Delete {
-		if m.Ref != (generation.Ref{}) {
-			return errors.New("delete has generation")
+	if len(m.Changes) > 128 || len(m.Conditions) > 256 {
+		return errors.New("transaction too large")
+	}
+	if len(m.Changes) > 0 && (m.Key != "" || m.Ref != (generation.Ref{}) || m.Delete) {
+		return errors.New("ambiguous transaction")
+	}
+	seen := map[string]bool{}
+	refs := map[string]generation.Ref{}
+	for _, c := range m.changes() {
+		if !validKey(c.Key) || seen[c.Key] {
+			return errors.New("invalid or duplicate key")
 		}
-		return nil
+		seen[c.Key] = true
+		if len(c.Attributes.ETag) > 128 || len(c.Attributes.ContentType) > 1024 || len(c.Attributes.Value) > 8192 {
+			return errors.New("attributes too large")
+		}
+		if !utf8.ValidString(c.Attributes.ETag) || strings.ContainsAny(c.Attributes.ETag, "\r\n\x00") || !utf8.ValidString(c.Attributes.Value) || !utf8.ValidString(c.Attributes.ContentType) || strings.ContainsAny(c.Attributes.ContentType, "\r\n") {
+			return errors.New("invalid attributes")
+		}
+		if c.Delete || c.MetaOnly {
+			if c.Ref != (generation.Ref{}) || (c.Delete && c.MetaOnly) {
+				return errors.New("invalid metadata change")
+			}
+		} else {
+			if err := c.Ref.Validate(); err != nil {
+				return err
+			}
+			if old, ok := refs[c.Ref.Hash]; ok && old != c.Ref {
+				return errors.New("inconsistent transaction generation size")
+			}
+			refs[c.Ref.Hash] = c.Ref
+		}
 	}
-	return m.Ref.Validate()
+	for _, c := range m.Conditions {
+		if c.Prefix != "" {
+			if !validKey(c.Prefix) || c.MaxCount <= 0 || c.Key != "" || c.EmptyPrefix != "" || c.Index != 0 {
+				return errors.New("invalid count condition")
+			}
+		} else if c.MaxCount != 0 {
+			return errors.New("count without prefix")
+		} else if c.EmptyPrefix != "" {
+			if c.Key != "" || c.Index != 0 || !validKey(c.EmptyPrefix) {
+				return errors.New("invalid prefix condition")
+			}
+		} else if !validKey(c.Key) {
+			return errors.New("invalid condition key")
+		}
+	}
+	return nil
+}
+
+func validKey(key string) bool { return key != "" && len(key) <= 4096 && utf8.ValidString(key) }
+func (m Mutation) changes() []Change {
+	if len(m.Changes) > 0 {
+		return m.Changes
+	}
+	return []Change{{Key: m.Key, Ref: m.Ref, Delete: m.Delete}}
+}
+func checkConditions(entries map[string]Entry, conditions []Condition) error {
+	for _, c := range conditions {
+		if c.Prefix != "" {
+			count := 0
+			for key, e := range entries {
+				if !e.Deleted && strings.HasPrefix(key, c.Prefix) {
+					count++
+					if count >= c.MaxCount {
+						return ErrCondition
+					}
+				}
+			}
+		} else if c.EmptyPrefix != "" {
+			for key, e := range entries {
+				if !e.Deleted && strings.HasPrefix(key, c.EmptyPrefix) {
+					return ErrCondition
+				}
+			}
+		} else {
+			e, ok := entries[c.Key]
+			if c.Index == 0 {
+				if ok && !e.Deleted {
+					return ErrCondition
+				}
+			} else if !ok || e.Deleted || e.Index != c.Index {
+				return ErrCondition
+			}
+		}
+	}
+	return nil
 }
 
 func (m Mutation) fingerprint() string {
@@ -53,9 +164,12 @@ func (m Mutation) fingerprint() string {
 }
 
 type Entry struct {
-	Ref     generation.Ref `json:"ref"`
-	Deleted bool           `json:"deleted"`
-	Index   uint64         `json:"index"`
+	Ref        generation.Ref `json:"ref"`
+	Deleted    bool           `json:"deleted"`
+	Index      uint64         `json:"index"`
+	MetaOnly   bool           `json:"meta_only,omitempty"`
+	Attributes Attributes     `json:"attributes,omitempty"`
+	Modified   int64          `json:"modified,omitempty"`
 }
 
 type receipt struct {
@@ -74,6 +188,8 @@ type command struct {
 	ConfigIndex uint64
 	Mutation    Mutation
 	Copies      []raft.ServerID
+	Proofs      map[string][]raft.ServerID `json:",omitempty"`
+	Timestamp   int64                      `json:",omitempty"`
 	Change      *transition
 }
 
@@ -222,24 +338,44 @@ func (f *machine) Apply(log *raft.Log) interface{} {
 		if s.Transition != nil {
 			return ErrTransition
 		}
-		if !c.Mutation.Delete {
-			v := voters(s.Config)
-			seen := map[raft.ServerID]bool{}
-			for _, id := range c.Copies {
-				if v[id] {
-					seen[id] = true
+		if err := checkConditions(s.Entries, c.Mutation.Conditions); err != nil {
+			return err
+		}
+		changes := c.Mutation.changes()
+		// Validate every output before changing any state: multipart completion
+		// publishes the object and closes its upload in the same log entry.
+		for _, change := range changes {
+			if !change.Delete && !change.MetaOnly {
+				v := voters(s.Config)
+				seen := map[raft.ServerID]bool{}
+				copies := c.Copies
+				if len(c.Mutation.Changes) > 0 {
+					copies = c.Proofs[change.Ref.Hash]
+				}
+				for _, id := range copies {
+					if v[id] {
+						seen[id] = true
+					}
+				}
+				if len(v) == 0 || len(seen) < len(v)/2+1 {
+					return ErrDataQuorum
+				}
+				if old, ok := s.Generations[change.Ref.Hash]; ok && old != change.Ref {
+					return errors.New("inconsistent generation size")
 				}
 			}
-			if len(v) == 0 || len(seen) < len(v)/2+1 {
-				return ErrDataQuorum
-			}
-			if old, ok := s.Generations[c.Mutation.Ref.Hash]; ok && old != c.Mutation.Ref {
-				return errors.New("inconsistent generation size")
-			}
-			s.Generations[c.Mutation.Ref.Hash] = c.Mutation.Ref
 		}
-		e := Entry{Ref: c.Mutation.Ref, Deleted: c.Mutation.Delete, Index: log.Index}
-		s.Entries[c.Mutation.Key] = e
+		var e Entry
+		for i, change := range changes {
+			out := Entry{Ref: change.Ref, Deleted: change.Delete, MetaOnly: change.MetaOnly, Attributes: change.Attributes, Index: log.Index, Modified: c.Timestamp}
+			if !change.Delete && !change.MetaOnly {
+				s.Generations[change.Ref.Hash] = change.Ref
+			}
+			s.Entries[change.Key] = out
+			if i == 0 {
+				e = out
+			}
+		}
 		s.Operations[c.Mutation.ID] = receipt{Fingerprint: c.Mutation.fingerprint(), Entry: e}
 		return e
 	case "freeze":
@@ -339,10 +475,13 @@ func (f *machine) Restore(r io.ReadCloser) error {
 		}
 	}
 	checkEntry := func(e Entry) error {
+		if err := (Mutation{ID: "snapshot", Changes: []Change{{Key: "snapshot", Ref: e.Ref, Delete: e.Deleted, MetaOnly: e.MetaOnly, Attributes: e.Attributes}}}).validate(); err != nil {
+			return err
+		}
 		if e.Index == 0 || e.Index > s.Index {
 			return errors.New("invalid entry index")
 		}
-		if e.Deleted {
+		if e.Deleted || e.MetaOnly {
 			if e.Ref != (generation.Ref{}) {
 				return errors.New("invalid tombstone")
 			}

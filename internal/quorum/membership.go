@@ -62,6 +62,9 @@ func (n *Node) CatchUp(ctx context.Context, id raft.ServerID) error {
 }
 
 func (n *Node) seed(ctx context.Context, s state, id raft.ServerID) error {
+	if p, ok := n.peers.(inventoryPeers); ok {
+		return n.seedIncremental(ctx, s, id, p)
+	}
 	for _, ref := range s.Generations {
 		if err := n.copyTo(ctx, id, ref); err != nil {
 			return err
@@ -74,9 +77,8 @@ func (n *Node) seed(ctx context.Context, s state, id raft.ServerID) error {
 // learner, then changes Raft membership and thaws. Thus increasing N also
 // increases durable copy counts where the new majority requires it. The freeze
 // survives leadership changes; a new leader can resume with the same call.
-// The current implementation retransfers/reverifies all retained generations
-// at this boundary, even after CatchUp. Bounded incremental certification is
-// required before this is suitable for a large production dataset.
+// Transports with process-bound inventory certification copy only the final
+// delta after CatchUp; other transports conservatively recopy all generations.
 func (n *Node) Promote(ctx context.Context, id raft.ServerID) error {
 	return n.change(ctx, "promote", id)
 }

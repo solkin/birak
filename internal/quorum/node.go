@@ -1,6 +1,6 @@
-// Package quorum is the next-generation storage engine. It is not yet wired to
-// birakd's legacy filesystem gateways. The embedding transport must authenticate
-// node/cluster identity and encrypt both Raft and generation traffic.
+// Package quorum provides durable majority writes for birakd quorum mode.
+// The embedding transport authenticates node/cluster identity and encrypts
+// both Raft metadata and immutable generation traffic.
 package quorum
 
 import (
@@ -228,7 +228,15 @@ func wait(ctx context.Context, f raft.Future) error {
 
 // Barrier commits through the current voting configuration, so an isolated
 // former leader cannot return a successful write or a stale linearizable read.
-func (n *Node) barrier(ctx context.Context) error { return wait(ctx, n.raft.Barrier(n.timeout)) }
+func (n *Node) barrier(ctx context.Context) error {
+	if err := n.objects.CheckStorage(); err != nil {
+		return err
+	}
+	if err := wait(ctx, n.raft.Barrier(n.timeout)); err != nil {
+		return err
+	}
+	return n.objects.CheckStorage()
+}
 
 func (n *Node) apply(ctx context.Context, c command) (interface{}, error) {
 	c.Format = Format
@@ -294,34 +302,27 @@ func (n *Node) mutate(ctx context.Context, m Mutation) (Entry, error) {
 	if s.Transition != nil {
 		return Entry{}, ErrTransition
 	}
-	c := command{Kind: "mutate", ConfigIndex: s.ConfigIndex, Mutation: m}
-	if !m.Delete {
-		v := voters(s.Config)
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		type result struct {
-			id  raft.ServerID
-			err error
+	n.fsm.mu.RLock()
+	err := checkConditions(n.fsm.state.Entries, m.Conditions)
+	n.fsm.mu.RUnlock()
+	if err != nil {
+		return Entry{}, err
+	}
+	c := command{Kind: "mutate", ConfigIndex: s.ConfigIndex, Mutation: m, Timestamp: time.Now().UnixNano(), Proofs: make(map[string][]raft.ServerID)}
+	for _, change := range m.changes() {
+		if change.Delete || change.MetaOnly {
+			continue
 		}
-		done := make(chan result, len(v))
-		for id := range v {
-			go func() { done <- result{id, n.copyTo(ctx, id, m.Ref)} }()
+		if _, ok := c.Proofs[change.Ref.Hash]; ok {
+			continue
 		}
-		var failures error
-		for left := len(v); left > 0 && len(c.Copies) < len(v)/2+1; left-- {
-			select {
-			case result := <-done:
-				if result.err == nil {
-					c.Copies = append(c.Copies, result.id)
-				} else {
-					failures = errors.Join(failures, result.err)
-				}
-			case <-ctx.Done():
-				return Entry{}, errors.Join(ErrDataQuorum, ctx.Err(), failures)
-			}
+		copies, err := n.replicate(ctx, s.Config, change.Ref)
+		if err != nil {
+			return Entry{}, err
 		}
-		if len(v) == 0 || len(c.Copies) < len(v)/2+1 {
-			return Entry{}, errors.Join(ErrDataQuorum, failures)
+		c.Proofs[change.Ref.Hash] = copies
+		if len(m.Changes) == 0 {
+			c.Copies = copies
 		}
 	}
 	result, err := n.apply(ctx, c)
@@ -329,6 +330,38 @@ func (n *Node) mutate(ctx context.Context, m Mutation) (Entry, error) {
 		return Entry{}, err
 	}
 	return result.(Entry), nil
+}
+
+func (n *Node) replicate(ctx context.Context, config raft.Configuration, ref generation.Ref) ([]raft.ServerID, error) {
+	v := voters(config)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		id  raft.ServerID
+		err error
+	}
+	done := make(chan result, len(v))
+	for id := range v {
+		go func() { done <- result{id, n.copyTo(ctx, id, ref)} }()
+	}
+	var copies []raft.ServerID
+	var failures error
+	for left := len(v); left > 0 && len(copies) < len(v)/2+1; left-- {
+		select {
+		case result := <-done:
+			if result.err == nil {
+				copies = append(copies, result.id)
+			} else {
+				failures = errors.Join(failures, result.err)
+			}
+		case <-ctx.Done():
+			return nil, errors.Join(ErrDataQuorum, ctx.Err(), failures)
+		}
+	}
+	if len(v) == 0 || len(copies) < len(v)/2+1 {
+		return nil, errors.Join(ErrDataQuorum, failures)
+	}
+	return copies, nil
 }
 
 func (n *Node) checkPeer(ctx context.Context, id raft.ServerID) error {

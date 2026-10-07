@@ -18,6 +18,8 @@ import (
 	"github.com/birak/birak/internal/fileops"
 )
 
+var ErrTooLarge = errors.New("generation exceeds upload limit")
+
 var ErrCorrupt = errors.New("generation checksum or size mismatch")
 
 type Ref struct {
@@ -39,6 +41,10 @@ type Store struct {
 	life        sync.RWMutex // Close waits for in-flight installs before releasing lease
 	mu          sync.Mutex   // publishing/closing only; uploads do not hold this lock
 	release     func() error
+	proofMu     sync.Mutex
+	receipts    map[string]durableReceipt
+	proofID     string
+	proofEpoch  uint64
 	// Explicit fault boundaries, also used by flush-failure/ENOSPC tests.
 	syncFile func(*os.File) error
 	syncDir  func(string) error
@@ -86,7 +92,7 @@ func New(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, release: release, syncFile: (*os.File).Sync, syncDir: SyncDir, directories: make(map[string]os.FileInfo)}
+	s := &Store{receipts: make(map[string]durableReceipt), proofID: newProofID(), dir: dir, release: release, syncFile: (*os.File).Sync, syncDir: SyncDir, directories: make(map[string]os.FileInfo)}
 	for _, sub := range []string{"objects", "staging"} {
 		if err := MakeDir(filepath.Join(dir, sub)); err != nil {
 			release()
@@ -138,6 +144,12 @@ func (s *Store) checkStorage() error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) CheckStorage() error {
+	s.life.RLock()
+	defer s.life.RUnlock()
+	return s.checkStorage()
 }
 
 func (s *Store) Close() error {
@@ -207,7 +219,7 @@ func (s *Store) put(ctx context.Context, r io.Reader, limit int64, expected *Ref
 		return zero, err
 	}
 	if n > limit {
-		return zero, errors.New("generation exceeds upload limit")
+		return zero, ErrTooLarge
 	}
 	ref := Ref{Hash: hex.EncodeToString(h.Sum(nil)), Size: n}
 	if expected != nil && ref != *expected {
@@ -253,6 +265,9 @@ func (s *Store) put(ctx context.Context, r io.Reader, limit int64, expected *Ref
 	if err := s.checkStorage(); err != nil {
 		return zero, err
 	}
+	if err := s.remember(ref); err != nil {
+		return zero, err
+	}
 	return ref, nil
 }
 
@@ -265,7 +280,12 @@ func (s *Store) Open(ctx context.Context, ref Ref) (*os.File, error) {
 	return s.open(ctx, ref)
 }
 
-func (s *Store) open(ctx context.Context, ref Ref) (*os.File, error) {
+func (s *Store) open(ctx context.Context, ref Ref) (file *os.File, openErr error) {
+	defer func() {
+		if openErr != nil {
+			s.forget(ref)
+		}
+	}()
 	if err := s.checkStorage(); err != nil {
 		return nil, err
 	}
@@ -304,6 +324,9 @@ func (s *Store) open(ctx context.Context, ref Ref) (*os.File, error) {
 func (s *Store) VerifyDurable(ctx context.Context, ref Ref) error {
 	s.life.RLock()
 	defer s.life.RUnlock()
+	return s.verifyDurable(ctx, ref)
+}
+func (s *Store) verifyDurable(ctx context.Context, ref Ref) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.release == nil {
@@ -323,5 +346,8 @@ func (s *Store) VerifyDurable(ctx context.Context, ref Ref) error {
 	if err = s.syncDir(filepath.Dir(s.path(ref))); err != nil {
 		return err
 	}
-	return s.checkStorage()
+	if err := s.checkStorage(); err != nil {
+		return err
+	}
+	return s.remember(ref)
 }
