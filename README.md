@@ -1,6 +1,6 @@
 # Birak — Distributed File Server
 
-Birak is a distributed file server with built-in replication. Each node stores a full copy of the data and automatically keeps it in sync with other nodes over the network. Files are accessible via S3 API, WebDAV, SFTP, HTTP file browser, or the local filesystem — use whichever protocol fits your workflow.
+Birak is a distributed file server with built-in replication. In the default filesystem mode, each node stores a full copy of the data and automatically keeps it in sync with other nodes over the network. Files are accessible via S3 API, WebDAV, SFTP, HTTP file browser, or the local filesystem — use whichever protocol fits your workflow.
 
 <p align="center">
   <img src="docs/screenshot-http-browser.jpg" alt="Birak HTTP File Browser" width="800">
@@ -25,11 +25,14 @@ A Birak cluster consists of one or more **nodes**. Each node has two directories
 
 Nodes know about each other through a **peers** list in the config. Each node polls its peers for changes and downloads new or updated files automatically. There is no central server — every node is a full replica.
 
-The current daemon acknowledges local writes before asynchronous replication completes.
-An isolated node's successful response does **not** guarantee that another node has
-the file. A new [quorum storage engine](docs/audits/quorum-core.md) is under
-development and tested separately; it is not enabled by this configuration or
-connected to the gateways yet.
+The default `filesystem` mode acknowledges local writes before asynchronous
+replication completes. An isolated node's successful response does **not**
+guarantee that another node has the file. The opt-in
+[quorum mode](docs/quorum-operations.md) now connects S3 and multipart to durable
+majority writes, authenticated membership and failover. It is intended for
+supervised testing while the remaining [production work](docs/audits/quorum-service-s3.md)
+is completed. The following filesystem configuration and protocols apply to the
+default mode; quorum mode has a separate private data layout and S3-only gateway.
 
 Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browser. For direct filesystem updates, publish atomically and change the mtime when replacing bytes. An unexplained checksum change with identical size and mtime is quarantined and repaired from a healthy peer; use a gateway when intentionally preserving both attributes. Once synced, files are accessible through any supported protocol.
 

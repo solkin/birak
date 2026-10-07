@@ -13,6 +13,8 @@ package birak_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -20,6 +22,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/birak/birak/internal/store"
 )
 
 func TestRestoredBackupRejoinsTheCluster(t *testing.T) {
@@ -47,7 +51,19 @@ func TestRestoredBackupRejoinsTheCluster(t *testing.T) {
 	}
 	holdsEverything := func(n *crashNode) func() bool {
 		return func() bool {
+			// Replica publication writes and flushes bytes before indexing them.
+			// Observing the destination path alone is not a replication ACK.
+			indexed := map[string]store.FileMeta{}
+			for _, entry := range n.manifest(t) {
+				indexed[entry.Name] = entry
+			}
 			for name, want := range expected {
+				entry, ok := indexed[name]
+				digest := sha256.Sum256(want)
+				if !ok || entry.Deleted || entry.Hash != hex.EncodeToString(digest[:]) {
+					return false
+				}
+
 				got, err := os.ReadFile(filepath.Join(n.syncDir, filepath.FromSlash(name)))
 				if err != nil || !bytes.Equal(got, want) {
 					return false

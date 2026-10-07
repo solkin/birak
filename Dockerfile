@@ -3,11 +3,13 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /birakd ./cmd/birakd
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /birakd ./cmd/birakd \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /birakctl ./cmd/birakctl
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata
 COPY --from=build /birakd /usr/local/bin/birakd
+COPY --from=build /birakctl /usr/local/bin/birakctl
 
 # Run as a non-root user that owns the data directories. The SFTP host key is
 # stored under /data/meta (a volume), so it persists across restarts instead of

@@ -3,11 +3,13 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -22,12 +24,14 @@ const defaultScrubBytesPerSecond = 8 << 20
 
 // Config holds all daemon configuration.
 type Config struct {
-	NodeID     string   `yaml:"node_id"`
-	SyncDir    string   `yaml:"sync_dir"`
-	MetaDir    string   `yaml:"meta_dir"`
-	ListenAddr string   `yaml:"listen_addr"`
-	Peers      []string `yaml:"peers"`
-	Ignore     []string `yaml:"ignore"`
+	StorageMode string       `yaml:"storage_mode"`
+	Quorum      QuorumConfig `yaml:"quorum"`
+	NodeID      string       `yaml:"node_id"`
+	SyncDir     string       `yaml:"sync_dir"`
+	MetaDir     string       `yaml:"meta_dir"`
+	ListenAddr  string       `yaml:"listen_addr"`
+	Peers       []string     `yaml:"peers"`
+	Ignore      []string     `yaml:"ignore"`
 	// LogLevel is debug, info, warn or error. Every indexed file and every
 	// cursor move is a debug record written synchronously, some of it while the
 	// store's write mutex is held, so debug logging on a busy node is a
@@ -43,6 +47,23 @@ type Config struct {
 	Multipart      MultipartConfig `yaml:"multipart"`
 	Sync           SyncConfig      `yaml:"sync"`
 	Gateways       GatewaysConfig  `yaml:"gateways"`
+}
+
+type QuorumSeed struct {
+	ID      string `yaml:"id"`
+	Address string `yaml:"address"`
+}
+type QuorumConfig struct {
+	ClusterID        string        `yaml:"cluster_id"`
+	StateDir         string        `yaml:"state_dir"`
+	ListenAddr       string        `yaml:"listen_addr"`
+	AdvertiseAddr    string        `yaml:"advertise_addr"`
+	CAFile           string        `yaml:"ca_file"`
+	CertFile         string        `yaml:"cert_file"`
+	KeyFile          string        `yaml:"key_file"`
+	Seeds            []QuorumSeed  `yaml:"seeds"`
+	OperationTimeout time.Duration `yaml:"operation_timeout"`
+	TransferTimeout  time.Duration `yaml:"transfer_timeout"`
 }
 
 // MultipartConfig holds limits and retention settings for S3 multipart uploads.
@@ -112,7 +133,9 @@ type S3GatewayConfig struct {
 	Domain     string `yaml:"domain"`
 	// Buckets are created at startup when missing, so that they exist before a
 	// client that cannot create them, or should not, first asks for them.
-	Buckets []string `yaml:"buckets"`
+	Buckets     []string `yaml:"buckets"`
+	TLSCertFile string   `yaml:"tls_cert_file"`
+	TLSKeyFile  string   `yaml:"tls_key_file"`
 }
 
 // SyncConfig holds sync-specific tuning parameters.
@@ -151,12 +174,14 @@ type SyncConfig struct {
 // DefaultConfig returns a config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		NodeID:     "node-1",
-		SyncDir:    "./sync",
-		MetaDir:    "./meta",
-		ListenAddr: ":9100",
-		Ignore:     []string{},
-		LogLevel:   "info",
+		StorageMode: "filesystem",
+		Quorum:      QuorumConfig{ListenAddr: ":9100", OperationTimeout: 2 * time.Minute, TransferTimeout: 30 * time.Minute},
+		NodeID:      "node-1",
+		SyncDir:     "./sync",
+		MetaDir:     "./meta",
+		ListenAddr:  ":9100",
+		Ignore:      []string{},
+		LogLevel:    "info",
 		// Unlike the other multipart limits, zero means unlimited for the active
 		// upload cap. Seed its documented default here so an omitted setting is
 		// distinguishable from an explicit max_active_uploads: 0 in YAML.
@@ -227,6 +252,13 @@ func Load(path string) (Config, error) {
 // applyEnv overrides config values with environment variables.
 // Env vars take precedence over the config file.
 func applyEnv(c *Config) {
+	for key, target := range map[string]*string{
+		"BIRAK_STORAGE_MODE": &c.StorageMode, "BIRAK_QUORUM_CLUSTER_ID": &c.Quorum.ClusterID, "BIRAK_QUORUM_STATE_DIR": &c.Quorum.StateDir, "BIRAK_QUORUM_LISTEN_ADDR": &c.Quorum.ListenAddr, "BIRAK_QUORUM_ADVERTISE_ADDR": &c.Quorum.AdvertiseAddr, "BIRAK_QUORUM_CA_FILE": &c.Quorum.CAFile, "BIRAK_QUORUM_CERT_FILE": &c.Quorum.CertFile, "BIRAK_QUORUM_KEY_FILE": &c.Quorum.KeyFile, "BIRAK_S3_TLS_CERT_FILE": &c.Gateways.S3.TLSCertFile, "BIRAK_S3_TLS_KEY_FILE": &c.Gateways.S3.TLSKeyFile,
+	} {
+		if value := os.Getenv(key); value != "" {
+			*target = value
+		}
+	}
 	if v := os.Getenv("BIRAK_NODE_ID"); v != "" {
 		c.NodeID = v
 	}
@@ -453,6 +485,60 @@ func (c Config) SlogLevel() slog.Level {
 }
 
 func (c *Config) validate() error {
+	if c.StorageMode != "filesystem" && c.StorageMode != "quorum" {
+		return fmt.Errorf("storage_mode must be filesystem or quorum")
+	}
+	if (c.Gateways.S3.TLSCertFile == "") != (c.Gateways.S3.TLSKeyFile == "") {
+		return fmt.Errorf("S3 TLS certificate and key must be configured together")
+	}
+	if c.StorageMode == "quorum" {
+		q := c.Quorum
+		if q.ClusterID == "" || q.StateDir == "" || q.ListenAddr == "" || q.AdvertiseAddr == "" || q.CAFile == "" || q.CertFile == "" || q.KeyFile == "" {
+			return fmt.Errorf("quorum requires cluster_id, state_dir, listen_addr, advertise_addr and CA/certificate/key files")
+		}
+		if _, _, err := net.SplitHostPort(q.AdvertiseAddr); err != nil {
+			return fmt.Errorf("invalid quorum advertise_addr: %w", err)
+		}
+		if q.OperationTimeout <= 0 || q.TransferTimeout <= 0 {
+			return fmt.Errorf("quorum timeouts must be positive")
+		}
+		if len(c.Peers) > 0 || len(c.Ignore) > 0 {
+			return fmt.Errorf("legacy peers and ignore rules cannot be used in quorum mode")
+		}
+		if c.Gateways.WebDAV.Enabled || c.Gateways.SFTP.Enabled || c.Gateways.HTTP.Enabled {
+			return fmt.Errorf("quorum mode currently supports S3 only; filesystem gateways would bypass consensus")
+		}
+		if c.Gateways.S3.AccessKey == "" || c.Gateways.S3.SecretKey == "" {
+			return fmt.Errorf("quorum mode requires S3 credentials, including on nodes without a public S3 listener")
+		}
+		for _, bucket := range c.Gateways.S3.Buckets {
+			if bucket == "" || bucket == "." || bucket == ".." || bucket == ".birak" || len(bucket) > 63 || strings.ContainsAny(bucket, "/\\\x00\r\n") || !utf8.ValidString(bucket) {
+				return fmt.Errorf("invalid configured quorum bucket")
+			}
+		}
+		if c.MaxUploadBytes <= 0 {
+			return fmt.Errorf("quorum mode requires a positive max_upload_bytes")
+		}
+		if c.Gateways.S3.Enabled && c.Gateways.S3.TLSCertFile == "" {
+			host, _, err := net.SplitHostPort(c.Gateways.S3.ListenAddr)
+			ip := net.ParseIP(host)
+			if err != nil || ip == nil || !ip.IsLoopback() {
+				return fmt.Errorf("quorum S3 requires TLS or a loopback listener behind a TLS proxy")
+			}
+		}
+		ids := map[string]bool{}
+		addresses := map[string]bool{}
+		for _, seed := range q.Seeds {
+			if seed.ID == "" || seed.ID == c.NodeID || ids[seed.ID] || addresses[seed.Address] {
+				return fmt.Errorf("duplicate or invalid quorum seed")
+			}
+			if _, _, err := net.SplitHostPort(seed.Address); err != nil {
+				return fmt.Errorf("invalid seed address: %w", err)
+			}
+			ids[seed.ID] = true
+			addresses[seed.Address] = true
+		}
+	}
 	if _, ok := logLevels[strings.ToLower(strings.TrimSpace(c.LogLevel))]; !ok && c.LogLevel != "" {
 		return fmt.Errorf("log_level must be one of debug, info, warn, error (got %q)", c.LogLevel)
 	}
