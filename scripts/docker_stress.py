@@ -84,9 +84,16 @@ class Stand:
 
     def connect(self, index):
         docker("network", "connect", "--alias", f"n{index}-peer", self.cluster, self.nodes[index]["name"])
+        self.refresh_endpoints(index)
 
     def restart(self, index):
         docker("start", self.nodes[index]["name"])
+        self.refresh_endpoints(index)
+
+    def refresh_endpoints(self, index):
+        # Some Linux engines reallocate dynamically published ports when the
+        # default bridge changes. Read the current bindings after every network
+        # mutation, not only before attaching the replication network.
         ports = json.loads(docker("inspect", self.nodes[index]["name"]))[0]["NetworkSettings"]["Ports"]
         for kind, port in (("sync", "9100/tcp"), ("s3", "9200/tcp")):
             scheme = "https" if kind == "s3" and getattr(self, "tls", None) else "http"
@@ -94,6 +101,7 @@ class Stand:
 
     def disconnect(self, index):
         docker("network", "disconnect", self.cluster, self.nodes[index]["name"])
+        self.refresh_endpoints(index)
 
     def headers(self, index, kind, method, path, body=b"", payload_hash=None):
         endpoint = self.nodes[index][kind]
@@ -182,6 +190,11 @@ class Stand:
     def close(self, logs):
         for index, node in self.nodes.items():
             logs[f"n{index}"] = docker("logs", "--tail", "100", node["name"], check=False)
+            raw = docker("inspect", node["name"], check=False)
+            if raw:
+                info = json.loads(raw)[0]
+                logs[f"n{index}-state"] = json.dumps({"state": info["State"],
+                    "ports": info["NetworkSettings"]["Ports"], "sync": node["sync"], "s3": node["s3"]})
             docker("rm", "--volumes", "-f", node["name"], check=False)
         for volume in self.volumes:
             docker("volume", "rm", volume, check=False)
