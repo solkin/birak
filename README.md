@@ -45,7 +45,7 @@ Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browse
 
 ## Quick Start
 
-Current release: **v2.0.0**. Read the [release and upgrade notes](docs/releases/v2.0.0.md)
+Current release: **v2.0.1**. Read the [release and upgrade notes](docs/releases/v2.0.1.md)
 before upgrading an existing cluster.
 
 ### Docker
@@ -531,7 +531,7 @@ A polling cursor acknowledges receipt, not successful application. It cannot saf
 
 Run one daemon per data volume and metadata directory; OS-held leases reject a second process and are released automatically on exit. Assign a unique `node_id` to each node. Replication rejects a peer advertising the same ID as the local node. Each database has a persistent identity, while every daemon start generates a fresh **process incarnation**, returned as `X-Birak-Epoch`. Peers reset their cursors on an incarnation change and replay current metadata. This also covers a restored backup whose version counter has already caught up with an old cursor.
 
-**Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 4`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds the extended clock, namespace reservations, and admission marker automatically. Build with Go 1.26 or newer. Keep a pre-upgrade metadata backup if a binary rollback is required.
+**Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 4`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds the extended clock, namespace reservations, and admission marker automatically. Release builds pin Go 1.26.9; use a patched supported Go toolchain when building from source. Keep a pre-upgrade metadata backup if a binary rollback is required.
 
 The version high-water mark survives deletion of file records. Both `meta_dir` and `sync_dir`, including `.birak/storage-id`, should use persistent storage and be included in a consistent backup. Losing the metadata also loses deletion history, cursors, and repair work that might have no other surviving copy.
 
