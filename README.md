@@ -45,7 +45,7 @@ Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browse
 
 ## Quick Start
 
-Current release: **v2.0.1**. Read the [release and upgrade notes](docs/releases/v2.0.1.md)
+Current release: **v2.0.2**. Read the [release and upgrade notes](docs/releases/v2.0.2.md)
 before upgrading an existing cluster.
 
 ### Docker

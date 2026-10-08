@@ -97,7 +97,11 @@ class Stand:
         ports = json.loads(docker("inspect", self.nodes[index]["name"]))[0]["NetworkSettings"]["Ports"]
         for kind, port in (("sync", "9100/tcp"), ("s3", "9200/tcp")):
             scheme = "https" if kind == "s3" and getattr(self, "tls", None) else "http"
-            self.nodes[index][kind] = scheme + "://127.0.0.1:" + ports[port][0]["HostPort"]
+            current = scheme + "://127.0.0.1:" + ports[port][0]["HostPort"]
+            if current != self.nodes[index][kind]:
+                print(json.dumps({"event": "docker_port_remapped", "node": index,
+                      "kind": kind, "before": self.nodes[index][kind], "after": current}), flush=True)
+            self.nodes[index][kind] = current
 
     def disconnect(self, index):
         docker("network", "disconnect", self.cluster, self.nodes[index]["name"])
