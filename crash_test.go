@@ -103,8 +103,6 @@ func TestCrashLeavesTheIndexBehindTheDisk(t *testing.T) {
 	// Acknowledged writes accumulate across rounds: a crash must not lose one
 	// that was acknowledged three crashes ago either.
 	acknowledged := map[string][]byte{}
-	firstACK := make(chan struct{})
-	var ackOnce sync.Once
 
 	for round := range rounds {
 		written := node.writeUntilKilled(t, round)
@@ -246,6 +244,8 @@ func (n *crashNode) writeUntilKilled(t *testing.T, round int) map[string][]byte 
 	t.Helper()
 	var mu sync.Mutex
 	acknowledged := map[string][]byte{}
+	firstACK := make(chan struct{})
+	var ackOnce sync.Once
 
 	stop := make(chan struct{})
 	var writers sync.WaitGroup
