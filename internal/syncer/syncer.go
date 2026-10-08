@@ -182,7 +182,8 @@ type Syncer struct {
 	// help them, so they leave no repair row — which is exactly why they need a
 	// counter: a peer whose ignore list differs diverges permanently, and that
 	// was previously visible only as a log line nobody reads.
-	skipped atomic.Int64
+	initialized atomic.Bool
+	skipped     atomic.Int64
 
 	// Unexported checkpoint for process-boundary regression tests.
 	namespaceCheckpoint func(step, name string) error
@@ -237,7 +238,7 @@ func New(
 		wake[p] = make(chan struct{}, 1)
 	}
 
-	return &Syncer{
+	result := &Syncer{
 		store:          s,
 		watcher:        w,
 		syncDir:        syncDir,
@@ -263,6 +264,8 @@ func New(
 			CheckRedirect: refuseRedirect,
 		},
 	}
+	result.initializeAdmission()
+	return result
 }
 
 // Peer URLs are explicit cluster configuration. A redirect is not permission
@@ -316,8 +319,13 @@ func (s *Syncer) Run(ctx context.Context) {
 }
 
 // ScanStatus and CheckStorage expose local readiness separately from peers.
-func (s *Syncer) ScanStatus() watcher.ScanStatus { return s.watcher.Status() }
-func (s *Syncer) CheckStorage() error            { return s.watcher.CheckStorage() }
+func (s *Syncer) ScanStatus() watcher.ScanStatus {
+	status := s.watcher.Status()
+	status.ReplicaInitialized = s.ServingReady()
+	status.Ready = status.Ready && status.ReplicaInitialized
+	return status
+}
+func (s *Syncer) CheckStorage() error { return s.watcher.CheckStorage() }
 
 // SkippedEntries counts peer entries this node decided never to apply.
 func (s *Syncer) SkippedEntries() int64 { return s.skipped.Load() }
@@ -440,6 +448,7 @@ func (s *Syncer) pollPeer(ctx context.Context, peerURL string) {
 			continue
 		}
 
+		s.ServingReady()
 		// No changes — wait before the next poll. The jitter keeps a fleet of
 		// pods from settling into lockstep against the same peer.
 		if !sleepCtx(ctx, jitter(s.opts.PollInterval)) {
@@ -704,11 +713,8 @@ func validateMetadata(change store.FileMeta) error {
 	if !change.Deleted && (change.Size < 0 || change.Size == math.MaxInt64 || !isSHA256Hex(change.Hash)) {
 		return fmt.Errorf("malformed metadata (size=%d hash=%q)", change.Size, change.Hash)
 	}
-	// A saturated conflict clock can never be advanced past, so accepting one
-	// would leave every later local write at that name failing forever. No real
-	// timestamp reaches it; refusing the value keeps the path writable.
-	if change.Clock == math.MaxInt64 || change.ModTime == math.MaxInt64 {
-		return fmt.Errorf("saturated conflict clock for %q", change.Name)
+	if err := store.ValidateClock(change); err != nil {
+		return err
 	}
 	if change.SupersededBy != "" {
 		if !change.Deleted || change.Size != 0 || !isSHA256Hex(change.Hash) || !store.NamespaceConflict(change.Name, change.SupersededBy) {
@@ -892,11 +898,11 @@ func (s *Syncer) deferRepair(peerURL string, item store.RepairItem, cause string
 // Reconciliation derives that difference from the manifest, independently of
 // the cursor. Persistent I/O or connectivity failures still require recovery.
 func (s *Syncer) reconcilePeer(ctx context.Context, peerURL string) {
-	if s.opts.ReconcileInterval == 0 {
+	if s.opts.ReconcileInterval == 0 && s.initialized.Load() {
 		return
 	}
 	// Stagger the first pass so a restarted fleet does not reconcile in unison.
-	if !sleepCtx(ctx, jitter(s.opts.ReconcileInterval/4)) {
+	if s.initialized.Load() && !sleepCtx(ctx, jitter(s.opts.ReconcileInterval/4)) {
 		return
 	}
 	for {
@@ -912,7 +918,14 @@ func (s *Syncer) reconcilePeer(ctx context.Context, peerURL string) {
 			// that stopped on its page budget has compared a slice of it.
 			s.withStat(peerURL, func(st *peerStat) { st.lastReconcile = time.Now() })
 		}
-		if !sleepCtx(ctx, jitter(s.opts.ReconcileInterval)) {
+		s.ServingReady()
+		interval := s.opts.ReconcileInterval
+		if !s.initialized.Load() {
+			interval = time.Second
+		} else if interval <= 0 {
+			return
+		}
+		if !sleepCtx(ctx, jitter(interval)) {
 			return
 		}
 	}
@@ -1418,6 +1431,14 @@ func (s *Syncer) commitDeletionLocked(ctx context.Context, meta store.FileMeta, 
 // rewriting it. Watcher-generated names are already canonical, so any change
 // during cleaning signals malformed or traversal-oriented peer metadata.
 func (s *Syncer) safeLocalPath(name string) (string, error) {
+	if s.store != nil {
+		if err := s.store.CheckName(name); err != nil {
+			return "", err
+		}
+	}
+	if err := fileops.CheckSpelling(s.syncDir, filepath.Join(s.syncDir, filepath.FromSlash(name))); err != nil {
+		return "", err
+	}
 	normalized := filepath.ToSlash(name)
 	if err := validateSyncName(normalized); err != nil {
 		return "", err

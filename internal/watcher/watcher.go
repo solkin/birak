@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -414,12 +415,11 @@ func (w *Watcher) addDirsRecursive(fsw *fsnotify.Watcher, root string) (failCoun
 	return failCount, err
 }
 
-// processBatch inspects and publishes each file under the same lock used by
-// gateway commits and replication. No stale event batch can overwrite a newer
-// store entry at the end of a long scan.
+// processBatch hashes outside the commit lock, then checks the generation and
+// current state under the same lock used by gateways and replication.
 func (w *Watcher) processBatch(names []string) {
 	for _, name := range names {
-		err := w.Refresh(name)
+		err := w.scanFile(name)
 		if err == nil {
 			continue
 		}
@@ -475,10 +475,19 @@ func (w *Watcher) scanFile(name string) error {
 	}
 	unlock := fileops.Lock(w.dir)
 	defer unlock()
+	if err := w.prepareStorageLocked(); err != nil {
+		return err
+	}
 	return w.refreshFileLocked(name, indexOptions{published: map[string]*hashed{name: {info: info, hash: hash}}})
 }
 
 func (w *Watcher) refreshFileLocked(name string, opts indexOptions) error {
+	if err := w.store.CheckName(name); err != nil {
+		return err
+	}
+	if err := fileops.CheckSpelling(w.dir, filepath.Join(w.dir, filepath.FromSlash(name))); err != nil {
+		return err
+	}
 	if fileops.BusyLocked(w.dir, filepath.Join(w.dir, filepath.FromSlash(name))) {
 		return fileops.ErrBusy
 	}
@@ -540,7 +549,7 @@ func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, err
 		}
 		// The root was verified above; absence is a local deletion, not loss of a mount.
 		CleanEmptyParentsLocked(fullPath, w.dir, w.ignorePatterns, w.logger)
-		return &FileEvent{Name: name, ModTime: existing.ModTime + 1, Deleted: true}, nil
+		return &FileEvent{Name: name, ModTime: existing.ModTime, Deleted: true}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -623,12 +632,22 @@ func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, err
 	if existing != nil && !existing.Deleted && existing.Hash == hash && existing.ModTime == info.ModTime().UnixNano() && existing.Size == info.Size() {
 		return nil, nil
 	}
-	if existing != nil && !existing.Deleted && existing.Hash == hash && existing.Size == info.Size() {
-		// Same bytes, different timestamp. One file is somebody running touch;
-		// a tree of them is a backup restored with a copy that dropped
-		// modification times, and every one of those files is about to outrank
-		// whatever the cluster holds — including a deletion.
+	if !trusted && existing != nil && !existing.Deleted && existing.Hash == hash && existing.Size == info.Size() {
+		// Unchanged bytes with restored timestamps are not a new mutation. Keep
+		// the recorded rank and durably restore mtime before exposing metadata.
+		stamp := time.Unix(0, existing.ModTime)
+		if err := os.Chtimes(fullPath, stamp, stamp); err != nil {
+			return nil, err
+		}
+		f, err := os.Open(fullPath)
+		if err != nil {
+			return nil, err
+		}
+		if err := errors.Join(f.Sync(), f.Close()); err != nil {
+			return nil, err
+		}
 		w.restamped.Add(1)
+		return nil, nil
 	}
 	return &FileEvent{Name: name, ModTime: info.ModTime().UnixNano(), Size: info.Size(), Hash: hash}, nil
 }
@@ -648,9 +667,12 @@ func (w *Watcher) snapshot(path string, precomputed *hashed) (os.FileInfo, strin
 // ScanStatus describes the last complete checksum scan, independent of peers.
 // A failed or incomplete scan never opens readiness.
 type ScanStatus struct {
-	Ready         bool   `json:"ready"`
-	LastScanAgoMS int64  `json:"last_scan_ms_ago"`
-	LastError     string `json:"last_error,omitempty"`
+	ScrubBytesPerSecond     int64  `json:"scrub_bytes_per_second"`
+	DirectorySyncBestEffort bool   `json:"directory_sync_best_effort"`
+	ReplicaInitialized      bool   `json:"replica_initialized"`
+	Ready                   bool   `json:"ready"`
+	LastScanAgoMS           int64  `json:"last_scan_ms_ago"`
+	LastError               string `json:"last_error,omitempty"`
 	// Quarantined counts names whose bytes changed without a write timestamp.
 	// They are individually unavailable and awaiting repair from a peer.
 	Quarantined int `json:"quarantined"`
@@ -663,7 +685,7 @@ type ScanStatus struct {
 func (w *Watcher) Status() ScanStatus {
 	w.statusMu.Lock()
 	defer w.statusMu.Unlock()
-	status := ScanStatus{LastError: w.lastError, LastScanAgoMS: -1, LastScrubAgoMS: -1, Quarantined: w.store.QuarantineCount()}
+	status := ScanStatus{LastError: w.lastError, LastScanAgoMS: -1, LastScrubAgoMS: -1, Quarantined: w.store.QuarantineCount(), ScrubBytesPerSecond: w.scrubRate.Load(), DirectorySyncBestEffort: runtime.GOOS == "windows"}
 	if !w.lastScrub.IsZero() {
 		status.LastScrubAgoMS = time.Since(w.lastScrub).Milliseconds()
 	}
@@ -808,6 +830,39 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 		return err
 	}
 	var scanErr, integrityErr error
+	inspectError := func(name string, err error) {
+		if err == nil {
+			return
+		}
+		switch {
+		case errors.Is(err, ErrIntegrity):
+			integrityErr = errors.Join(integrityErr, err)
+		case errors.Is(err, fileops.ErrBusy):
+			w.logger.Debug("scan skipped a file being written", "name", name)
+		default:
+			scanErr = errors.Join(scanErr, err)
+		}
+	}
+	// Fetch metadata for bounded batches instead of one SQL query per inode.
+	// The deletion pass below already owns index pages and reuses those too.
+	batch := make([]string, 0, 256)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		known, err := w.store.GetFilesBatch(batch)
+		if err != nil {
+			return err
+		}
+		for _, name := range batch {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			inspectError(name, w.sweepKnownFile(name, known[name]))
+		}
+		batch = batch[:0]
+		return nil
+	}
 	err := filepath.WalkDir(w.dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -834,22 +889,16 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 		if d.IsDir() {
 			return nil
 		}
-		if err := w.sweepFile(name); err != nil {
-			switch {
-			case errors.Is(err, ErrIntegrity):
-				integrityErr = errors.Join(integrityErr, err)
-			case errors.Is(err, fileops.ErrBusy):
-				// A gateway owns this name right now. Its own commit indexes the
-				// result, so an upload in flight is not an incomplete scan — and
-				// must not take a node that is serving traffic out of rotation.
-				w.logger.Debug("scan skipped a file being written", "name", name)
-			default:
-				scanErr = errors.Join(scanErr, err)
-			}
+		batch = append(batch, name)
+		if len(batch) == cap(batch) {
+			return flush()
 		}
 		return nil
 	})
 	if err != nil || scanErr != nil {
+		return errors.Join(err, scanErr)
+	}
+	if err := flush(); err != nil || scanErr != nil {
 		return errors.Join(err, scanErr)
 	}
 	var after string
@@ -878,7 +927,7 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 			// A file may also have appeared since the walk. Both paths recheck
 			// disk and store under the commit lock, so neither can publish a
 			// stale deletion.
-			if err := w.sweepFile(meta.Name); err != nil && !errors.Is(err, fileops.ErrBusy) && !errors.Is(err, ErrIntegrity) {
+			if err := w.sweepKnownFile(meta.Name, &meta); err != nil && !errors.Is(err, fileops.ErrBusy) && !errors.Is(err, ErrIntegrity) {
 				return err
 			}
 		}
@@ -908,11 +957,7 @@ func (w *Watcher) warnAboutRestamping() {
 	if restamped < restampThreshold {
 		return
 	}
-	w.logger.Warn("files have unchanged contents but new modification times",
-		"files", restamped,
-		"consequence", "these will outrank the cluster's current state, including deletions",
-		"likely_cause", "a backup restored with a copy that did not preserve timestamps",
-		"remedy", "restore again with cp -a, rsync -a or tar -p before this node replicates")
+	w.logger.Warn("restored modification times for unchanged indexed files", "files", restamped)
 }
 
 // safeSymlinkInfo follows a file symlink only when its target remains inside the

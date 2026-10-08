@@ -123,6 +123,12 @@ func TestRestoredBackupRejoinsTheCluster(t *testing.T) {
 // since deleted. Bringing them back would be worse than losing them — a delete
 // that undoes itself is the failure operators never forgive.
 func TestRestoredBackupDoesNotResurrectDeletedFiles(t *testing.T) {
+	for _, restamp := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lost-timestamps=%v", restamp), func(t *testing.T) { testRestoredBackupDeletion(t, restamp) })
+	}
+}
+
+func testRestoredBackupDeletion(t *testing.T, restamp bool) {
 	binary := daemonBinary(t)
 	writer := newCrashNode(t, binary)
 	restored := newCrashNode(t, binary)
@@ -170,6 +176,20 @@ func TestRestoredBackupDoesNotResurrectDeletedFiles(t *testing.T) {
 	}
 	copyTree(t, filepath.Join(backup, "sync"), restored.syncDir)
 	copyTree(t, filepath.Join(backup, "meta"), filepath.Join(restored.root, "meta"))
+	if restamp {
+		stamp := time.Now().Add(time.Hour)
+		if err := filepath.WalkDir(restored.syncDir, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.Type().IsRegular() {
+				return os.Chtimes(path, stamp, stamp)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	restored.start(t)
 	restored.awaitReady(t)
 
@@ -190,13 +210,10 @@ func TestRestoredBackupDoesNotResurrectDeletedFiles(t *testing.T) {
 // copyTree copies a directory tree the way a backup tool must: contents,
 // permissions **and modification times**.
 //
-// The timestamps are not a nicety. Conflict resolution ranks a file by its
-// logical clock, and a restored file whose timestamp is fresh is indexed as a
-// brand-new local write — it then outranks the cluster's newer state, including
-// tombstones, and a deletion undoes itself on every node. Restoring with a copy
-// that drops timestamps is silent, and it corrupts the whole cluster rather
-// than one node. `cp -a`, `rsync -a`, `tar -p` and every real backup tool
-// preserve them; plain `cp -R` does not.
+// Preserving timestamps avoids rehashing every restored file. With matching
+// metadata or a durable replica intent, unchanged bytes also recover their
+// recorded timestamp when a backup tool loses it. Without metadata, a restored
+// file is indistinguishable from a new local write.
 func copyTree(t *testing.T, from, to string) {
 	t.Helper()
 	err := filepath.WalkDir(from, func(path string, d fs.DirEntry, err error) error {

@@ -135,6 +135,71 @@ func TestReplicaIntentRetainsRemoteClock(t *testing.T) {
 	}
 }
 
+func TestReplicaIntentRecoveryAfterBackupRestamps(t *testing.T) {
+	for _, indexed := range []bool{false, true} {
+		for _, changed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("indexed=%v/changed=%v", indexed, changed), func(t *testing.T) {
+				w := auditWatcher(t)
+				path := filepath.Join(w.dir, "file")
+				clock := int64(500)
+				if indexed {
+					if err := os.WriteFile(path, []byte("before"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					if err := w.Refresh("file"); err != nil {
+						t.Fatal(err)
+					}
+					old, err := w.store.GetFile("file")
+					if err != nil || old == nil {
+						t.Fatalf("initial metadata: %+v %v", old, err)
+					}
+					clock = old.StateClock() + 500
+				}
+				stamp := time.Now().Add(-time.Hour)
+				if err := os.WriteFile(path, []byte("AFTER!"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				hash, err := hashFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				meta := store.FileMeta{Name: "file", Hash: hash, Size: 6, ModTime: stamp.UnixNano(), Clock: clock}
+				if err := w.store.StageReplica(meta); err != nil {
+					t.Fatal(err)
+				}
+				if changed {
+					if err := os.WriteFile(path, []byte("OTHER!"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				fresh := time.Now().Add(time.Hour)
+				if err := os.Chtimes(path, fresh, fresh); err != nil {
+					t.Fatal(err)
+				}
+				restarted := New(w.dir, w.store, w.logger, time.Millisecond, time.Hour, nil)
+				if err := restarted.Refresh("file"); err != nil {
+					t.Fatal(err)
+				}
+				got, err := w.store.GetFile("file")
+				if err != nil || got == nil {
+					t.Fatalf("recovered metadata: %+v %v", got, err)
+				}
+				if !changed {
+					info, err := os.Stat(path)
+					if err != nil || info.ModTime().UnixNano() != meta.ModTime || store.CompareState(got, &meta) != 0 {
+						t.Fatalf("restamped replica became a local write: %+v %v", got, err)
+					}
+				} else if got.Hash == meta.Hash || got.ModTime != fresh.UnixNano() {
+					t.Fatalf("different bytes accepted as replica: %+v", got)
+				}
+				if pending, err := w.store.ReplicaIntent("file"); err != nil || pending != nil {
+					t.Fatalf("intent not resolved: %+v %v", pending, err)
+				}
+			})
+		}
+	}
+}
+
 func TestReplicaDeletionIntentBesideDirectory(t *testing.T) {
 	w := auditWatcher(t)
 	path := filepath.Join(w.dir, "file")

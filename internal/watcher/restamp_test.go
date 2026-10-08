@@ -1,10 +1,7 @@
 package watcher
 
-// A backup restored with a copy that dropped modification times is the quietest
-// way to corrupt this cluster: every restored file is indexed as a brand-new
-// local write, outranks whatever the peers hold, and overwrites it — deletions
-// included. Nothing about it looks like an error. The least this node can do is
-// say so out loud, once, while there is still time to restore it properly.
+// Restoring unchanged bytes with lost timestamps retains their recorded rank
+// and repairs the on-disk timestamps, before replication starts.
 
 import (
 	"bytes"
@@ -25,7 +22,7 @@ func restampWatcher(t *testing.T) (*Watcher, *bytes.Buffer) {
 	return w, &logged
 }
 
-func TestRestoreWithoutTimestampsIsReported(t *testing.T) {
+func TestRestoreWithoutTimestampsIsCorrectedAndReported(t *testing.T) {
 	w, logged := restampWatcher(t)
 	for i := range restampThreshold + 2 {
 		path := filepath.Join(w.dir, "file-"+string(rune('a'+i))+".bin")
@@ -38,6 +35,17 @@ func TestRestoreWithoutTimestampsIsReported(t *testing.T) {
 	}
 	if strings.Contains(logged.String(), "modification times") {
 		t.Fatalf("warned about a tree it had only just indexed:\n%s", logged.String())
+	}
+	before := make(map[string]int64)
+	versions := make(map[string]int64)
+	clocks := make(map[string]int64)
+	for i := range restampThreshold + 2 {
+		name := "file-" + string(rune('a'+i)) + ".bin"
+		meta, err := w.store.GetFile(name)
+		if err != nil || meta == nil {
+			t.Fatalf("indexed %s: %v", name, err)
+		}
+		before[name], versions[name], clocks[name] = meta.ModTime, meta.Version, meta.Clock
 	}
 
 	// Restore: same bytes, new timestamps — what `cp -R` leaves behind.
@@ -60,11 +68,22 @@ func TestRestoreWithoutTimestampsIsReported(t *testing.T) {
 	if err := restarted.periodicScan(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	for name, stamp := range before {
+		meta, err := w.store.GetFile(name)
+		if err != nil || meta == nil {
+			t.Fatalf("restored %s: %v", name, err)
+		}
+		info, err := os.Stat(filepath.Join(w.dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if meta.ModTime != stamp || meta.Version != versions[name] || meta.Clock != clocks[name] || info.ModTime().UnixNano() != stamp {
+			t.Fatalf("restore promoted unchanged %s or failed to repair its timestamp: %+v; disk=%d", name, meta, info.ModTime().UnixNano())
+		}
+	}
 	out := logged.String()
 	for _, want := range []string{
-		"unchanged contents but new modification times",
-		"did not preserve timestamps",
-		"cp -a",
+		"restored modification times for unchanged indexed files",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("a restore without timestamps went unreported (missing %q):\n%s", want, out)

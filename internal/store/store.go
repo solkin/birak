@@ -1,7 +1,7 @@
 package store
 
 import (
-	"cmp"
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -25,13 +25,14 @@ const NoAckGate = int64(math.MaxInt64)
 // FileMeta represents a file entry in the store. It doubles as the wire format
 // of /changes, /meta and /manifest, so only replicated fields are serialized.
 type FileMeta struct {
-	Name    string `json:"name"`
-	ModTime int64  `json:"mod_time"` // UnixNano
-	Size    int64  `json:"size"`
-	Hash    string `json:"hash"` // SHA256 hex
-	Deleted bool   `json:"deleted"`
-	Version int64  `json:"version"`
-	Clock   int64  `json:"clock"` // per-path logical time; independent of filesystem mtime
+	Name     string `json:"name"`
+	ModTime  int64  `json:"mod_time"` // UnixNano
+	Size     int64  `json:"size"`
+	Hash     string `json:"hash"` // SHA256 hex
+	Deleted  bool   `json:"deleted"`
+	Version  int64  `json:"version"`
+	BigClock string `json:"big_clock,omitempty"`
+	Clock    int64  `json:"clock"` // per-path logical time; independent of filesystem mtime
 	// A namespace tombstone carries the winning live state's clock, mtime,
 	// hash and name. It must not invent a clock that can defeat a newer file.
 	SupersededBy string `json:"superseded_by,omitempty"`
@@ -109,6 +110,10 @@ type Store struct {
 	integrityMu    sync.RWMutex
 	quarantined    map[string]bool
 	damagedObjects map[string]bool
+	countMu        sync.Mutex
+	countVersion   int64
+	countValid     bool
+	countCached    int64
 }
 
 // SetRepairLimit changes the per-peer queue cap. Zero disables it.
@@ -147,6 +152,11 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+
+	if err := s.migrateNames(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("portable namespace: %w", err)
 	}
 
 	// Migrate legacy databases from MAX(version), retaining any higher persisted
@@ -239,6 +249,7 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_files_deleted_name ON files(deleted, name);
 	CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
 
+	CREATE TABLE IF NOT EXISTS namespace_names (folded TEXT PRIMARY KEY, name TEXT NOT NULL);
 	CREATE TABLE IF NOT EXISTS local_intents (path TEXT PRIMARY KEY);
 	CREATE TABLE IF NOT EXISTS quarantine (name TEXT PRIMARY KEY);
 	CREATE TABLE IF NOT EXISTS damaged_objects (identity TEXT PRIMARY KEY);
@@ -292,6 +303,7 @@ func (s *Store) migrate() error {
 	}
 	for _, column := range []struct{ table, name, definition string }{
 		{"files", "clock", "INTEGER NOT NULL DEFAULT 0"},
+		{"files", "big_clock", "TEXT NOT NULL DEFAULT ''"},
 		{"files", "superseded_by", "TEXT NOT NULL DEFAULT ''"},
 		{"files", "conflict_of", "TEXT NOT NULL DEFAULT ''"},
 		{"repair_queue", "metadata", "TEXT NOT NULL DEFAULT ''"},
@@ -453,21 +465,20 @@ func (s *Store) commitPut(meta FileMeta, local bool) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	if err := bindName(tx, name); err != nil {
+		return 0, err
+	}
+	if err := ValidateClock(meta); err != nil {
+		return 0, err
+	}
 	if local {
-		// Zero means a legacy row: its clock falls back to mtime. New local
-		// clocks must stay positive even for files dated before the Unix epoch.
-		meta.Clock = max(1, meta.Clock, meta.ModTime)
 		previous, err := namespaceClock(tx, name)
 		if err != nil {
 			return 0, err
 		}
-		if previous.Valid {
-			if previous.Int64 == math.MaxInt64 {
-				return 0, fmt.Errorf("conflict clock exhausted for %q", name)
-			}
-			meta.Clock = max(meta.Clock, previous.Int64+1)
-		}
+		AdvanceClock(&meta, previous)
 	}
+
 	var ver int64
 	if err := tx.QueryRow(`UPDATE node_meta SET value = CAST(value AS INTEGER) + 1
 		WHERE key = 'last_version' RETURNING CAST(value AS INTEGER)`).Scan(&ver); err != nil {
@@ -486,8 +497,8 @@ func (s *Store) commitPut(meta FileMeta, local bool) (int64, error) {
 	}
 
 	_, execErr := tx.Exec(`
-		INSERT INTO files (name, mod_time, size, hash, deleted, version, deleted_at, clock, superseded_by, conflict_of)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO files (name, mod_time, size, hash, deleted, version, deleted_at, clock, superseded_by, conflict_of, big_clock)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			mod_time   = excluded.mod_time,
 			size       = excluded.size,
@@ -497,8 +508,9 @@ func (s *Store) commitPut(meta FileMeta, local bool) (int64, error) {
 			deleted_at = excluded.deleted_at,
  clock = excluded.clock,
  superseded_by = excluded.superseded_by,
- conflict_of = excluded.conflict_of
-	`, name, modTime, size, hash, deletedInt, ver, deletedAt, meta.Clock, meta.SupersededBy, meta.ConflictOf)
+ conflict_of = excluded.conflict_of,
+ big_clock = excluded.big_clock
+	`, name, modTime, size, hash, deletedInt, ver, deletedAt, meta.Clock, meta.SupersededBy, meta.ConflictOf, meta.BigClock)
 	if execErr != nil {
 		// Roll back the version counter on failure so versions stay gapless.
 		return 0, fmt.Errorf("upsert file %q: %w", name, execErr)
@@ -513,12 +525,12 @@ func (s *Store) commitPut(meta FileMeta, local bool) (int64, error) {
 	return ver, nil
 }
 
-const fileColumns = "name, mod_time, size, hash, deleted, version, deleted_at, clock, superseded_by, conflict_of"
+const fileColumns = "name, mod_time, size, hash, deleted, version, deleted_at, clock, superseded_by, conflict_of, big_clock"
 
 func scanFile(sc interface{ Scan(...any) error }) (FileMeta, error) {
 	var f FileMeta
 	var deleted int
-	err := sc.Scan(&f.Name, &f.ModTime, &f.Size, &f.Hash, &deleted, &f.Version, &f.DeletedAt, &f.Clock, &f.SupersededBy, &f.ConflictOf)
+	err := sc.Scan(&f.Name, &f.ModTime, &f.Size, &f.Hash, &deleted, &f.Version, &f.DeletedAt, &f.Clock, &f.SupersededBy, &f.ConflictOf, &f.BigClock)
 	f.Deleted = deleted != 0
 	return f, err
 }
@@ -594,11 +606,55 @@ func (s *Store) MaxVersion() (int64, error) {
 	return s.cachedNextVer - 1, nil
 }
 
-// FileCount returns the number of non-deleted files.
+// FileCount caches the indexed COUNT until the next committed file mutation.
+// Frequent monitoring must not scan half a million names on every scrape.
 func (s *Store) FileCount() (int64, error) {
+	s.countMu.Lock()
+	defer s.countMu.Unlock()
+	version, err := s.MaxVersion()
+	if err != nil {
+		return 0, err
+	}
+	if s.countValid && s.countVersion == version {
+		return s.countCached, nil
+	}
 	var count int64
-	err := s.db.QueryRow("SELECT COUNT(*) FROM files WHERE deleted = 0").Scan(&count)
+	err = s.db.QueryRow("SELECT COUNT(*) FROM files WHERE deleted = 0").Scan(&count)
+	if err == nil {
+		// A concurrent mutation leaves this cache tagged with the earlier
+		// version, so the next call recomputes rather than keeping a stale count.
+		s.countCached, s.countVersion, s.countValid = count, version, true
+	}
 	return count, err
+}
+
+// ListLiveRange seeks in the live-name index. Bounds are [from, until), with
+// an additional exclusive cursor. It never materializes a whole bucket.
+func (s *Store) ListLiveRange(ctx context.Context, from, until, after string, limit int) ([]FileMeta, error) {
+	if limit <= 0 || limit > 10000 {
+		return nil, fmt.Errorf("invalid live range limit %d", limit)
+	}
+	operator, lower := ">=", from
+	if after >= from {
+		operator, lower = ">", after
+	}
+	// Give SQLite one lower bound, so a deep cursor always becomes the index
+	// seek rather than a residual filter on an earlier bucket-prefix bound.
+	rows, err := s.db.QueryContext(ctx, "SELECT "+fileColumns+
+		" FROM files WHERE deleted=0 AND name"+operator+"? AND name<? ORDER BY name LIMIT ?", lower, until, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var page []FileMeta
+	for rows.Next() {
+		meta, err := scanFile(rows)
+		if err != nil {
+			return nil, err
+		}
+		page = append(page, meta)
+	}
+	return page, rows.Err()
 }
 
 // GetPeerState returns the cursor and remembered epoch for a peer.
@@ -813,7 +869,7 @@ func CompareState(a, b *FileMeta) int {
 	if b == nil {
 		return 1
 	}
-	if c := cmp.Compare(a.StateClock(), b.StateClock()); c != 0 {
+	if c := CompareClock(*a, *b); c != 0 {
 		return c
 	}
 	if a.ModTime < b.ModTime {

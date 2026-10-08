@@ -157,7 +157,7 @@ func TestAuditScanQuarantinesRewriteWithPreservedAttributes(t *testing.T) {
 	}
 }
 
-func TestAuditSameContentNewMtimeUpdatesConflictClock(t *testing.T) {
+func TestAuditSameContentNewMtimeKeepsRecordedRank(t *testing.T) {
 	w := auditWatcher(t)
 	path := filepath.Join(w.dir, "same-content")
 	if err := os.WriteFile(path, []byte("same bytes"), 0o600); err != nil {
@@ -178,8 +178,8 @@ func TestAuditSameContentNewMtimeUpdatesConflictClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta == nil || meta.ModTime != after.UnixNano() {
-		t.Fatalf("new write time lost despite mtime being conflict clock: %+v", meta)
+	if meta == nil || meta.ModTime != before.UnixNano() || meta.Clock != before.UnixNano() {
+		t.Fatalf("unchanged restored bytes promoted their conflict rank: %+v", meta)
 	}
 }
 

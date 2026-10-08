@@ -42,6 +42,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		out.gauge("birak_storage_ok", "1 when the data volume matches this metadata database.", nil, boolValue(storageOK))
 		out.gauge("birak_local_ready", "1 when this node can serve and accept writes.", nil, boolValue(storageOK && status.Ready))
 		out.gauge("birak_quarantined_files", "Files whose bytes changed without a write timestamp.", nil, float64(status.Quarantined))
+		out.gauge("birak_replica_initialized", "1 after initial admission; does not certify current remote freshness.", nil, boolValue(status.ReplicaInitialized))
+		out.gauge("birak_scrub_bytes_per_second", "Configured logical byte budget for checksum verification.", nil, float64(status.ScrubBytesPerSecond))
+		out.gauge("birak_directory_sync_best_effort", "1 when directory flushing is best effort on this platform.", nil, boolValue(status.DirectorySyncBestEffort))
+		if status.LastScrubAgoMS >= 0 {
+			out.gauge("birak_last_scrub_seconds", "Age of the last completed checksum verification cycle.", nil, float64(status.LastScrubAgoMS)/1000)
+		}
 		if status.LastScanAgoMS >= 0 {
 			out.gauge("birak_last_scan_seconds", "Age of the last complete checksum scan.", nil, float64(status.LastScanAgoMS)/1000)
 		}
@@ -75,6 +81,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"Commits that have taken this volume's lock.", float64(lock.Acquisitions))
 	out.gauge("birak_commit_lock_worst_seconds",
 		"Longest single hold of this volume's lock.", nil, lock.Worst.Seconds())
+	reads := fileops.ReaderStats(s.syncDir)
+	out.gauge("birak_active_readers", "Open revocable filesystem readers across gateways and peers.", nil, float64(reads.Active))
+	out.counter("birak_file_read_bytes_total", "Bytes read from filesystem descriptors; includes probes and peer traffic, not confirmed egress.", float64(reads.BytesRead))
+	out.counter("birak_reader_revocations_total", "Open readers revoked after integrity detection.", float64(reads.Revocations))
 
 	out.gauge("birak_uptime_seconds", "Time since this process started serving.", nil, time.Since(started).Seconds())
 

@@ -729,14 +729,12 @@ func (g *Gateway) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	objects, cpList, err := g.collectObjects(bp, prefix, delimiter)
+	pageObjects, pagePrefixes, isTruncated, nextToken, err := g.listPage(r.Context(), bp, bucket, prefix, delimiter, marker, maxKeys)
 	if err != nil {
 		g.logger.Error("list objects walk failed", "bucket", bucket, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
 		return
 	}
-
-	pageObjects, pagePrefixes, isTruncated, nextToken := paginate(objects, cpList, marker, maxKeys)
 
 	result := ListBucketResultV1{
 		Xmlns:          s3Xmlns,
@@ -767,20 +765,18 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	objects, cpList, err := g.collectObjects(bp, prefix, delimiter)
-	if err != nil {
-		g.logger.Error("list objects walk failed", "bucket", bucket, "error", err)
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
-		return
-	}
-
 	// A continuation token, when present, takes precedence over start-after.
 	skipAfter := startAfter
 	if contToken != "" {
 		skipAfter = contToken
 	}
 
-	pageObjects, pagePrefixes, isTruncated, nextToken := paginate(objects, cpList, skipAfter, maxKeys)
+	pageObjects, pagePrefixes, isTruncated, nextToken, err := g.listPage(r.Context(), bp, bucket, prefix, delimiter, skipAfter, maxKeys)
+	if err != nil {
+		g.logger.Error("list objects failed", "bucket", bucket, "error", err)
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+		return
+	}
 
 	result := ListBucketResultV2{
 		Xmlns:       s3Xmlns,

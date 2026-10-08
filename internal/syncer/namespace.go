@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -216,13 +215,8 @@ func (s *Syncer) preserveConflictLocked(ctx context.Context, original store.File
 	}
 	// An operator may have removed an earlier conflict copy; a new conflict must
 	// preserve its bytes again before removing the currently live generation.
-	copyMeta.Clock = max(1, copyMeta.Clock)
-	if previous != nil {
-		if previous.StateClock() == math.MaxInt64 {
-			return fmt.Errorf("conflict copy clock exhausted: %s", copyMeta.Name)
-		}
-		copyMeta.Clock = max(copyMeta.Clock, previous.StateClock()+1)
-	}
+	store.AdvanceClock(&copyMeta, previous)
+
 	in, err := os.Open(source)
 	if err != nil {
 		return err

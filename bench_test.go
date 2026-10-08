@@ -555,7 +555,7 @@ func benchDigest(t *testing.T, n *benchNode) string {
 			return hex.EncodeToString(sum.Sum(nil))
 		}
 		for _, meta := range page {
-			fmt.Fprintf(sum, "%s|%s|%t|%d|%d\n", meta.Name, meta.Hash, meta.Deleted, meta.StateClock(), meta.Size)
+			fmt.Fprintf(sum, "%s|%s|%t|%d|%s|%d\n", meta.Name, meta.Hash, meta.Deleted, meta.StateClock(), meta.BigClock, meta.Size)
 			after = meta.Name
 		}
 	}

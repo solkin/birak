@@ -29,9 +29,12 @@ type rootState struct {
 	// Every commit on a volume queues behind mu, so how long it is held is the
 	// one number that explains write latency under load — and the only way to
 	// tell "this node is slow" from "this node is serialized".
-	lockCount atomic.Int64
-	lockHeld  atomic.Int64 // nanoseconds
-	lockWorst atomic.Int64 // nanoseconds
+	lockCount         atomic.Int64
+	lockHeld          atomic.Int64 // nanoseconds
+	lockWorst         atomic.Int64 // nanoseconds
+	readerCount       atomic.Int64
+	readBytes         atomic.Int64
+	readerRevocations atomic.Int64
 }
 
 // LockLoad reports how much time commits have spent holding a volume's lock.
@@ -580,7 +583,13 @@ func Publish(root, scratch, dest string) error {
 	if err := errors.Join(f.Sync(), f.Close()); err != nil {
 		return err
 	}
-	return Commit(root, []string{dest}, func() error {
+	info, hash, err := Snapshot(scratch)
+	if err != nil {
+		return err
+	}
+	unlock := Lock(root)
+	defer unlock()
+	return commitPublishedLocked(root, nil, []string{dest}, map[string]Published{dest: {Info: info, Hash: hash}}, func() error {
 		if BusyLocked(root, dest) {
 			return ErrBusy
 		}

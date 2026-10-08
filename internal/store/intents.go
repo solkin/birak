@@ -17,6 +17,9 @@ func (s *Store) BeginLocal(paths []string) error {
 	}
 	defer tx.Rollback()
 	for _, path := range paths {
+		if err := bindName(tx, path); err != nil {
+			return err
+		}
 		if _, err = tx.Exec("INSERT OR IGNORE INTO local_intents(path) VALUES (?)", path); err != nil {
 			return err
 		}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/store"
@@ -87,6 +88,16 @@ func (w *Watcher) beginCommitLocked(paths []string) error {
 	names, err := w.relativePaths(paths)
 	if err != nil {
 		return err
+	}
+	for _, name := range names {
+		if err := w.store.CheckName(name); err != nil {
+			return err
+		}
+	}
+	for _, path := range paths {
+		if err := fileops.CheckSpelling(w.dir, path); err != nil {
+			return err
+		}
 	}
 	// Observe the old destination before an overwrite, even if fsnotify has not
 	// indexed it yet. Its clock is the lower bound for the acknowledged mutation.
@@ -303,7 +314,16 @@ func (w *Watcher) recoverReplicaLocked(name string) error {
 		if err != nil {
 			return err
 		}
-		matches = hash == meta.Hash && info.Size() == meta.Size && info.ModTime().UnixNano() == meta.ModTime
+		matches = hash == meta.Hash && info.Size() == meta.Size
+		if matches && info.ModTime().UnixNano() != meta.ModTime {
+			// A backup can lose timestamps between replica publication and its
+			// metadata commit. The durable intent still identifies these bytes;
+			// restore its timestamp instead of creating a newer local version.
+			stamp := time.Unix(0, meta.ModTime)
+			if err := os.Chtimes(path, stamp, stamp); err != nil {
+				return err
+			}
+		}
 	}
 	if matches {
 		// A restart can observe a rename that was never flushed. Seeing matching

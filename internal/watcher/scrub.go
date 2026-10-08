@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/birak/birak/internal/fileops"
+	"github.com/birak/birak/internal/store"
 )
 
 const (
@@ -33,6 +34,18 @@ const (
 func (w *Watcher) sweepFile(name string) error {
 	if w.unchangedByStat(name) {
 		return nil
+	}
+	return w.scanFile(name)
+}
+
+// sweepKnownFile uses an index page already read by the sweep. A changed or
+// missing file is still rechecked under the commit lock against current state.
+func (w *Watcher) sweepKnownFile(name string, meta *store.FileMeta) error {
+	if !w.NeedsRepair(name) && meta != nil && !meta.Deleted {
+		info, err := os.Lstat(filepath.Join(w.dir, filepath.FromSlash(name)))
+		if err == nil && info.Mode().IsRegular() && info.Size() == meta.Size && info.ModTime().UnixNano() == meta.ModTime {
+			return nil
+		}
 	}
 	return w.scanFile(name)
 }

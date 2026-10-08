@@ -22,20 +22,22 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Check reachable dependency vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
       - name: Run tests including replication fault scenarios
         run: |
           limited_volume="$RUNNER_TEMP/birak-enospc"
-          quorum_volume="$RUNNER_TEMP/birak-quorum-enospc"
-          mkdir -p "$limited_volume" "$quorum_volume"
+          mkdir -p "$limited_volume"
           sudo mount -t tmpfs -o size=16m,mode=1777 tmpfs "$limited_volume"
           trap 'sudo umount "$limited_volume"' EXIT
-          sudo mount -t tmpfs -o size=16m,mode=1777 tmpfs "$quorum_volume"
-          trap 'sudo umount "$limited_volume"; sudo umount "$quorum_volume"' EXIT
           # The suite now runs real daemon processes under -race: crash
           # consistency, backup restore, and a three-node partition model. On a
           # shared runner those are minutes, not seconds, and a timeout that
           # kills them looks exactly like a flaky test.
-          BIRAK_TEST_FULL_VOLUME="$limited_volume" BIRAK_TEST_QUORUM_FULL_VOLUME="$quorum_volume" go test -race -count=1 -v -timeout 900s ./...
+          BIRAK_TEST_FULL_VOLUME="$limited_volume" go test -race -count=1 -v -timeout 900s ./...
 
   windows-build:
     runs-on: windows-latest
@@ -46,3 +48,34 @@ jobs:
           go-version-file: go.mod
       - name: Build all packages on Windows
         run: go build ./...
+
+  docker-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build filesystem daemon image
+        run: docker build -t birak:filesystem-production-test .
+      - name: Stress four real replicas and recover faults
+        run: |
+          python3 scripts/docker_stress.py --objects 1000 --writers 12 --duration 20 \
+            --large-mib 32 --report "$RUNNER_TEMP/birak-docker-acceptance.json"
+      - name: Verify TLS APK and icon workload
+        run: |
+          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/birak-readload" ./scripts/readload
+          python3 scripts/docker_read_load.py --image birak:filesystem-production-test \
+            --objects 10000 --duration 20 --icon-readers 8 --apk-readers 4 \
+            --go-client "$RUNNER_TEMP/birak-readload" --client-network docker --icon-rps 200 \
+            --min-mib-per-second 0 --min-apk-mib-per-second 0 \
+            --report "$RUNNER_TEMP/birak-read-acceptance.json"
+      - name: Save acceptance report and daemon logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-filesystem-acceptance
+          path: |
+            ${{ runner.temp }}/birak-docker-acceptance.json
+            ${{ runner.temp }}/birak-read-acceptance.json

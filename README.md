@@ -1,6 +1,6 @@
 # Birak — Distributed File Server
 
-Birak is a distributed file server with built-in replication. In the default filesystem mode, each node stores a full copy of the data and automatically keeps it in sync with other nodes over the network. Files are accessible via S3 API, WebDAV, SFTP, HTTP file browser, or the local filesystem — use whichever protocol fits your workflow.
+Birak is a distributed file server with built-in replication. Each node stores a full copy of the data and automatically keeps it in sync with other nodes over the network. Files are accessible via S3 API, WebDAV, SFTP, HTTP file browser, or the local filesystem — use whichever protocol fits your workflow.
 
 <p align="center">
   <img src="docs/screenshot-http-browser.jpg" alt="Birak HTTP File Browser" width="800">
@@ -25,19 +25,28 @@ A Birak cluster consists of one or more **nodes**. Each node has two directories
 
 Nodes know about each other through a **peers** list in the config. Each node polls its peers for changes and downloads new or updated files automatically. There is no central server — every node is a full replica.
 
-The default `filesystem` mode acknowledges local writes before asynchronous
-replication completes. An isolated node's successful response does **not**
-guarantee that another node has the file. The opt-in
-[quorum mode](docs/quorum-operations.md) now connects S3 and multipart to durable
-majority writes, authenticated membership and failover. It is intended for
-supervised testing, with background repair, fenced garbage collection and verified
-S3 backup/restore. The remaining [production acceptance](docs/audits/quorum-maintenance-recovery.md)
-covers target hardware, capacity and client compatibility. The following filesystem configuration and protocols apply to the
-default mode; quorum mode has a separate private data layout and S3-only gateway.
+Each node accepts local reads and writes independently of the number of reachable
+peers. Nodes resume synchronization when connectivity returns; there is no leader,
+voting membership, or minimum cluster size required to keep a healthy node working.
+New nodes join replication by configuring peers. A restored consistent backup can
+rejoin with its original metadata; unchanged indexed bytes retain their recorded
+rank even if the backup tool lost their timestamps. See the recovery rules below.
+
+Writes are acknowledged after local publication, before asynchronous replication
+completes. An isolated node's successful response does not guarantee that another
+node has the file. Concurrent changes converge using the conflict rules below.
+
+Birak supports filesystem replication only. The former experimental quorum mode
+and its private data layout are no longer supported. `storage_mode: filesystem`
+is accepted for compatibility; another value fails startup. Quorum data directories
+cannot be used as `sync_dir` or `meta_dir`; there is no automatic conversion.
 
 Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browser. For direct filesystem updates, publish atomically and change the mtime when replacing bytes. An unexplained checksum change with identical size and mtime is quarantined and repaired from a healthy peer; use a gateway when intentionally preserving both attributes. Once synced, files are accessible through any supported protocol.
 
 ## Quick Start
+
+Current release: **v2.0.0**. Read the [release and upgrade notes](docs/releases/v2.0.0.md)
+before upgrading an existing cluster.
 
 ### Docker
 
@@ -239,6 +248,8 @@ export BIRAK_HTTP_ENABLED=true
 | `gateways.s3.listen_addr` | `BIRAK_S3_LISTEN_ADDR` | `:9200` | S3 Gateway address |
 | `gateways.s3.access_key` | `BIRAK_S3_ACCESS_KEY` | _(empty)_ | S3 access key |
 | `gateways.s3.secret_key` | `BIRAK_S3_SECRET_KEY` | _(empty)_ | S3 secret key |
+| `gateways.s3.tls_cert_file` | `BIRAK_S3_TLS_CERT_FILE` | _(empty)_ | PEM server certificate chain for HTTPS; configure with the key |
+| `gateways.s3.tls_key_file` | `BIRAK_S3_TLS_KEY_FILE` | _(empty)_ | PEM server private key for HTTPS |
 | `gateways.s3.buckets` | `BIRAK_S3_BUCKETS` | `[]` | Buckets to create at startup when missing (comma-separated in env) |
 | `gateways.webdav.enabled` | `BIRAK_WEBDAV_ENABLED` | `false` | Enable WebDAV Gateway |
 | `gateways.webdav.listen_addr` | `BIRAK_WEBDAV_LISTEN_ADDR` | `:9300` | WebDAV Gateway address |
@@ -281,6 +292,10 @@ Open `http://localhost:9400` in any browser. If `username` and `password` are co
 ### S3 Gateway
 
 S3-compatible API for use with AWS CLI, SDKs, and any S3 client.
+
+Configure `gateways.s3.tls_cert_file` and `tls_key_file` together to serve HTTPS
+directly. Both YAML and environment settings are supported. Otherwise the listener
+serves HTTP, which can be placed behind a TLS proxy.
 
 - **Buckets** are top-level directories in `sync_dir`. Bucket `photos` = directory `sync_dir/photos/`.
 - **Objects** are files inside buckets. Key `2024/img.jpg` in bucket `photos` = file `sync_dir/photos/2024/img.jpg`.
@@ -327,6 +342,13 @@ such as a backup tool, first uses one. A name that cannot be a bucket, including
 an ignored one, stops startup. A bucket is a directory: when deletions, local or
 replicated from a peer, leave it empty, sync-aware cleanup removes it, and a
 configured bucket is created again at the next start.
+
+Object listings use the daemon's SQLite live-name index and bounded pages,
+including prefix/delimiter seeks. A successful gateway PUT is already indexed;
+a file copied directly into `sync_dir` appears in LIST after watcher processing
+or the next sweep. GET reads the filesystem immediately. Pagination is not a
+snapshot across concurrent writes. Embedding the S3 gateway without a Catalog
+uses the legacy filesystem walk, limited to 100000 entries.
 
 #### S3 Batch Deletes
 
@@ -449,6 +471,20 @@ Replication requests require cache revalidation, and cluster responses use `Cach
 
 The greater `clock` wins. A local mutation advances beyond the observed state at that name and its ancestors/descendants, including overwrite, deletion, recreation, or a timestamp rollback. This lets an explicit file/directory replacement supersede its old contents even when the client preserves an older mtime. Incoming replication preserves that clock. Initial local indexing starts from `max(1, mtime)`; legacy database rows fall back to mtime. Equal clocks are resolved by mtime, then live-over-deleted state, SHA256, and finally the path name. The same ordering is used by polling, repairs, and reconciliation. Identical bytes can update their clock and timestamp without another download.
 
+If a logical clock exceeds int64, its canonical decimal `big_clock` extension
+continues the ordering and incrementing. A peer cannot exhaust local writes by
+sending a clock near the integer limit. The integer `clock` stays at MaxInt64
+when the extension is present.
+
+Names have one persistent spelling per Unicode-normalized, case-folded path
+component, including directories and deletion history. For example `App.apk`
+and `app.apk`, or composed and decomposed spellings of `café`, cannot coexist.
+Birak refuses the second spelling before modifying the first file, on Linux as
+well as APFS/NTFS. Case-only renames require a distinct name. Independently
+created aliases on disconnected nodes require an operator to resolve the names;
+their repair stays pending rather than overwriting bytes. Upgrading legacy
+metadata with such aliases refuses startup and reports the collision.
+
 This is asynchronous last-writer-wins replication. Gateways acknowledge local filesystem and metadata completion, without waiting for a quorum. Clock skew can decide conflicts; concurrent edits at the same name do not keep both versions. A successful local write is not a zero-RPO cluster guarantee.
 
 Independent creation of `a` and `a/child` is resolved automatically using the same ordering. Before displacing a live file, Birak verifies and saves its bytes in a regular root-level file named `birak-conflict-<digest>`. The digest depends on the original path and content hash, so retries and multiple peers share the same copy. Copies replicate normally; `/meta` and `/manifest` expose their original path as `conflict_of`. A structural tombstone carries `superseded_by` and the winner's exact clock, mtime and hash. It does not invent a larger clock that could erase a newer third-node write.
@@ -463,7 +499,17 @@ The **scrub** re-reads and re-hashes stored files continuously at `scrub_bytes_p
 
 An incomplete or unreadable directory walk never triggers the scan's deletion pass. A persistent marker at `sync_dir/.birak/storage-id` binds the data volume to its metadata database. A missing or mismatched marker makes local storage unready and prevents indexing, gateway mutations, and applying peer changes. Preserve this file with the data volume; do not delete it to bypass a storage fault. A legacy database is bound on first successful validation; an empty data root with existing live metadata is rejected.
 
-`/readyz` answers whether this node can serve and accept writes: storage is bound and the last sweep completed recently. `/healthz` reports process liveness. A quarantined file is *not* a node fault — it is unavailable by name, counted in `/status.local.quarantined` and in `birak_quarantined_files`, and repaired from a peer. Quarantine is persisted in SQLite and restored before reads or repair replay. S3, WebDAV, SFTP, HTTP UI and peer downloads share a read fence; detecting damage revokes open readers of that inode, including aliases. Bytes delivered before detection cannot be recalled. A repaired name does not make an old descriptor or a hard link to the damaged generation readable again. Local damaged-generation records are retained conservatively until that same generation is verified healthy. One damaged file therefore no longer removes a node from a load balancer, which it previously did permanently when no peer held a healthy copy. Alert on the quarantine count. `/status.local` also exposes sweep age, scrub cycle age and the last error. Peer outages and queued repairs must be monitored separately.
+`/readyz` answers whether this node can serve and accept writes: storage is bound and the last sweep completed recently. An empty new replica with configured peers also stays unready until it completes a manifest comparison and applies the observed changes from at least one source. That admission is persisted, including a negative marker during incomplete catch-up; a partial restart cannot bypass it. Once admitted, peer outages never revoke admission. A standalone node or a node seeded with local files is an independent origin. This is not a certificate of global freshness; route client traffic using `/readyz`, since the gateways themselves remain reachable during catch-up. `/healthz` reports process liveness. A quarantined file is *not* a node fault — it is unavailable by name, counted in `/status.local.quarantined` and in `birak_quarantined_files`, and repaired from a peer. Quarantine is persisted in SQLite and restored before reads or repair replay. S3, WebDAV, SFTP, HTTP UI and peer downloads share a read fence; detecting damage revokes open readers of that inode, including aliases. Bytes delivered before detection cannot be recalled. A repaired name does not make an old descriptor or a hard link to the damaged generation readable again. Local damaged-generation records are retained conservatively until that same generation is verified healthy. One damaged file therefore no longer removes a node from a load balancer, which it previously did permanently when no peer held a healthy copy. Alert on the quarantine count. `/status.local` also exposes sweep age, scrub cycle age and the last error. Peer outages and queued repairs must be monitored separately.
+
+When a scan verifies that indexed bytes and size are unchanged but the mtime
+has moved, it restores the recorded mtime without generating a new state. An
+external `touch` alone therefore does not create a replicated version. Explicit
+gateway intents preserve normal version advancement when publishing a change,
+including unchanged bytes with a changed mtime.
+
+The same rule applies to a published replica whose durable intent has not yet
+been committed into the index: recovery verifies its bytes, restores the
+intent's mtime and retains the remote version before advertising it to peers.
 
 Direct external filesystem writers do not acquire Birak's commit lock. Publish their files with atomic replacement and a changed mtime, and avoid concurrent external writes to names being changed through gateways or replication. Unexpected same-size/same-mtime checksum changes retain the last verified metadata, quarantine that name, and queue repair from peers. The name stays counted in `/status.local.quarantined` until a healthy copy arrives; the node keeps serving everything else. Without a healthy copy anywhere the count stays up, and Birak does not guess which bytes are correct.
 
@@ -485,22 +531,23 @@ A polling cursor acknowledges receipt, not successful application. It cannot saf
 
 Run one daemon per data volume and metadata directory; OS-held leases reject a second process and are released automatically on exit. Assign a unique `node_id` to each node. Replication rejects a peer advertising the same ID as the local node. Each database has a persistent identity, while every daemon start generates a fresh **process incarnation**, returned as `X-Birak-Epoch`. Peers reset their cursors on an incarnation change and replay current metadata. This also covers a restored backup whose version counter has already caught up with an old cursor.
 
-**Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 3`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds `superseded_by` and `conflict_of` automatically. Keep a pre-upgrade metadata backup if a binary rollback is required.
+**Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 4`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds the extended clock, namespace reservations, and admission marker automatically. Build with Go 1.26 or newer. Keep a pre-upgrade metadata backup if a binary rollback is required.
 
 The version high-water mark survives deletion of file records. Both `meta_dir` and `sync_dir`, including `.birak/storage-id`, should use persistent storage and be included in a consistent backup. Losing the metadata also loses deletion history, cursors, and repair work that might have no other surviving copy.
 
-**A backup must preserve modification times.** Conflict resolution ranks a file
-by a logical clock that starts from its timestamp, so a restored file with a
-fresh timestamp is indexed as a brand-new local write. It then outranks whatever
-the cluster holds and overwrites it — on every node, including undoing
-deletions, and without a single error anywhere. Use a tool that keeps
-timestamps: `cp -a`, `rsync -a`, `tar -p`, or any real backup product. Plain
-`cp -R` does not, and is enough to corrupt the cluster from one node.
-
 Stop the node before copying, so `meta_dir` and `sync_dir` come from the same
-moment, and restore both together. A node that starts up and finds many files
-with unchanged contents but new timestamps logs a warning naming this cause;
-restore again, properly, before it replicates.
+moment, and restore both together. Preserve modification times where possible
+(`cp -a`, `rsync -a`, or an equivalent backup tool). If timestamps were lost,
+Birak hashes unchanged indexed files, restores their recorded timestamps, and
+keeps their original logical clocks. Such files do not become new writes or
+undo later deletions. A bulk correction is reported in the startup log.
+
+This protection requires matching metadata and bytes. A file absent from the
+restored index, or whose bytes differ from it, is a local input; without the
+original metadata Birak cannot distinguish an old backup from a deliberate new
+write. Keep deletion history and `.birak/storage-id` with the backup. Do not
+restore a pending filesystem transaction onto new objects without following
+its explicit recovery procedure.
 
 Removing a peer from configuration clears its polling cursor but retains its
 unfinished repairs in SQLite and in `/status.repairs`. Its queue is paused while
@@ -609,6 +656,9 @@ birak_peer_pending_repairs{peer="http://192.168.1.2:9100"} 0
 birak_commit_lock_held_seconds_total 41.7
 birak_commit_lock_acquisitions_total 9182
 birak_commit_lock_worst_seconds 0.098
+birak_active_readers 12
+birak_file_read_bytes_total 104857600
+birak_reader_revocations_total 0
 ```
 
 Alert on `birak_peer_healthy`, `birak_repair_oldest_seconds`,
@@ -621,6 +671,10 @@ is fixed in completely different places.
 apply — malformed metadata, or names excluded by an `ignore` rule that differs
 between nodes. Those leave no repair row, so a node that diverges this way is
 visible here and nowhere else.
+
+Reader metrics cover shared file descriptors across gateways and replication.
+The bytes counter measures bytes read from files, including internal probes;
+use your ingress or proxy metrics to measure confirmed client egress.
 
 ### GET /healthz
 
@@ -722,7 +776,7 @@ the real 15-second response-header timeout check.
 ```bash
 # All tests
 go vet ./...
-go test -race -v -timeout 240s ./...
+go test -race -v -timeout 900s ./...
 
 # Unit tests for a specific package
 go test -v ./internal/store/
@@ -746,6 +800,41 @@ page cache say nothing about a network volume.
 ```bash
 BIRAK_BENCH_DIR=/data/bench go test -run TestBenchSyncUnderLoad -timeout 30m .
 ```
+
+### Four-node Docker acceptance
+
+With Docker and Python 3 available, the disposable stand tests signed S3 writes,
+network partitions, joining a new replica, partial-clone SIGKILL, offline backup
+restore with lost timestamps, and corruption with exact preserved mtime. It
+creates separate named data/meta volumes and removes its resources afterward.
+The same stand runs in CI before image release. Results and limits are recorded
+in the [filesystem hardening report](docs/audits/filesystem-production-hardening.md).
+
+```bash
+docker build -t birak:filesystem-production-test .
+python3 scripts/docker_stress.py --objects 1000 --writers 12 --duration 20 \
+  --large-mib 32 --report /tmp/birak-docker-acceptance.json
+```
+
+### APK and icon load acceptance
+
+The [APK read-load report](docs/audits/apk-read-production-load.md) records
+500000 physical icon files, 10/100/500 MiB APK payloads, verified TLS reads,
+conditional icon GETs, concurrent uploads and background scanning. The Go
+client can run inside Docker to avoid the Docker Desktop published-port path.
+The fixture is synthetic and already indexed; this does not measure initial
+ingestion of a complete production archive or icon extraction.
+
+```bash
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /tmp/birak-readload ./scripts/readload
+python3 scripts/docker_read_load.py --image birak:filesystem-production-test \
+  --objects 500000 --duration 60 --icon-readers 24 --apk-readers 8 \
+  --go-client /tmp/birak-readload --client-network docker --icon-rps 1000 \
+  --apk-mib-per-second 240 --report /tmp/birak-read-load.json
+```
+
+Use `GOARCH=amd64` for an amd64 Docker host. Docker, Python 3 and OpenSSL must
+be available. Volumes and containers are disposable and removed afterward.
 
 ### Crash consistency
 

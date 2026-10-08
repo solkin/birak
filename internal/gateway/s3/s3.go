@@ -13,7 +13,7 @@ import (
 
 	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/multipart"
-	"github.com/birak/birak/internal/quorum"
+	"github.com/birak/birak/internal/store"
 	"github.com/birak/birak/internal/watcher"
 )
 
@@ -27,15 +27,14 @@ type Config struct {
 	// Multipart is the staging store backing the multipart upload API. When nil,
 	// multipart operations answer NotImplemented and the rest of the gateway is
 	// unaffected.
-	Multipart *multipart.Store
-	// Quorum selects the logical object namespace; no filesystem handler or
-	// watcher is used in this mode, including for buckets and multipart parts.
-	Quorum          *quorum.Node
-	QuorumLimits    multipart.Limits
-	Forward         func(http.ResponseWriter, *http.Request)
-	TLSCertFile     string
-	TLSKeyFile      string
-	TransferTimeout time.Duration
+	Multipart   *multipart.Store
+	TLSCertFile string
+	TLSKeyFile  string
+	// Catalog provides the daemon's durable name index for bounded LIST pages.
+	// Without it, standalone gateways retain their filesystem walk behavior.
+	Catalog interface {
+		ListLiveRange(context.Context, string, string, string, int) ([]store.FileMeta, error)
+	}
 }
 
 // Gateway implements the S3-compatible API.
@@ -46,7 +45,6 @@ type Gateway struct {
 	logger         *slog.Logger
 	server         *http.Server
 	multipart      *multipart.Store
-	uploads        chan struct{}
 }
 
 // New creates a new S3 Gateway.
@@ -69,21 +67,6 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 		// intentionally left unset so large object transfers are not cut off.
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       120 * time.Second,
-	}
-	if cfg.Quorum != nil {
-		// ServeMux canonicalizes dot/repeated-slash paths. S3 keys are opaque and
-		// signed, so preserve their spelling throughout the quorum path.
-		g.server.Handler = http.HandlerFunc(g.route)
-		limit := cfg.QuorumLimits.MaxConcurrentParts
-		if limit <= 0 {
-			limit = 16
-		}
-		g.uploads = make(chan struct{}, limit)
-		if g.config.TransferTimeout <= 0 {
-			g.config.TransferTimeout = 30 * time.Minute
-		}
-		g.server.ReadTimeout = g.config.TransferTimeout
-		g.server.WriteTimeout = g.config.TransferTimeout
 	}
 
 	return g
@@ -177,26 +160,6 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 		return
 	}
-	if g.config.Quorum != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), g.config.TransferTimeout)
-		defer cancel()
-		r = r.WithContext(ctx)
-		status := g.config.Quorum.Status()
-		if !status.Voter {
-			writeS3Error(w, 503, "SlowDown", "Node is not ready to serve requests")
-			return
-		}
-		if status.State != "Leader" {
-			if g.config.Forward != nil {
-				g.config.Forward(w, r)
-			} else {
-				writeS3Error(w, 503, "SlowDown", "Leader unavailable")
-			}
-			return
-		}
-		g.routeQuorum(w, r)
-		return
-	}
 
 	path := strings.TrimPrefix(r.URL.Path, "/")
 
@@ -224,9 +187,6 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 
 	g.routeBucketOrObject(w, r, bucket, key)
 }
-
-// Handler exposes the same authenticated API to the cluster's mTLS proxy.
-func (g *Gateway) Handler() http.Handler { return g.server.Handler }
 
 // routeBucketOrObject handles all bucket-level and object-level operations.
 // Used by both path-style and virtual-hosted-style routing.

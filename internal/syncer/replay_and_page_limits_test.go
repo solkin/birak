@@ -100,35 +100,35 @@ func TestQuarantinedNameStillRepairsFromAnEqualPeerState(t *testing.T) {
 	}
 }
 
-// A saturated clock can never be advanced past, so accepting one would leave
-// every later local write at that name failing with "conflict clock exhausted".
-func TestSaturatedConflictClockIsRejected(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		meta store.FileMeta
-	}{
-		{"clock", store.FileMeta{Clock: math.MaxInt64}},
-		{"mod_time", store.FileMeta{ModTime: math.MaxInt64}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			meta := auditMeta("poisoned.txt", "remote", 1)
-			meta.Clock = tc.meta.Clock
-			if tc.meta.ModTime != 0 {
-				meta.ModTime = tc.meta.ModTime
+// Saturated int64 metadata remains usable: further writes use the decimal
+// extension rather than becoming unreplicable or exhausting the local path.
+func TestSaturatedConflictClockRemainsWritable(t *testing.T) {
+	for _, initial := range []int64{math.MaxInt64 - 1, math.MaxInt64} {
+		meta := auditMeta("poisoned.txt", "remote", 1)
+		meta.Clock = initial
+		if err := validateMetadata(meta); err != nil {
+			t.Fatal(err)
+		}
+		s, _ := auditSyncer(t)
+		if _, err := s.store.PutRemote(meta); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 4; i++ {
+			if _, err := s.store.PutLocal(store.FileMeta{Name: meta.Name, ModTime: 2, Hash: meta.Hash, Size: meta.Size}); err != nil {
+				t.Fatal(err)
 			}
-			if err := validateMetadata(meta); err == nil {
-				t.Fatal("saturated conflict clock accepted from a peer")
+			got, err := s.store.GetFile(meta.Name)
+			if err != nil {
+				t.Fatal(err)
 			}
-		})
-	}
-
-	// A local write at that name must remain possible afterwards.
-	s, _ := auditSyncer(t)
-	if _, err := s.store.PutLocal(store.FileMeta{
-		Name: "poisoned.txt", ModTime: time.Now().UnixNano(), Size: 6,
-		Hash: strings.Repeat("a", 64),
-	}); err != nil {
-		t.Fatalf("local write refused: %v", err)
+			if err := validateMetadata(*got); err != nil {
+				t.Fatal(err)
+			}
+			if store.CompareClock(*got, meta) <= 0 {
+				t.Fatalf("clock did not advance: %+v %+v", got, meta)
+			}
+			meta = *got
+		}
 	}
 }
 

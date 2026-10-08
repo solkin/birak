@@ -30,10 +30,9 @@ import (
 
 func main() {
 	configPath := flag.String("config", "", "path to config file (optional, can use env vars instead)")
-	bootstrap := flag.Bool("bootstrap", false, "create a new quorum cluster once, on fresh state only")
 	flag.Parse()
 
-	if err := runBootstrap(*configPath, *bootstrap); err != nil {
+	if err := run(*configPath); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
 	}
@@ -43,9 +42,6 @@ func main() {
 // not application, and cannot safely authorize distributed deletion GC.
 
 func run(configPath string) error {
-	return runBootstrap(configPath, false)
-}
-func runBootstrap(configPath string, bootstrap bool) error {
 	// Load configuration.
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -64,13 +60,6 @@ func runBootstrap(configPath string, bootstrap bool) error {
 		Level: cfg.SlogLevel(),
 	}))
 	logger := slog.New(logs).With("node", cfg.NodeID)
-	if cfg.StorageMode == "quorum" {
-		defer logs.Close()
-		return runQuorum(cfg, bootstrap, logger)
-	}
-	if bootstrap {
-		return fmt.Errorf("-bootstrap requires storage_mode: quorum")
-	}
 
 	logger.Info("starting birak daemon",
 		"sync_dir", cfg.SyncDir,
@@ -256,6 +245,7 @@ func runBootstrap(configPath string, bootstrap bool) error {
 				Multipart:      multipartStore,
 				TLSCertFile:    cfg.Gateways.S3.TLSCertFile,
 				TLSKeyFile:     cfg.Gateways.S3.TLSKeyFile,
+				Catalog:        st,
 			},
 			logger,
 		)

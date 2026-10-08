@@ -11,6 +11,17 @@ import (
 
 var ErrUnreadable = errors.New("file is quarantined")
 
+type ReaderLoad struct {
+	Active, BytesRead, Revocations int64
+}
+
+// ReaderStats counts filesystem reads, including peer downloads and probes.
+// BytesRead is not a certificate of successful network delivery.
+func ReaderStats(dir string) ReaderLoad {
+	r := root(dir)
+	return ReaderLoad{r.readerCount.Load(), r.readBytes.Load(), r.readerRevocations.Load()}
+}
+
 // GenerationKey identifies the local filesystem object, including attributes
 // that distinguish inode reuse. Damaged generations stay fenced after another
 // inode repairs their original name: a hard link may still name the old bytes.
@@ -65,6 +76,7 @@ func OpenReader(dir, path string) (*Reader, error) {
 		r.root.readers = make(map[*Reader]struct{})
 	}
 	r.root.readers[r] = struct{}{}
+	r.root.readerCount.Add(1)
 	return r, nil
 }
 
@@ -78,7 +90,10 @@ func RevokeReadersLocked(dir, path string) {
 	for reader := range root(dir).readers {
 		if os.SameFile(info, reader.info) {
 			reader.mu.Lock()
-			reader.err = ErrUnreadable
+			if reader.err == nil {
+				reader.err = ErrUnreadable
+				reader.root.readerRevocations.Add(1)
+			}
 			reader.mu.Unlock()
 		}
 	}
@@ -90,7 +105,9 @@ func (r *Reader) Read(p []byte) (int, error) {
 	if r.err != nil {
 		return 0, r.err
 	}
-	return r.file.Read(p[:min(len(p), 64<<10)])
+	n, err := r.file.Read(p[:min(len(p), 64<<10)])
+	r.root.readBytes.Add(int64(n))
+	return n, err
 }
 
 func (r *Reader) ReadAt(p []byte, off int64) (int, error) {
@@ -103,6 +120,7 @@ func (r *Reader) ReadAt(p []byte, off int64) (int, error) {
 			return n, err
 		}
 		count, err := r.file.ReadAt(p[n:min(len(p), n+(64<<10))], off+int64(n))
+		r.root.readBytes.Add(int64(count))
 		r.mu.Unlock()
 		n += count
 		if err != nil {
@@ -130,7 +148,10 @@ func (r *Reader) Close() error {
 	defer r.root.mu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.root.readers, r)
+	if _, exists := r.root.readers[r]; exists {
+		delete(r.root.readers, r)
+		r.root.readerCount.Add(-1)
+	}
 	r.err = os.ErrClosed
 	return r.file.Close()
 }
