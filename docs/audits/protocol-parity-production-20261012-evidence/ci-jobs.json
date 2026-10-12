@@ -1,0 +1,264 @@
+{
+  "birak": [
+    {
+      "name": "test / test",
+      "conclusion": "success",
+      "html_url": "https://github.com/solkin/birak/actions/runs/37832195273/job/113500089438",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-go@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Vet",
+          "conclusion": "success"
+        },
+        {
+          "name": "Check reachable dependency vulnerabilities",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run tests including replication fault scenarios",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/setup-go@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "name": "test / docker-acceptance",
+      "conclusion": "success",
+      "html_url": "https://github.com/solkin/birak/actions/runs/37832195273/job/113500089954",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-go@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Build filesystem daemon image",
+          "conclusion": "success"
+        },
+        {
+          "name": "Stress four real replicas and recover faults",
+          "conclusion": "success"
+        },
+        {
+          "name": "Verify TLS APK and icon workload",
+          "conclusion": "success"
+        },
+        {
+          "name": "Save acceptance report and daemon logs",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/setup-go@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "name": "test / windows-build",
+      "conclusion": "success",
+      "html_url": "https://github.com/solkin/birak/actions/runs/37832195273/job/113500089996",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-go@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Build all packages on Windows",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/setup-go@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "name": "build-and-push",
+      "conclusion": "success",
+      "html_url": "https://github.com/solkin/birak/actions/runs/37832195273/job/113503339794",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Checkout",
+          "conclusion": "success"
+        },
+        {
+          "name": "Set up QEMU",
+          "conclusion": "success"
+        },
+        {
+          "name": "Set up Docker Buildx",
+          "conclusion": "success"
+        },
+        {
+          "name": "Log in to Docker Hub",
+          "conclusion": "success"
+        },
+        {
+          "name": "Extract version from tag",
+          "conclusion": "success"
+        },
+        {
+          "name": "Build and push",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Build and push",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Log in to Docker Hub",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Set up Docker Buildx",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Set up QEMU",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Checkout",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ],
+  "sebastian": [
+    {
+      "name": "test",
+      "conclusion": "success",
+      "html_url": "https://github.com/solkin/sebastian/actions/runs/37740835180/job/113190915783",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-go@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Vet",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run tests",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/setup-go@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "name": "windows-build",
+      "conclusion": "success",
+      "html_url": "https://github.com/solkin/sebastian/actions/runs/37740835180/job/113190915888",
+      "steps": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run actions/setup-go@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Build all packages on Windows",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/setup-go@v5",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ]
+}

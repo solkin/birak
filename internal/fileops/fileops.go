@@ -149,6 +149,10 @@ func validateLocked(dir string) error {
 	}
 	return nil
 }
+
+// CheckRootLocked applies the watcher's storage fence to maintenance that
+// already owns the namespace lock.
+func CheckRootLocked(dir string) error { return validateLocked(dir) }
 func Commit(dir string, paths []string, fn func() error) error {
 	return CommitFrom(dir, nil, paths, fn)
 }

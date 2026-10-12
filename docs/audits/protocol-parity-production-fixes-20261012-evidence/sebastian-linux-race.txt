@@ -1,0 +1,14 @@
+go: downloading gopkg.in/yaml.v3 v3.0.1
+go: downloading golang.org/x/sys v0.47.0
+go: downloading golang.org/x/crypto v0.56.0
+ok  	github.com/solkin/sebastian	2.495s
+?   	github.com/solkin/sebastian/cmd/sebastiand	[no test files]
+ok  	github.com/solkin/sebastian/internal/config	1.038s
+ok  	github.com/solkin/sebastian/internal/fileops	2.333s
+ok  	github.com/solkin/sebastian/internal/gateway	1.522s
+ok  	github.com/solkin/sebastian/internal/gateway/httpui	1.105s
+ok  	github.com/solkin/sebastian/internal/gateway/s3	8.891s
+ok  	github.com/solkin/sebastian/internal/gateway/sftp	1.706s
+ok  	github.com/solkin/sebastian/internal/gateway/webdav	3.314s
+ok  	github.com/solkin/sebastian/internal/logging	1.015s
+ok  	github.com/solkin/sebastian/internal/multipart	1.293s

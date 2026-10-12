@@ -128,6 +128,10 @@ func IsScratchFile(name string) bool {
 func SweepTempFiles(rootDir string, maxAge time.Duration, logger *slog.Logger) {
 	unlock := fileops.Lock(rootDir)
 	defer unlock()
+	if err := fileops.CheckRootLocked(rootDir); err != nil {
+		logger.Debug("defer scratch cleanup while storage is unavailable", "error", err)
+		return
+	}
 	if pending, err := fileops.ReplacementPendingLocked(rootDir); err != nil || pending {
 		logger.Debug("defer scratch cleanup until replacement recovery completes", "error", err)
 		return
@@ -312,7 +316,7 @@ func LogMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 		next.ServeHTTP(rl, r)
 		logger.Info("request",
 			"method", r.Method,
-			"url", r.URL.String(),
+			"url", requestLogURL(r),
 			"status", rl.Status,
 			"size", rl.Size,
 			"user_agent", r.UserAgent(),

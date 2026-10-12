@@ -1,0 +1,29 @@
+go: downloading github.com/fsnotify/fsnotify v1.9.0
+go: downloading gopkg.in/yaml.v3 v3.0.1
+go: downloading golang.org/x/sys v0.47.0
+go: downloading golang.org/x/text v0.41.0
+go: downloading golang.org/x/crypto v0.56.0
+go: downloading modernc.org/sqlite v1.44.3
+go: downloading modernc.org/libc v1.67.6
+go: downloading modernc.org/memory v1.11.0
+go: downloading github.com/google/uuid v1.6.0
+go: downloading golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546
+go: downloading modernc.org/mathutil v1.7.1
+go: downloading github.com/dustin/go-humanize v1.0.1
+go: downloading github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec
+ok  	github.com/birak/birak	99.887s
+ok  	github.com/birak/birak/cmd/birakd	1.016s
+ok  	github.com/birak/birak/internal/config	1.055s
+ok  	github.com/birak/birak/internal/fileops	4.515s
+ok  	github.com/birak/birak/internal/gateway	1.587s
+ok  	github.com/birak/birak/internal/gateway/httpui	1.321s
+ok  	github.com/birak/birak/internal/gateway/s3	12.696s
+ok  	github.com/birak/birak/internal/gateway/sftp	2.139s
+ok  	github.com/birak/birak/internal/gateway/webdav	7.857s
+ok  	github.com/birak/birak/internal/logging	1.030s
+ok  	github.com/birak/birak/internal/multipart	1.641s
+ok  	github.com/birak/birak/internal/server	2.263s
+ok  	github.com/birak/birak/internal/store	8.605s
+ok  	github.com/birak/birak/internal/syncer	64.830s
+ok  	github.com/birak/birak/internal/watcher	7.650s
+?   	github.com/birak/birak/scripts/readload	[no test files]

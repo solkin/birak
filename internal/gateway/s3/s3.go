@@ -161,6 +161,11 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if unsupportedStreamingBody(r) {
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", "aws-chunked and streaming payloads are not supported; send an unencoded payload.")
+		return
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/")
 
 	// Detect virtual-hosted-style: bucket in Host header subdomain.

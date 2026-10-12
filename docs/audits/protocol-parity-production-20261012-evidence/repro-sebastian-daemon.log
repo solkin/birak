@@ -1,0 +1,26 @@
+time=2026-10-12T15:46:35.784+03:00 level=INFO msg="sebastian starting" root_dir=/tmp/protocol-parity-audit-20261012.ZAFtpB/repro-sebastian/files s3=true webdav=true http=true sftp=true
+time=2026-10-12T15:46:35.784+03:00 level=WARN msg="insecure configuration" detail="WebDAV gateway is enabled without username/password; it accepts unauthenticated requests"
+time=2026-10-12T15:46:35.784+03:00 level=WARN msg="insecure configuration" detail="HTTP UI gateway is enabled without username/password; it accepts unauthenticated requests"
+time=2026-10-12T15:46:35.784+03:00 level=WARN msg="insecure configuration" detail="SFTP gateway is enabled without username/password; it accepts unauthenticated connections"
+time=2026-10-12T15:46:35.787+03:00 level=WARN msg="generated a new SFTP host key; clients will see a new host identity" gateway=sftp path=/tmp/protocol-parity-audit-20261012.ZAFtpB/repro-sebastian/hostkey
+time=2026-10-12T15:46:35.787+03:00 level=INFO msg="multipart janitor started" component=multipart-janitor interval=1h0m0s upload_ttl=168h0m0s temp_file_max_age=24h0m0s
+time=2026-10-12T15:46:35.787+03:00 level=INFO msg="HTTP file server started" gateway=http addr=127.0.0.1:52253
+time=2026-10-12T15:46:35.787+03:00 level=INFO msg="sftp gateway started" gateway=sftp addr=127.0.0.1:52254
+time=2026-10-12T15:46:35.787+03:00 level=INFO msg="S3 gateway started" gateway=s3 addr=127.0.0.1:52251
+time=2026-10-12T15:46:35.787+03:00 level=INFO msg="WebDAV gateway started" gateway=webdav addr=127.0.0.1:52252
+time=2026-10-12T15:46:35.791+03:00 level=INFO msg=request gateway=s3 method=GET url=/bucket/regular.txt status=200 size=2 user_agent=""
+time=2026-10-12T15:46:35.815+03:00 level=INFO msg="object created" gateway=s3 bucket=bucket key=chunked.txt size=46
+time=2026-10-12T15:46:35.815+03:00 level=INFO msg=request gateway=s3 method=PUT url=/bucket/chunked.txt status=200 size=0 user_agent=""
+time=2026-10-12T15:46:35.816+03:00 level=INFO msg=request gateway=s3 method=GET url=/bucket/chunked.txt status=200 size=46 user_agent=""
+time=2026-10-12T15:46:36.318+03:00 level=INFO msg=request gateway=s3 method=GET url=/bucket/fifo status=500 size=18 user_agent=""
+time=2026-10-12T15:46:36.924+03:00 level=INFO msg=request gateway=webdav method=GET url=/bucket/fifo status=500 size=18 user_agent=""
+time=2026-10-12T15:46:37.630+03:00 level=INFO msg=request gateway=http method=GET url=/_api/dl/bucket/fifo status=500 size=18 user_agent=""
+time=2026-10-12T15:46:37.852+03:00 level=INFO msg="ssh connection" gateway=sftp remote=127.0.0.1:52267 user=anonymous
+time=2026-10-12T15:46:38.574+03:00 level=INFO msg="object created" gateway=s3 bucket=bucket key=after-sftp.txt size=12
+time=2026-10-12T15:46:38.574+03:00 level=INFO msg=request gateway=s3 method=PUT url=/bucket/after-sftp.txt status=200 size=0 user_agent=""
+time=2026-10-12T15:46:43.720+03:00 level=WARN msg="list objects: result truncated at limit" gateway=s3 limit=100000
+time=2026-10-12T15:46:43.725+03:00 level=INFO msg=request gateway=s3 method=GET url="/large-bucket?list-type=2&start-after=099999.txt&max-keys=10" status=200 size=295 user_agent=""
+time=2026-10-12T15:46:43.726+03:00 level=INFO msg="received signal, shutting down" signal=terminated
+time=2026-10-12T15:46:43.726+03:00 level=INFO msg="multipart janitor stopped" component=multipart-janitor
+time=2026-10-12T15:46:43.726+03:00 level=INFO msg="sftp gateway stopped" gateway=sftp
+time=2026-10-12T15:46:43.726+03:00 level=INFO msg="sebastian stopped"

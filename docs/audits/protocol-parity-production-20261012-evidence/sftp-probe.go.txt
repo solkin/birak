@@ -1,0 +1,28 @@
+package main
+
+import (
+ "encoding/binary"
+ "fmt"
+ "io"
+ "os"
+ "time"
+ "golang.org/x/crypto/ssh"
+)
+func packet(w io.Writer, kind byte, body []byte) {
+ b:=make([]byte,5); binary.BigEndian.PutUint32(b,uint32(len(body)+1)); b[4]=kind
+ w.Write(append(b,body...))
+}
+func read(r io.Reader) (byte,error) {
+ var n [4]byte; if _,e:=io.ReadFull(r,n[:]);e!=nil{return 0,e}
+ b:=make([]byte,binary.BigEndian.Uint32(n[:]));_,e:=io.ReadFull(r,b);return b[0],e
+}
+func main(){
+ c,e:=ssh.Dial("tcp",os.Args[1],&ssh.ClientConfig{User:"anonymous",HostKeyCallback:ssh.InsecureIgnoreHostKey(),Timeout:time.Second});if e!=nil{panic(e)};defer c.Close()
+ ch,reqs,e:=c.OpenChannel("session",nil);if e!=nil{panic(e)};go ssh.DiscardRequests(reqs);defer ch.Close()
+ b:=make([]byte,4);binary.BigEndian.PutUint32(b,4);b=append(b,[]byte("sftp")...);_,e=ch.SendRequest("subsystem",true,b);if e!=nil{panic(e)}
+ packet(ch,1,[]byte{0,0,0,3});if _,e=read(ch);e!=nil{panic(e)}
+ path:=[]byte(os.Args[2]);b=make([]byte,8);binary.BigEndian.PutUint32(b,1);binary.BigEndian.PutUint32(b[4:],uint32(len(path)));b=append(b,path...);b=append(b,0,0,0,1,0,0,0,0)
+ packet(ch,3,b);fmt.Println("SFTP OPEN sent")
+ result:=make(chan string,1);go func(){kind,e:=read(ch);result<-fmt.Sprintf("response type=%d err=%v",kind,e)}()
+ select{case s:=<-result:fmt.Println(s);case <-time.After(3*time.Second):fmt.Println("SFTP OPEN blocked")}
+}

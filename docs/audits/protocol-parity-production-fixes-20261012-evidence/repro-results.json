@@ -1,0 +1,77 @@
+[
+  {
+    "project": "sebastian",
+    "scenario": "signed aws-chunked PutObject",
+    "put_status": 501,
+    "get_status": 404,
+    "expected_bytes": 5,
+    "stored_bytes": 135,
+    "stores_encoded_body": false,
+    "body_matches_payload": false
+  },
+  {
+    "project": "sebastian",
+    "scenario": "s3 GET FIFO",
+    "elapsed_seconds": 0.106,
+    "status": 500
+  },
+  {
+    "project": "sebastian",
+    "scenario": "webdav GET FIFO",
+    "elapsed_seconds": 0.106,
+    "status": 500
+  },
+  {
+    "project": "sebastian",
+    "scenario": "http GET FIFO",
+    "elapsed_seconds": 0.106,
+    "status": 500
+  },
+  {
+    "project": "sebastian",
+    "scenario": "S3 PUT while SFTP OPEN FIFO",
+    "sftp_output": "response type=101 err=<nil>",
+    "status": 200
+  },
+  {
+    "project": "sebastian",
+    "scenario": "LIST after first 100000 files",
+    "physical_files": 100001,
+    "status": 200,
+    "response": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Name>large-bucket</Name>\n  <Prefix></Prefix>\n  <MaxKeys>10</MaxKeys>\n  <IsTruncated>false</IsTruncated>\n  <KeyCount>1</KeyCount>\n  <Contents>\n    <Key>100000.txt</Key>\n    <LastModified>2026-10-12T13:58:40.361Z</LastModified>\n    <ETag>&#34;0-18ddcce740df40e5&#34;</ETag>\n    <Size>0</Size>\n    <StorageClass>STANDARD</StorageClass>\n  </Contents>\n  <StartAfter>099999.txt</StartAfter>\n</ListBucketResult>"
+  },
+  {
+    "project": "birak",
+    "scenario": "signed aws-chunked PutObject",
+    "put_status": 501,
+    "get_status": 404,
+    "expected_bytes": 5,
+    "stored_bytes": 135,
+    "stores_encoded_body": false,
+    "body_matches_payload": false
+  },
+  {
+    "project": "birak",
+    "scenario": "s3 GET FIFO",
+    "elapsed_seconds": 0.105,
+    "status": 500
+  },
+  {
+    "project": "birak",
+    "scenario": "webdav GET FIFO",
+    "elapsed_seconds": 0.105,
+    "status": 500
+  },
+  {
+    "project": "birak",
+    "scenario": "http GET FIFO",
+    "elapsed_seconds": 0.104,
+    "status": 500
+  },
+  {
+    "project": "birak",
+    "scenario": "S3 PUT while SFTP OPEN FIFO",
+    "sftp_output": "response type=101 err=<nil>",
+    "status": 200
+  }
+]

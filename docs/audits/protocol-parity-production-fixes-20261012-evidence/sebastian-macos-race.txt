@@ -1,0 +1,11 @@
+ok  	github.com/solkin/sebastian	3.962s
+?   	github.com/solkin/sebastian/cmd/sebastiand	[no test files]
+ok  	github.com/solkin/sebastian/internal/config	3.898s
+ok  	github.com/solkin/sebastian/internal/fileops	20.878s
+ok  	github.com/solkin/sebastian/internal/gateway	8.209s
+ok  	github.com/solkin/sebastian/internal/gateway/httpui	6.195s
+ok  	github.com/solkin/sebastian/internal/gateway/s3	66.320s
+ok  	github.com/solkin/sebastian/internal/gateway/sftp	16.092s
+ok  	github.com/solkin/sebastian/internal/gateway/webdav	13.069s
+ok  	github.com/solkin/sebastian/internal/logging	4.425s
+ok  	github.com/solkin/sebastian/internal/multipart	10.237s

@@ -1,0 +1,16 @@
+time=2026-10-12T15:48:06.135+03:00 level=INFO msg="starting birak daemon" node=volume-audit sync_dir=/private/tmp/protocol-parity-audit-20261012.ZAFtpB/volume-birak/files listen_addr=127.0.0.1:52306 peers=[]
+time=2026-10-12T15:48:06.139+03:00 level=INFO msg="store opened" node=volume-audit path=/private/tmp/protocol-parity-audit-20261012.ZAFtpB/volume-birak/meta/birak.db
+time=2026-10-12T15:48:06.144+03:00 level=INFO msg="HTTP server starting" node=volume-audit addr=127.0.0.1:52306
+time=2026-10-12T15:48:06.144+03:00 level=INFO msg="no peers configured, syncer idle" node=volume-audit
+time=2026-10-12T15:48:06.145+03:00 level=INFO msg="multipart janitor started" node=volume-audit component=multipart-janitor interval=1h0m0s upload_ttl=168h0m0s temp_file_max_age=24h0m0s
+time=2026-10-12T15:48:06.145+03:00 level=INFO msg="S3 gateway started" node=volume-audit gateway=s3 addr=127.0.0.1:52305
+time=2026-10-12T15:48:06.145+03:00 level=INFO msg="watcher started" node=volume-audit dir=/private/tmp/protocol-parity-audit-20261012.ZAFtpB/volume-birak/files
+time=2026-10-12T15:48:06.145+03:00 level=INFO msg="checksum scrub started" node=volume-audit bytes_per_second=8388608
+time=2026-10-12T15:48:06.235+03:00 level=INFO msg=request node=volume-audit gateway=s3 method=GET url=/bucket/old.txt status=200 size=10 user_agent=""
+time=2026-10-12T15:48:06.236+03:00 level=ERROR msg="put object: mkdir failed" node=volume-audit gateway=s3 bucket=bucket key=new.txt error="data volume sentinel unavailable: open /private/tmp/protocol-parity-audit-20261012.ZAFtpB/volume-birak/files/.birak/storage-id: no such file or directory"
+time=2026-10-12T15:48:06.236+03:00 level=INFO msg=request node=volume-audit gateway=s3 method=PUT url=/bucket/new.txt status=500 size=134 user_agent=""
+time=2026-10-12T15:48:06.236+03:00 level=INFO msg=request node=volume-audit gateway=s3 method=GET url="/bucket/new.txt?X-Amz-Signature=audit-bearer-token&X-Amz-Credential=audit-access" status=403 size=118 user_agent=""
+time=2026-10-12T15:48:06.236+03:00 level=INFO msg="received signal, shutting down" node=volume-audit signal=terminated
+time=2026-10-12T15:48:06.236+03:00 level=INFO msg="watcher stopped" node=volume-audit
+time=2026-10-12T15:48:06.236+03:00 level=INFO msg="multipart janitor stopped" node=volume-audit component=multipart-janitor
+time=2026-10-12T15:48:06.236+03:00 level=INFO msg="birak daemon stopped" node=volume-audit

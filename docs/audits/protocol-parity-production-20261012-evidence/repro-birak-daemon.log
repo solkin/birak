@@ -1,0 +1,34 @@
+time=2026-10-12T15:46:43.955+03:00 level=INFO msg="starting birak daemon" node=audit sync_dir=/tmp/protocol-parity-audit-20261012.ZAFtpB/repro-birak/files listen_addr=127.0.0.1:52274 peers=[]
+time=2026-10-12T15:46:43.956+03:00 level=WARN msg="insecure configuration" node=audit detail="WebDAV gateway is enabled without username/password; it accepts unauthenticated requests"
+time=2026-10-12T15:46:43.956+03:00 level=WARN msg="insecure configuration" node=audit detail="HTTP UI gateway is enabled without username/password; it accepts unauthenticated requests"
+time=2026-10-12T15:46:43.956+03:00 level=WARN msg="insecure configuration" node=audit detail="SFTP gateway is enabled without username/password; it accepts unauthenticated connections"
+time=2026-10-12T15:46:43.964+03:00 level=INFO msg="store opened" node=audit path=/tmp/protocol-parity-audit-20261012.ZAFtpB/repro-birak/meta/birak.db
+time=2026-10-12T15:46:44.000+03:00 level=INFO msg="HTTP server starting" node=audit addr=127.0.0.1:52274
+time=2026-10-12T15:46:44.000+03:00 level=INFO msg="no peers configured, syncer idle" node=audit
+time=2026-10-12T15:46:44.003+03:00 level=INFO msg="watcher started" node=audit dir=/tmp/protocol-parity-audit-20261012.ZAFtpB/repro-birak/files
+time=2026-10-12T15:46:44.003+03:00 level=INFO msg="checksum scrub started" node=audit bytes_per_second=8388608
+time=2026-10-12T15:46:44.003+03:00 level=INFO msg="multipart janitor started" node=audit component=multipart-janitor interval=1h0m0s upload_ttl=168h0m0s temp_file_max_age=24h0m0s
+time=2026-10-12T15:46:44.003+03:00 level=INFO msg="S3 gateway started" node=audit gateway=s3 addr=127.0.0.1:52270
+time=2026-10-12T15:46:44.003+03:00 level=INFO msg="WebDAV gateway started" node=audit gateway=webdav addr=127.0.0.1:52271
+time=2026-10-12T15:46:44.003+03:00 level=INFO msg="HTTP file server started" node=audit gateway=http addr=127.0.0.1:52272
+time=2026-10-12T15:46:44.007+03:00 level=WARN msg="generated a new SFTP host key; clients will see a new host identity" node=audit gateway=sftp path=/tmp/protocol-parity-audit-20261012.ZAFtpB/repro-birak/hostkey
+time=2026-10-12T15:46:44.007+03:00 level=INFO msg="sftp gateway started" node=audit gateway=sftp addr=127.0.0.1:52273
+time=2026-10-12T15:46:44.040+03:00 level=INFO msg=request node=audit gateway=s3 method=GET url=/bucket/regular.txt status=200 size=2 user_agent=""
+time=2026-10-12T15:46:44.075+03:00 level=INFO msg="running requested full scan" node=audit
+time=2026-10-12T15:46:44.075+03:00 level=INFO msg="object created" node=audit gateway=s3 bucket=bucket key=chunked.txt size=46
+time=2026-10-12T15:46:44.075+03:00 level=INFO msg=request node=audit gateway=s3 method=PUT url=/bucket/chunked.txt status=200 size=0 user_agent=""
+time=2026-10-12T15:46:44.076+03:00 level=INFO msg=request node=audit gateway=s3 method=GET url=/bucket/chunked.txt status=200 size=46 user_agent=""
+time=2026-10-12T15:46:44.077+03:00 level=ERROR msg="get object: open failed" node=audit gateway=s3 bucket=bucket key=fifo error="not a regular file: /tmp/protocol-parity-audit-20261012.ZAFtpB/repro-birak/files/bucket/fifo"
+time=2026-10-12T15:46:44.077+03:00 level=INFO msg=request node=audit gateway=s3 method=GET url=/bucket/fifo status=500 size=120 user_agent=""
+time=2026-10-12T15:46:44.183+03:00 level=ERROR msg="get open failed" node=audit gateway=webdav path=bucket/fifo error="not a regular file: /tmp/protocol-parity-audit-20261012.ZAFtpB/repro-birak/files/bucket/fifo"
+time=2026-10-12T15:46:44.184+03:00 level=INFO msg=request node=audit gateway=webdav method=GET url=/bucket/fifo status=500 size=22 user_agent=""
+time=2026-10-12T15:46:44.291+03:00 level=INFO msg=request node=audit gateway=http method=GET url=/_api/dl/bucket/fifo status=500 size=22 user_agent=""
+time=2026-10-12T15:46:44.406+03:00 level=INFO msg="ssh connection" node=audit gateway=sftp remote=127.0.0.1:52284 user=anonymous
+time=2026-10-12T15:46:44.631+03:00 level=INFO msg="running requested full scan" node=audit
+time=2026-10-12T15:46:44.631+03:00 level=INFO msg="object created" node=audit gateway=s3 bucket=bucket key=after-sftp.txt size=12
+time=2026-10-12T15:46:44.631+03:00 level=INFO msg=request node=audit gateway=s3 method=PUT url=/bucket/after-sftp.txt status=200 size=0 user_agent=""
+time=2026-10-12T15:46:44.737+03:00 level=INFO msg="received signal, shutting down" node=audit signal=terminated
+time=2026-10-12T15:46:44.737+03:00 level=INFO msg="watcher stopped" node=audit
+time=2026-10-12T15:46:44.737+03:00 level=INFO msg="multipart janitor stopped" node=audit component=multipart-janitor
+time=2026-10-12T15:46:44.737+03:00 level=INFO msg="sftp gateway stopped" node=audit gateway=sftp
+time=2026-10-12T15:46:44.737+03:00 level=INFO msg="birak daemon stopped" node=audit

@@ -1,0 +1,16 @@
+ok  	github.com/birak/birak	104.307s
+ok  	github.com/birak/birak/cmd/birakd	1.258s
+ok  	github.com/birak/birak/internal/config	1.521s
+ok  	github.com/birak/birak/internal/fileops	17.903s
+ok  	github.com/birak/birak/internal/gateway	3.652s
+ok  	github.com/birak/birak/internal/gateway/httpui	2.521s
+ok  	github.com/birak/birak/internal/gateway/s3	68.517s
+ok  	github.com/birak/birak/internal/gateway/sftp	12.641s
+ok  	github.com/birak/birak/internal/gateway/webdav	21.069s
+ok  	github.com/birak/birak/internal/logging	2.953s
+ok  	github.com/birak/birak/internal/multipart	8.900s
+ok  	github.com/birak/birak/internal/server	7.022s
+ok  	github.com/birak/birak/internal/store	22.586s
+ok  	github.com/birak/birak/internal/syncer	106.350s
+ok  	github.com/birak/birak/internal/watcher	23.142s
+?   	github.com/birak/birak/scripts/readload	[no test files]

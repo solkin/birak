@@ -25,14 +25,6 @@ import (
 	"github.com/birak/birak/internal/watcher"
 )
 
-// maxListWalkEntries bounds how many objects/prefixes a single ListObjects walk
-// will materialize, so a bucket with a pathological number of files cannot
-// exhaust memory or stall the server. A truncated walk is logged.
-const maxListWalkEntries = 100000
-
-// errWalkLimit aborts the bucket walk once maxListWalkEntries is reached.
-var errWalkLimit = errors.New("list walk limit reached")
-
 // --- S3 XML response types ---
 
 // S3Error is the standard S3 error response.
@@ -532,122 +524,6 @@ func (g *Gateway) handleGetBucketACL(w http.ResponseWriter, r *http.Request, buc
 }
 
 // --- Object handlers ---
-
-// collectObjects walks a bucket directory and collects all matching objects and
-// common prefixes, sorted lexicographically. It does not read file contents and
-// does not paginate — pagination is applied separately by paginate.
-func (g *Gateway) collectObjects(bp, prefix, delimiter string) ([]ObjectInfo, []string, error) {
-	var objects []ObjectInfo
-	commonPrefixes := make(map[string]bool)
-
-	err := filepath.Walk(bp, func(path string, fi os.FileInfo, err error) error {
-		if err != nil {
-			// Skip an unreadable entry but log it: silently dropping it would make
-			// objects beneath it vanish from the listing with no signal.
-			g.logger.Warn("list objects: skipping unreadable entry", "path", path, "error", err)
-			return nil
-		}
-		if path == bp {
-			return nil
-		}
-
-		// Stop the walk once we have collected the cap; better to truncate (and log)
-		// than to hold an unbounded result set in memory.
-		if len(objects)+len(commonPrefixes) >= maxListWalkEntries {
-			return errWalkLimit
-		}
-
-		relPath, _ := filepath.Rel(bp, path)
-		key := filepath.ToSlash(relPath)
-
-		// A backup can be an entire directory during WebDAV COPY/MOVE. Prune
-		// scratch directories before walking children or collecting prefixes.
-		if gateway.IsScratchFile(fi.Name()) {
-			if fi.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		// Skip ignored files/dirs.
-		rootRel, relErr := filepath.Rel(g.syncDir, path)
-		if relErr != nil {
-			return relErr
-		}
-		if watcher.ShouldIgnore(filepath.ToSlash(rootRel), g.ignorePatterns) {
-			if fi.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if fi.IsDir() {
-			return nil
-		}
-
-		// Walk reports Lstat metadata for symlinks, while GET and HEAD follow a
-		// safe in-root link. Resolve only link entries so LIST reports the same
-		// size/mtime/ETag as those operations, and omit links that escape syncDir.
-		if fi.Mode()&os.ModeSymlink != 0 {
-			if !gateway.PathResolvesWithin(bp, path) {
-				g.logger.Warn("list objects: skipping symlink outside bucket", "path", path)
-				return nil
-			}
-			if _, _, safeErr := gateway.SafePath(g.syncDir, filepath.ToSlash(rootRel), g.ignorePatterns); safeErr != nil {
-				g.logger.Warn("list objects: skipping unsafe symlink", "path", path, "error", safeErr)
-				return nil
-			}
-			resolvedInfo, statErr := os.Stat(path)
-			if statErr != nil || resolvedInfo.IsDir() {
-				return nil
-			}
-			fi = resolvedInfo
-		}
-
-		if prefix != "" && !strings.HasPrefix(key, prefix) {
-			return nil
-		}
-
-		if delimiter != "" {
-			rest := key
-			if prefix != "" {
-				rest = key[len(prefix):]
-			}
-			if idx := strings.Index(rest, delimiter); idx >= 0 {
-				commonPrefixes[prefix+rest[:idx+len(delimiter)]] = true
-				return nil
-			}
-		}
-
-		objects = append(objects, ObjectInfo{
-			Key:          key,
-			LastModified: fi.ModTime().UTC().Format(s3TimeFormat),
-			ETag:         etagFor(fi),
-			Size:         fi.Size(),
-			StorageClass: "STANDARD",
-		})
-
-		return nil
-	})
-	if err != nil && !errors.Is(err, errWalkLimit) {
-		return nil, nil, err
-	}
-	if errors.Is(err, errWalkLimit) {
-		g.logger.Warn("list objects: result truncated at limit", "limit", maxListWalkEntries)
-	}
-
-	sort.Slice(objects, func(i, j int) bool {
-		return objects[i].Key < objects[j].Key
-	})
-
-	cpList := make([]string, 0, len(commonPrefixes))
-	for cp := range commonPrefixes {
-		cpList = append(cpList, cp)
-	}
-	sort.Strings(cpList)
-
-	return objects, cpList, nil
-}
 
 // paginate applies S3 list pagination over the merged, lexically ordered key
 // space of objects and common prefixes: it drops everything up to and including

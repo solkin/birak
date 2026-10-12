@@ -1,0 +1,4 @@
+ok  	github.com/solkin/sebastian/internal/multipart	4.122s
+ok  	github.com/solkin/sebastian/internal/gateway	3.215s
+ok  	github.com/solkin/sebastian/internal/fileops	8.273s
+ok  	github.com/solkin/sebastian	4.527s

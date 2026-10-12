@@ -4,6 +4,12 @@
 [отчёте приёмки](audits/filesystem-production-hardening.md) и
 [отчёте APK/иконок](audits/apk-read-production-load.md).
 
+Межпроектная проверка 12 октября 2026 года и исправления общего файлового слоя
+описаны в [отчёте повторной приёмки](audits/protocol-parity-production-fixes-20261012.md).
+В текущем кандидате aws-chunked явно отклоняется с 501, filesystem LIST не
+обрезается на 100000 объектах, multipart сообщает ошибки directory fsync,
+фоновые cleanup соблюдают storage fence, а auth query fields исключены из логов.
+
 ## Оценка
 
 Filesystem остаётся автономной асинхронной репликацией: доступность локальной

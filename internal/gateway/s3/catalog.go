@@ -30,12 +30,7 @@ func prefixEnd(prefix string) string {
 
 func (g *Gateway) listPage(ctx context.Context, bp, bucket, prefix, delimiter, after string, maxKeys int) ([]ObjectInfo, []CommonPrefix, bool, string, error) {
 	if g.config.Catalog == nil {
-		objects, prefixes, err := g.collectObjects(bp, prefix, delimiter)
-		if err != nil {
-			return nil, nil, false, "", err
-		}
-		o, p, truncated, next := paginate(objects, prefixes, after, maxKeys)
-		return o, p, truncated, next, nil
+		return g.filesystemPage(ctx, bp, prefix, delimiter, after, maxKeys)
 	}
 	if !utf8.ValidString(prefix) || !utf8.ValidString(after) || !utf8.ValidString(delimiter) {
 		return nil, nil, false, "", nil

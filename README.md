@@ -365,7 +365,7 @@ other keys. `VersionId` is ignored, as buckets are not versioned.
 #### S3 Multipart Uploads
 
 The full multipart API is supported, so `aws s3 cp` of a large file, `aws s3api`,
-boto3, rclone, and S3 SDKs upload parallel chunks out of the box.
+boto3, rclone, and S3 SDKs can upload parallel parts with unencoded request bodies.
 
 Multipart upload state is stored on disk under
 `sync_dir/.birak/multipart/{uploadId}/`, so an interrupted process can resume,
@@ -439,6 +439,13 @@ sftp> get photo.jpg
 sftp> mkdir backups
 sftp> rm old-file.txt
 ```
+
+S3 request bodies using `Content-Encoding: aws-chunked` or `STREAMING-*`
+payload markers return `501 NotImplemented` before changing an object or part.
+Configure clients to use unencoded upload bodies; ordinary HTTP transfer chunking
+is supported. Multipart metadata and parts propagate directory flush failures;
+a failed first flush of a replacement part preserves its acknowledged predecessor.
+Authentication query parameters are removed from gateway access logs.
 
 ## How Sync Works
 

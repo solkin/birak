@@ -1,0 +1,10 @@
+time=2026-10-12T15:48:06.005+03:00 level=INFO msg="sebastian starting" root_dir=/private/tmp/protocol-parity-audit-20261012.ZAFtpB/volume-sebastian/files s3=true webdav=false http=false sftp=false
+time=2026-10-12T15:48:06.005+03:00 level=INFO msg="multipart janitor started" component=multipart-janitor interval=1h0m0s upload_ttl=168h0m0s temp_file_max_age=24h0m0s
+time=2026-10-12T15:48:06.005+03:00 level=INFO msg="S3 gateway started" gateway=s3 addr=127.0.0.1:52298
+time=2026-10-12T15:48:06.106+03:00 level=INFO msg=request gateway=s3 method=GET url=/bucket/old.txt status=200 size=10 user_agent=""
+time=2026-10-12T15:48:06.124+03:00 level=INFO msg="object created" gateway=s3 bucket=bucket key=new.txt size=22
+time=2026-10-12T15:48:06.124+03:00 level=INFO msg=request gateway=s3 method=PUT url=/bucket/new.txt status=200 size=0 user_agent=""
+time=2026-10-12T15:48:06.125+03:00 level=INFO msg=request gateway=s3 method=GET url="/bucket/new.txt?X-Amz-Signature=audit-bearer-token&X-Amz-Credential=audit-access" status=403 size=118 user_agent=""
+time=2026-10-12T15:48:06.125+03:00 level=INFO msg="received signal, shutting down" signal=terminated
+time=2026-10-12T15:48:06.125+03:00 level=INFO msg="multipart janitor stopped" component=multipart-janitor
+time=2026-10-12T15:48:06.125+03:00 level=INFO msg="sebastian stopped"

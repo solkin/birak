@@ -27,6 +27,11 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
+      - name: Check release binary vulnerabilities
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/birak-security-check" ./cmd/birakd
+          govulncheck -mode=binary "$RUNNER_TEMP/birak-security-check"
+
       - name: Run tests including replication fault scenarios
         run: |
           limited_volume="$RUNNER_TEMP/birak-enospc"
@@ -65,7 +70,7 @@ jobs:
             --large-mib 32 --report "$RUNNER_TEMP/birak-docker-acceptance.json"
       - name: Verify TLS APK and icon workload
         run: |
-          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/birak-readload" ./scripts/readload
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/birak-readload" ./scripts/readload
           python3 scripts/docker_read_load.py --image birak:filesystem-production-test \
             --objects 10000 --duration 20 --icon-readers 8 --apk-readers 4 \
             --go-client "$RUNNER_TEMP/birak-readload" --client-network docker --icon-rps 200 \

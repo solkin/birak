@@ -1,0 +1,28 @@
+[
+  {
+    "project": "sebastian",
+    "scenario": "root replaced after startup",
+    "status": 200,
+    "published_on_replacement_volume": true,
+    "original_preserved": true,
+    "response": ""
+  },
+  {
+    "project": "sebastian",
+    "scenario": "request query logging",
+    "signature_logged": true
+  },
+  {
+    "project": "birak",
+    "scenario": "root replaced after startup",
+    "status": 500,
+    "published_on_replacement_volume": false,
+    "original_preserved": true,
+    "response": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code>InternalError</Code>\n  <Message>Failed to create directories</Message>\n</Error>"
+  },
+  {
+    "project": "birak",
+    "scenario": "request query logging",
+    "signature_logged": true
+  }
+]

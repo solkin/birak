@@ -1,0 +1,77 @@
+[
+  {
+    "project": "sebastian",
+    "scenario": "signed aws-chunked PutObject",
+    "put_status": 200,
+    "get_status": 200,
+    "expected_bytes": 5,
+    "stored_bytes": 46,
+    "stores_encoded_body": true,
+    "body_matches_payload": false
+  },
+  {
+    "project": "sebastian",
+    "scenario": "s3 GET FIFO",
+    "elapsed_seconds": 0.606,
+    "blocked": true
+  },
+  {
+    "project": "sebastian",
+    "scenario": "webdav GET FIFO",
+    "elapsed_seconds": 0.605,
+    "blocked": true
+  },
+  {
+    "project": "sebastian",
+    "scenario": "http GET FIFO",
+    "elapsed_seconds": 0.604,
+    "blocked": true
+  },
+  {
+    "project": "sebastian",
+    "scenario": "S3 PUT while SFTP OPEN FIFO",
+    "sftp_output": "response type=102 err=<nil>",
+    "blocked": true
+  },
+  {
+    "project": "sebastian",
+    "scenario": "LIST after first 100000 files",
+    "physical_files": 100001,
+    "status": 200,
+    "response": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Name>large-bucket</Name>\n  <Prefix></Prefix>\n  <MaxKeys>10</MaxKeys>\n  <IsTruncated>false</IsTruncated>\n  <KeyCount>0</KeyCount>\n  <StartAfter>099999.txt</StartAfter>\n</ListBucketResult>"
+  },
+  {
+    "project": "birak",
+    "scenario": "signed aws-chunked PutObject",
+    "put_status": 200,
+    "get_status": 200,
+    "expected_bytes": 5,
+    "stored_bytes": 46,
+    "stores_encoded_body": true,
+    "body_matches_payload": false
+  },
+  {
+    "project": "birak",
+    "scenario": "s3 GET FIFO",
+    "elapsed_seconds": 0.106,
+    "status": 500
+  },
+  {
+    "project": "birak",
+    "scenario": "webdav GET FIFO",
+    "elapsed_seconds": 0.106,
+    "status": 500
+  },
+  {
+    "project": "birak",
+    "scenario": "http GET FIFO",
+    "elapsed_seconds": 0.106,
+    "status": 500
+  },
+  {
+    "project": "birak",
+    "scenario": "S3 PUT while SFTP OPEN FIFO",
+    "sftp_output": "response type=101 err=<nil>",
+    "status": 200
+  }
+]

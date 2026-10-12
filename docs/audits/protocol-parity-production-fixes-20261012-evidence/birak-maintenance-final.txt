@@ -1,0 +1,3 @@
+ok  	github.com/birak/birak/internal/fileops	7.832s
+ok  	github.com/birak/birak/internal/gateway	2.923s
+ok  	github.com/birak/birak/internal/multipart	4.041s

@@ -1,0 +1,672 @@
+=== Symbol Results ===
+
+Vulnerability #1: GO-2026-6617
+    HTTP/2 server crash due to HPACK encoder race in net/http
+  More info: https://pkg.go.dev/vuln/GO-2026-6617
+  Standard library
+    Found in: net/http@go1.25.6
+    Fixed in: net/http@go1.26.9
+    Example traces found:
+      #1: internal/gateway/gateway.go:268:31: gateway.CheckBasicAuth calls http.Request.BasicAuth
+      #2: internal/gateway/gateway.go:268:31: gateway.CheckBasicAuth calls http.Request.BasicAuth
+      #3: internal/gateway/httpui/httpui.go:70:16: httpui.New calls http.ServeMux.HandleFunc
+      #4: internal/gateway/httpui/httpui.go:70:16: httpui.New calls http.ServeMux.HandleFunc
+      #5: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve
+      #6: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve
+      #7: internal/gateway/httpui/httpui.go:150:26: httpui.Gateway.Stop calls http.Server.Shutdown
+      #8: internal/gateway/httpui/httpui.go:150:26: httpui.Gateway.Stop calls http.Server.Shutdown
+      #9: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.body.Read
+      #10: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.body.Read
+      #11: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyEOFSignal.Read
+      #12: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyEOFSignal.Read
+      #13: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyLocked.Read
+      #14: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyLocked.Read
+      #15: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.checkConnErrorWriter.Write
+      #16: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.checkConnErrorWriter.Write
+      #17: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.chunkWriter.Write
+      #18: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.chunkWriter.Write
+      #19: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.connReader.Read
+      #20: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.connReader.Read
+      #21: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.expectContinueReader.Read
+      #22: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.expectContinueReader.Read
+      #23: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ConnectionError.Error
+      #24: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ConnectionError.Error
+      #25: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ErrCode.String
+      #26: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ErrCode.String
+      #27: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameHeader.String
+      #28: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameHeader.String
+      #29: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameType.String
+      #30: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameType.String
+      #31: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameWriteRequest.String
+      #32: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameWriteRequest.String
+      #33: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2Setting.String
+      #34: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2Setting.String
+      #35: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2SettingID.String
+      #36: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2SettingID.String
+      #37: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2StreamError.Error
+      #38: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2StreamError.Error
+      #39: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2bufferedWriterTimeoutWriter.Write
+      #40: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2bufferedWriterTimeoutWriter.Write
+      #41: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2chunkWriter.Write
+      #42: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2chunkWriter.Write
+      #43: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2connError.Error
+      #44: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2connError.Error
+      #45: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2duplicatePseudoHeaderError.Error
+      #46: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2duplicatePseudoHeaderError.Error
+      #47: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldNameError.Error
+      #48: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldNameError.Error
+      #49: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldValueError.Error
+      #50: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldValueError.Error
+      #51: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2pseudoHeaderError.Error
+      #52: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2pseudoHeaderError.Error
+      #53: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.http2requestBody.Read
+      #54: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.http2requestBody.Read
+      #55: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write
+      #56: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write
+      #57: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.http2responseWriter.WriteHeader
+      #58: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.http2responseWriter.WriteHeader
+      #59: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.http2responseWriter.WriteString
+      #60: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.http2responseWriter.WriteString
+      #61: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2writeData.String
+      #62: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2writeData.String
+      #63: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.loggingConn.Read
+      #64: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.loggingConn.Read
+      #65: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.loggingConn.Write
+      #66: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.loggingConn.Write
+      #67: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.maxBytesReader.Read
+      #68: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.maxBytesReader.Read
+      #69: internal/logging/async.go:127:20: logging.Async.Close calls sync.Once.Do, which eventually calls http.onceCloseListener.Close
+      #70: internal/logging/async.go:127:20: logging.Async.Close calls sync.Once.Do, which eventually calls http.onceCloseListener.Close
+      #71: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.response.ReadFrom
+      #72: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.response.ReadFrom
+      #73: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.response.Write
+      #74: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.response.Write
+      #75: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.response.WriteHeader
+      #76: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.response.WriteHeader
+      #77: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.response.WriteString
+      #78: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.response.WriteString
+
+Vulnerability #2: GO-2026-6613
+    HTTP/1 server connection desynchronization after 2xx CONNECT response in
+    net/http
+  More info: https://pkg.go.dev/vuln/GO-2026-6613
+  Standard library
+    Found in: net/http@go1.25.6
+    Fixed in: net/http@go1.26.9
+    Example traces found:
+      #1: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write, which eventually calls http.CanonicalHeaderKey
+      #2: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.http2responseWriter.WriteHeader, which eventually calls http.Header.Del
+      #3: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write, which eventually calls http.Header.Get
+      #4: internal/gateway/gateway.go:268:31: gateway.CheckBasicAuth calls http.Request.BasicAuth
+      #5: internal/gateway/httpui/httpui.go:70:16: httpui.New calls http.ServeMux.HandleFunc
+      #6: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve
+      #7: internal/gateway/httpui/httpui.go:150:26: httpui.Gateway.Stop calls http.Server.Shutdown
+      #8: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.body.Read
+      #9: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyEOFSignal.Read
+      #10: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyLocked.Read
+      #11: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write, which eventually calls http.checkConnErrorWriter.Write
+      #12: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write, which eventually calls http.chunkWriter.Write
+      #13: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.connReader.Read
+      #14: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.expectContinueReader.Read
+      #15: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.loggingConn.Read
+      #16: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.loggingConn.Write
+      #17: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.maxBytesReader.Read
+      #18: internal/logging/async.go:127:20: logging.Async.Close calls sync.Once.Do, which eventually calls http.onceCloseListener.Close
+      #19: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.response.ReadFrom
+      #20: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.response.Write
+      #21: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.response.WriteHeader
+      #22: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.response.WriteString
+
+Vulnerability #3: GO-2026-6612
+    Double flow control refund on HTTP/2 server streams in net/http
+  More info: https://pkg.go.dev/vuln/GO-2026-6612
+  Standard library
+    Found in: net/http@go1.25.6
+    Fixed in: net/http@go1.26.9
+    Example traces found:
+      #1: internal/gateway/gateway.go:268:31: gateway.CheckBasicAuth calls http.Request.BasicAuth
+      #2: internal/gateway/gateway.go:268:31: gateway.CheckBasicAuth calls http.Request.BasicAuth
+      #3: internal/gateway/httpui/httpui.go:70:16: httpui.New calls http.ServeMux.HandleFunc
+      #4: internal/gateway/httpui/httpui.go:70:16: httpui.New calls http.ServeMux.HandleFunc
+      #5: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve
+      #6: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve
+      #7: internal/gateway/httpui/httpui.go:150:26: httpui.Gateway.Stop calls http.Server.Shutdown
+      #8: internal/gateway/httpui/httpui.go:150:26: httpui.Gateway.Stop calls http.Server.Shutdown
+      #9: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.body.Read
+      #10: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.body.Read
+      #11: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyEOFSignal.Read
+      #12: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyEOFSignal.Read
+      #13: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyLocked.Read
+      #14: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyLocked.Read
+      #15: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.checkConnErrorWriter.Write
+      #16: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.checkConnErrorWriter.Write
+      #17: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.chunkWriter.Write
+      #18: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.chunkWriter.Write
+      #19: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.connReader.Read
+      #20: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.connReader.Read
+      #21: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.expectContinueReader.Read
+      #22: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.expectContinueReader.Read
+      #23: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ConnectionError.Error
+      #24: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ConnectionError.Error
+      #25: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ErrCode.String
+      #26: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ErrCode.String
+      #27: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameHeader.String
+      #28: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameHeader.String
+      #29: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameType.String
+      #30: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameType.String
+      #31: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameWriteRequest.String
+      #32: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameWriteRequest.String
+      #33: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2Setting.String
+      #34: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2Setting.String
+      #35: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2SettingID.String
+      #36: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2SettingID.String
+      #37: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2StreamError.Error
+      #38: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2StreamError.Error
+      #39: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2bufferedWriterTimeoutWriter.Write
+      #40: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2bufferedWriterTimeoutWriter.Write
+      #41: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2chunkWriter.Write
+      #42: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2chunkWriter.Write
+      #43: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2connError.Error
+      #44: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2connError.Error
+      #45: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2duplicatePseudoHeaderError.Error
+      #46: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2duplicatePseudoHeaderError.Error
+      #47: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldNameError.Error
+      #48: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldNameError.Error
+      #49: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldValueError.Error
+      #50: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldValueError.Error
+      #51: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2pseudoHeaderError.Error
+      #52: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2pseudoHeaderError.Error
+      #53: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.http2requestBody.Read
+      #54: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.http2requestBody.Read
+      #55: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write
+      #56: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write
+      #57: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.http2responseWriter.WriteHeader
+      #58: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.http2responseWriter.WriteHeader
+      #59: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.http2responseWriter.WriteString
+      #60: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.http2responseWriter.WriteString
+      #61: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2writeData.String
+      #62: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2writeData.String
+      #63: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.loggingConn.Read
+      #64: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.loggingConn.Read
+      #65: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.loggingConn.Write
+      #66: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.loggingConn.Write
+      #67: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.maxBytesReader.Read
+      #68: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.maxBytesReader.Read
+      #69: internal/logging/async.go:127:20: logging.Async.Close calls sync.Once.Do, which eventually calls http.onceCloseListener.Close
+      #70: internal/logging/async.go:127:20: logging.Async.Close calls sync.Once.Do, which eventually calls http.onceCloseListener.Close
+      #71: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.response.ReadFrom
+      #72: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.response.ReadFrom
+      #73: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.response.Write
+      #74: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.response.Write
+      #75: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.response.WriteHeader
+      #76: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.response.WriteHeader
+      #77: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.response.WriteString
+      #78: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.response.WriteString
+
+Vulnerability #4: GO-2026-6611
+    Excessive CPU consumption from repeated initial window changes in net/http
+  More info: https://pkg.go.dev/vuln/GO-2026-6611
+  Standard library
+    Found in: net/http@go1.25.6
+    Fixed in: net/http@go1.26.9
+    Example traces found:
+      #1: internal/gateway/gateway.go:268:31: gateway.CheckBasicAuth calls http.Request.BasicAuth
+      #2: internal/gateway/gateway.go:268:31: gateway.CheckBasicAuth calls http.Request.BasicAuth
+      #3: internal/gateway/httpui/httpui.go:70:16: httpui.New calls http.ServeMux.HandleFunc
+      #4: internal/gateway/httpui/httpui.go:70:16: httpui.New calls http.ServeMux.HandleFunc
+      #5: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve
+      #6: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve
+      #7: internal/gateway/httpui/httpui.go:150:26: httpui.Gateway.Stop calls http.Server.Shutdown
+      #8: internal/gateway/httpui/httpui.go:150:26: httpui.Gateway.Stop calls http.Server.Shutdown
+      #9: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.body.Read
+      #10: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.body.Read
+      #11: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyEOFSignal.Read
+      #12: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyEOFSignal.Read
+      #13: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyLocked.Read
+      #14: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyLocked.Read
+      #15: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.checkConnErrorWriter.Write
+      #16: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.checkConnErrorWriter.Write
+      #17: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.chunkWriter.Write
+      #18: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.chunkWriter.Write
+      #19: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.connReader.Read
+      #20: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.connReader.Read
+      #21: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.expectContinueReader.Read
+      #22: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.expectContinueReader.Read
+      #23: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ConnectionError.Error
+      #24: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ConnectionError.Error
+      #25: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ErrCode.String
+      #26: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ErrCode.String
+      #27: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameHeader.String
+      #28: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameHeader.String
+      #29: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameType.String
+      #30: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameType.String
+      #31: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameWriteRequest.String
+      #32: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameWriteRequest.String
+      #33: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2Setting.String
+      #34: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2Setting.String
+      #35: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2SettingID.String
+      #36: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2SettingID.String
+      #37: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2StreamError.Error
+      #38: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2StreamError.Error
+      #39: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2bufferedWriterTimeoutWriter.Write
+      #40: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2bufferedWriterTimeoutWriter.Write
+      #41: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2chunkWriter.Write
+      #42: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2chunkWriter.Write
+      #43: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2connError.Error
+      #44: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2connError.Error
+      #45: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2duplicatePseudoHeaderError.Error
+      #46: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2duplicatePseudoHeaderError.Error
+      #47: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldNameError.Error
+      #48: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldNameError.Error
+      #49: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldValueError.Error
+      #50: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldValueError.Error
+      #51: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2pseudoHeaderError.Error
+      #52: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2pseudoHeaderError.Error
+      #53: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.http2requestBody.Read
+      #54: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.http2requestBody.Read
+      #55: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write
+      #56: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write
+      #57: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.http2responseWriter.WriteHeader
+      #58: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.http2responseWriter.WriteHeader
+      #59: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.http2responseWriter.WriteString
+      #60: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.http2responseWriter.WriteString
+      #61: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2writeData.String
+      #62: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2writeData.String
+      #63: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.loggingConn.Read
+      #64: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.loggingConn.Read
+      #65: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.loggingConn.Write
+      #66: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.loggingConn.Write
+      #67: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.maxBytesReader.Read
+      #68: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.maxBytesReader.Read
+      #69: internal/logging/async.go:127:20: logging.Async.Close calls sync.Once.Do, which eventually calls http.onceCloseListener.Close
+      #70: internal/logging/async.go:127:20: logging.Async.Close calls sync.Once.Do, which eventually calls http.onceCloseListener.Close
+      #71: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.response.ReadFrom
+      #72: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.response.ReadFrom
+      #73: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.response.Write
+      #74: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.response.Write
+      #75: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.response.WriteHeader
+      #76: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.response.WriteHeader
+      #77: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.response.WriteString
+      #78: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.response.WriteString
+
+Vulnerability #5: GO-2026-6609
+    Lack of limit on size of parsed Range headers in net/http
+  More info: https://pkg.go.dev/vuln/GO-2026-6609
+  Standard library
+    Found in: net/http@go1.25.6
+    Fixed in: net/http@go1.26.9
+    Example traces found:
+      #1: internal/gateway/webdav/handlers.go:180:19: webdav.Gateway.handleGet calls http.ServeContent
+
+Vulnerability #6: GO-2026-6608
+    Memory limit bypass when parsing MIME headers in net/textproto,
+    mime/multipart
+  More info: https://pkg.go.dev/vuln/GO-2026-6608
+  Standard library
+    Found in: net/textproto@go1.25.6
+    Fixed in: net/textproto@go1.26.9
+    Example traces found:
+      #1: internal/gateway/httpui/handlers.go:198:32: httpui.Gateway.handleUpload calls http.Request.ParseMultipartForm, which calls multipart.Reader.ReadForm
+      #2: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls textproto.Reader.ReadMIMEHeader
+
+Vulnerability #7: GO-2026-6607
+    Reject malformed ECH outer extension references in crypto/tls
+  More info: https://pkg.go.dev/vuln/GO-2026-6607
+  Standard library
+    Found in: crypto/tls@go1.25.6
+    Fixed in: crypto/tls@go1.26.9
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls tls.Conn.HandshakeContext
+      #2: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls tls.Conn.Read
+
+Vulnerability #8: GO-2026-6604
+    Root.Mkdir(All) can follow junctions out of the root on Windows in os
+  More info: https://pkg.go.dev/vuln/GO-2026-6604
+  Standard library
+    Found in: os@go1.25.6
+    Fixed in: os@go1.26.9
+    Platforms: windows
+    Example traces found:
+      #1: internal/fileops/replace.go:63:21: fileops.replaceLocked calls os.Root.MkdirAll
+      #2: internal/fileops/replace.go:258:20: fileops.recoverReplacement calls os.Root.Remove
+      #3: internal/fileops/replace.go:84:19: fileops.replaceLocked calls os.Root.RemoveAll
+      #4: internal/fileops/replace.go:125:20: fileops.replaceLocked calls os.Root.Rename
+      #5: internal/fileops/replace.go:406:18: fileops.recoverLocked calls os.Root.Open, which eventually calls os.doInRoot[int]
+      #6: internal/fileops/replace.go:107:22: fileops.replaceLocked calls os.Root.Lstat, which eventually calls os.doInRoot[os.FileInfo]
+      #7: internal/fileops/replacement_tree.go:79:32: fileops.replacementTree calls os.Root.Readlink, which eventually calls os.doInRoot[string]
+
+Vulnerability #9: GO-2026-6603
+    HTTP/2 server memory exhaustion due to Trailer headers in net/http
+  More info: https://pkg.go.dev/vuln/GO-2026-6603
+  Standard library
+    Found in: net/http@go1.25.6
+    Fixed in: net/http@go1.26.9
+    Example traces found:
+      #1: internal/gateway/gateway.go:268:31: gateway.CheckBasicAuth calls http.Request.BasicAuth
+      #2: internal/gateway/gateway.go:268:31: gateway.CheckBasicAuth calls http.Request.BasicAuth
+      #3: internal/gateway/httpui/httpui.go:70:16: httpui.New calls http.ServeMux.HandleFunc
+      #4: internal/gateway/httpui/httpui.go:70:16: httpui.New calls http.ServeMux.HandleFunc
+      #5: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve
+      #6: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve
+      #7: internal/gateway/httpui/httpui.go:150:26: httpui.Gateway.Stop calls http.Server.Shutdown
+      #8: internal/gateway/httpui/httpui.go:150:26: httpui.Gateway.Stop calls http.Server.Shutdown
+      #9: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.body.Read
+      #10: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.body.Read
+      #11: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyEOFSignal.Read
+      #12: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyEOFSignal.Read
+      #13: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyLocked.Read
+      #14: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.bodyLocked.Read
+      #15: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.checkConnErrorWriter.Write
+      #16: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.checkConnErrorWriter.Write
+      #17: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.chunkWriter.Write
+      #18: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.chunkWriter.Write
+      #19: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.connReader.Read
+      #20: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.connReader.Read
+      #21: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.expectContinueReader.Read
+      #22: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.expectContinueReader.Read
+      #23: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ConnectionError.Error
+      #24: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ConnectionError.Error
+      #25: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ErrCode.String
+      #26: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2ErrCode.String
+      #27: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameHeader.String
+      #28: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameHeader.String
+      #29: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameType.String
+      #30: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameType.String
+      #31: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameWriteRequest.String
+      #32: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2FrameWriteRequest.String
+      #33: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2Setting.String
+      #34: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2Setting.String
+      #35: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2SettingID.String
+      #36: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2SettingID.String
+      #37: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2StreamError.Error
+      #38: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2StreamError.Error
+      #39: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2bufferedWriterTimeoutWriter.Write
+      #40: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2bufferedWriterTimeoutWriter.Write
+      #41: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2chunkWriter.Write
+      #42: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.http2chunkWriter.Write
+      #43: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2connError.Error
+      #44: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2connError.Error
+      #45: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2duplicatePseudoHeaderError.Error
+      #46: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2duplicatePseudoHeaderError.Error
+      #47: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldNameError.Error
+      #48: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldNameError.Error
+      #49: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldValueError.Error
+      #50: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2headerFieldValueError.Error
+      #51: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2pseudoHeaderError.Error
+      #52: internal/multipart/multipart.go:283:24: multipart.newUploadID calls rand.Read, which calls http.http2pseudoHeaderError.Error
+      #53: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.http2requestBody.Read
+      #54: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.http2requestBody.Read
+      #55: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write
+      #56: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.http2responseWriter.Write
+      #57: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.http2responseWriter.WriteHeader
+      #58: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.http2responseWriter.WriteHeader
+      #59: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.http2responseWriter.WriteString
+      #60: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.http2responseWriter.WriteString
+      #61: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2writeData.String
+      #62: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls http.http2writeData.String
+      #63: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.loggingConn.Read
+      #64: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.loggingConn.Read
+      #65: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.loggingConn.Write
+      #66: cmd/sebastiand/main.go:29:12: sebastiand.main calls flag.Parse, which eventually calls http.loggingConn.Write
+      #67: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.maxBytesReader.Read
+      #68: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.maxBytesReader.Read
+      #69: internal/logging/async.go:127:20: logging.Async.Close calls sync.Once.Do, which eventually calls http.onceCloseListener.Close
+      #70: internal/logging/async.go:127:20: logging.Async.Close calls sync.Once.Do, which eventually calls http.onceCloseListener.Close
+      #71: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.response.ReadFrom
+      #72: internal/multipart/multipart.go:553:26: multipart.Store.WritePart calls io.Copy, which eventually calls http.response.ReadFrom
+      #73: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.response.Write
+      #74: internal/gateway/gateway.go:292:34: gateway.ResponseLogger.Write calls http.response.Write
+      #75: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.response.WriteHeader
+      #76: internal/gateway/gateway.go:287:30: gateway.ResponseLogger.WriteHeader calls http.response.WriteHeader
+      #77: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.response.WriteString
+      #78: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls http.response.WriteString
+
+Vulnerability #10: GO-2026-6355
+    Prevent DoS on deadlocked established channel in golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-6355
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.49.0
+    Fixed in: golang.org/x/crypto@v0.56.0
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:188:48: sftp.Gateway.handleConnection calls ssh.NewServerConn
+
+Vulnerability #11: GO-2026-6354
+    Prevent DoS on deadlocked undecided channel in golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-6354
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.49.0
+    Fixed in: golang.org/x/crypto@v0.56.0
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:188:48: sftp.Gateway.handleConnection calls ssh.NewServerConn
+
+Vulnerability #12: GO-2026-6303
+    Source-address critical option not enforced for non-public-key auth
+    callbacks in golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-6303
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.49.0
+    Fixed in: golang.org/x/crypto@v0.55.0
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:188:48: sftp.Gateway.handleConnection calls ssh.NewServerConn
+
+Vulnerability #13: GO-2026-6090
+    Limit handshake messages we are willing to accept post-handshake in
+    crypto/tls
+  More info: https://pkg.go.dev/vuln/GO-2026-6090
+  Standard library
+    Found in: crypto/tls@go1.25.6
+    Fixed in: crypto/tls@go1.25.13
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls tls.Conn.HandshakeContext
+      #2: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls tls.Conn.Read
+
+Vulnerability #14: GO-2026-6089
+    Apply ReadHeaderTimeout when doing unencrypted HTTP/2 check in net/http
+  More info: https://pkg.go.dev/vuln/GO-2026-6089
+  Standard library
+    Found in: net/http@go1.25.6
+    Fixed in: net/http@go1.25.13
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve
+
+Vulnerability #15: GO-2026-6088
+    Add recursion depth guard during decode in encoding/xml
+  More info: https://pkg.go.dev/vuln/GO-2026-6088
+  Standard library
+    Found in: encoding/xml@go1.25.6
+    Fixed in: encoding/xml@go1.25.13
+    Example traces found:
+      #1: internal/gateway/s3/multipart.go:320:25: s3.Gateway.handleCompleteMultipartUpload calls xml.Unmarshal
+
+Vulnerability #16: GO-2026-5972
+    Enforce maximum recursion depth in encoding/asn1
+  More info: https://pkg.go.dev/vuln/GO-2026-5972
+  Standard library
+    Found in: encoding/asn1@go1.25.6
+    Fixed in: encoding/asn1@go1.25.13
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:252:38: sftp.loadOrGenerateHostKey calls ssh.ParsePrivateKey, which eventually calls asn1.Unmarshal
+
+Vulnerability #17: GO-2026-5856
+    Invoking Encrypted Client Hello privacy leak in crypto/tls
+  More info: https://pkg.go.dev/vuln/GO-2026-5856
+  Standard library
+    Found in: crypto/tls@go1.25.6
+    Fixed in: crypto/tls@go1.25.12
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls tls.Conn.HandshakeContext
+      #2: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls tls.Conn.Read
+
+Vulnerability #18: GO-2026-5039
+    Arbitrary inputs are included in errors without any escaping in
+    net/textproto
+  More info: https://pkg.go.dev/vuln/GO-2026-5039
+  Standard library
+    Found in: net/textproto@go1.25.6
+    Fixed in: net/textproto@go1.25.11
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls textproto.Reader.ReadMIMEHeader
+
+Vulnerability #19: GO-2026-5037
+    Inefficient candidate hostname parsing in crypto/x509
+  More info: https://pkg.go.dev/vuln/GO-2026-5037
+  Standard library
+    Found in: crypto/x509@go1.25.6
+    Fixed in: crypto/x509@go1.25.11
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls x509.Certificate.Verify
+      #2: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls x509.Certificate.VerifyHostname
+      #3: internal/multipart/multipart.go:780:20: multipart.Store.Abort calls fmt.Errorf, which eventually calls x509.HostnameError.Error
+
+Vulnerability #20: GO-2026-5023
+    Invoking VerifiedPublicKeyCallback permissions skip enforcement in
+    golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-5023
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.49.0
+    Fixed in: golang.org/x/crypto@v0.52.0
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:188:48: sftp.Gateway.handleConnection calls ssh.NewServerConn
+
+Vulnerability #21: GO-2026-5020
+    Invoking infinite loop on large channel writes in golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-5020
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.49.0
+    Fixed in: golang.org/x/crypto@v0.52.0
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:188:48: sftp.Gateway.handleConnection calls ssh.NewServerConn
+
+Vulnerability #22: GO-2026-5019
+    Invoking bypass of FIDO/U2F security keys physical interaction in
+    golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-5019
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.49.0
+    Fixed in: golang.org/x/crypto@v0.52.0
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:188:48: sftp.Gateway.handleConnection calls ssh.NewServerConn
+
+Vulnerability #23: GO-2026-5018
+    Invoking pathological RSA/DSA parameters may cause DoS in
+    golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-5018
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.49.0
+    Fixed in: golang.org/x/crypto@v0.52.0
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:188:48: sftp.Gateway.handleConnection calls ssh.NewServerConn
+      #2: internal/gateway/sftp/sftp.go:252:38: sftp.loadOrGenerateHostKey calls ssh.ParsePrivateKey
+
+Vulnerability #24: GO-2026-5017
+    Invoking client can cause server deadlock on unexpected responses in
+    golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-5017
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.49.0
+    Fixed in: golang.org/x/crypto@v0.52.0
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:188:48: sftp.Gateway.handleConnection calls ssh.NewServerConn
+
+Vulnerability #25: GO-2026-5014
+    Invoking bypass of certificate restrictions in golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-5014
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.49.0
+    Fixed in: golang.org/x/crypto@v0.52.0
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:188:48: sftp.Gateway.handleConnection calls ssh.NewServerConn
+
+Vulnerability #26: GO-2026-5013
+    Invoking byte arithmetic causes underflow and panic in
+    golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-5013
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.49.0
+    Fixed in: golang.org/x/crypto@v0.52.0
+    Example traces found:
+      #1: internal/gateway/sftp/sftp.go:188:48: sftp.Gateway.handleConnection calls ssh.NewServerConn
+
+Vulnerability #27: GO-2026-4971
+    Panic in Dial and LookupPort when handling NUL byte on Windows in net
+  More info: https://pkg.go.dev/vuln/GO-2026-4971
+  Standard library
+    Found in: net@go1.25.6
+    Fixed in: net@go1.25.10
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:129:23: httpui.Gateway.Start calls net.Listen
+
+Vulnerability #28: GO-2026-4970
+    Root escape via symlink plus trailing slash in os
+  More info: https://pkg.go.dev/vuln/GO-2026-4970
+  Standard library
+    Found in: os@go1.25.6
+    Fixed in: os@go1.25.12
+    Example traces found:
+      #1: internal/fileops/replace.go:406:18: fileops.recoverLocked calls os.Root.Open
+      #2: internal/fileops/replace.go:426:26: fileops.recoverLocked calls os.Root.ReadFile
+
+Vulnerability #29: GO-2026-4947
+    Unexpected work during chain building in crypto/x509
+  More info: https://pkg.go.dev/vuln/GO-2026-4947
+  Standard library
+    Found in: crypto/x509@go1.25.6
+    Fixed in: crypto/x509@go1.25.9
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls x509.Certificate.Verify
+
+Vulnerability #30: GO-2026-4946
+    Inefficient policy validation in crypto/x509
+  More info: https://pkg.go.dev/vuln/GO-2026-4946
+  Standard library
+    Found in: crypto/x509@go1.25.6
+    Fixed in: crypto/x509@go1.25.9
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls x509.Certificate.Verify
+
+Vulnerability #31: GO-2026-4870
+    Unauthenticated TLS 1.3 KeyUpdate record can cause persistent connection
+    retention and DoS in crypto/tls
+  More info: https://pkg.go.dev/vuln/GO-2026-4870
+  Standard library
+    Found in: crypto/tls@go1.25.6
+    Fixed in: crypto/tls@go1.25.9
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls tls.Conn.HandshakeContext
+      #2: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls tls.Conn.Read
+
+Vulnerability #32: GO-2026-4602
+    FileInfo can escape from a Root in os
+  More info: https://pkg.go.dev/vuln/GO-2026-4602
+  Standard library
+    Found in: os@go1.25.6
+    Fixed in: os@go1.25.8
+    Example traces found:
+      #1: internal/fileops/replace.go:413:27: fileops.recoverLocked calls os.File.ReadDir
+      #2: internal/multipart/multipart.go:1019:28: multipart.Store.Cleanup calls os.ReadDir
+
+Vulnerability #33: GO-2026-4601
+    Incorrect parsing of IPv6 host literals in net/url
+  More info: https://pkg.go.dev/vuln/GO-2026-4601
+  Standard library
+    Found in: net/url@go1.25.6
+    Fixed in: net/url@go1.25.8
+    Example traces found:
+      #1: internal/logging/async.go:127:20: logging.Async.Close calls sync.Once.Do, which eventually calls url.Parse
+      #2: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls url.ParseRequestURI
+
+Vulnerability #34: GO-2026-4337
+    Unexpected session resumption in crypto/tls
+  More info: https://pkg.go.dev/vuln/GO-2026-4337
+  Standard library
+    Found in: crypto/tls@go1.25.6
+    Fixed in: crypto/tls@go1.25.7
+    Example traces found:
+      #1: internal/gateway/httpui/httpui.go:142:26: httpui.Gateway.Start calls http.Server.Serve, which eventually calls tls.Conn.HandshakeContext
+      #2: internal/gateway/sftp/sftp.go:260:37: sftp.loadOrGenerateHostKey calls ed25519.GenerateKey, which eventually calls tls.Conn.Read
+
+Your code is affected by 34 vulnerabilities from 1 module and the Go standard library.
+This scan also found 10 vulnerabilities in packages you import and 17
+vulnerabilities in modules you require, but your code doesn't appear to call
+these vulnerabilities.
+Use '-show verbose' for more details.
