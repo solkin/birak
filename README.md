@@ -362,10 +362,48 @@ leaves the deleted keys out. `Content-MD5` and a concrete `x-amz-content-sha256`
 are enforced when present, so a captured signed request cannot be replayed with
 other keys. `VersionId` is ignored, as buckets are not versioned.
 
+#### S3 Upload Bodies and Checksums
+
+PutObject and UploadPart accept the body encodings S3 clients send by default,
+so the AWS CLI, AWS SDKs, boto3, `mc`, and minio-go need no client-side settings:
+
+| `x-amz-content-sha256` | Typical sender | Verified |
+|------------------------|----------------|----------|
+| hex SHA-256, `UNSIGNED-PAYLOAD` | AWS CLI and SDKs over HTTP, `mc` over HTTPS | the SHA-256, when concrete |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` | `mc` and minio-go over HTTP, AWS Java SDK v1 | every chunk signature, chained from the request signature |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` | SDKs that sign chunks and add a trailing checksum | chunk signatures, the trailer signature, and the checksum |
+| `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | AWS CLI ≥ 2.23, boto3 ≥ 1.36, aws-sdk-go-v2 ≥ 1.73 (S3) over HTTPS; `mc --checksum` | the trailing checksum |
+
+- aws-chunked bodies (`Content-Encoding: aws-chunked`) are decoded while they
+  stream, in constant memory. Only the decoded bytes are stored, and a part's
+  `ETag` and `Content-MD5` cover the decoded bytes.
+- A flexible checksum — `x-amz-checksum-crc32`, `-crc32c`, `-crc64nvme`, `-sha1`,
+  or `-sha256` — is verified over the decoded bytes, whether it is sent as a
+  header or as the trailer named by `x-amz-trailer`, and is echoed in the
+  response. One checksum per request; an unsupported algorithm is refused with
+  `InvalidRequest`.
+- `x-amz-decoded-content-length`, when sent, must equal the decoded size.
+  `max_upload_bytes` applies to decoded bytes; a declared length over the limit
+  is refused with `413` before the body is read.
+- All checks finish before the object is published or the part is staged. A
+  forged or reordered chunk (`SignatureDoesNotMatch`), a wrong checksum
+  (`BadDigest`), truncated or malformed framing (`IncompleteBody`,
+  `InvalidRequest`, `MalformedTrailerError`), or a length mismatch leaves the
+  existing object and staged parts unchanged.
+- Without configured credentials there is no secret to check chunk signatures
+  with; framing, length, and checksums are still verified. A signed streaming
+  body requires an `Authorization` header signature; a presigned URL carries no
+  seed signature for its chunks and is refused.
+- Other streaming variants, such as SigV4a
+  (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`), and aws-chunked bodies sent to
+  any request but PutObject and UploadPart return `501 NotImplemented` without
+  being read.
+
 #### S3 Multipart Uploads
 
 The full multipart API is supported, so `aws s3 cp` of a large file, `aws s3api`,
-boto3, rclone, and S3 SDKs can upload parallel parts with unencoded request bodies.
+boto3, rclone, `mc`, and S3 SDKs can upload parallel parts with their default
+request bodies, aws-chunked included.
 
 Multipart upload state is stored on disk under
 `sync_dir/.birak/multipart/{uploadId}/`, so an interrupted process can resume,
@@ -375,8 +413,9 @@ object is replicated.
 
 - Each part is streamed to a scratch file, hashed, and published with an atomic
   rename. Retrying the same part number safely replaces it.
-- `Content-MD5` and a concrete `x-amz-content-sha256` are enforced when present,
-  and the part response `ETag` is its MD5.
+- `Content-MD5`, a concrete `x-amz-content-sha256`, and flexible checksums are
+  enforced when present, and the part response `ETag` is its MD5. Streaming
+  bodies are decoded and verified as for PutObject.
 - Completion requires strictly ascending parts, matching ETags, and the configured
   minimum size for every part except the last.
 - Assembly re-hashes every part and checks final size before publishing the object
@@ -440,10 +479,7 @@ sftp> mkdir backups
 sftp> rm old-file.txt
 ```
 
-S3 request bodies using `Content-Encoding: aws-chunked` or `STREAMING-*`
-payload markers return `501 NotImplemented` before changing an object or part.
-Configure clients to use unencoded upload bodies; ordinary HTTP transfer chunking
-is supported. Multipart metadata and parts propagate directory flush failures;
+Multipart metadata and parts propagate directory flush failures;
 a failed first flush of a replacement part preserves its acknowledged predecessor.
 Authentication query parameters are removed from gateway access logs.
 

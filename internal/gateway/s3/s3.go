@@ -161,8 +161,10 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if unsupportedStreamingBody(r) {
-		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", "aws-chunked and streaming payloads are not supported; send an unencoded payload.")
+	// Only object PUTs (PutObject and UploadPart) decode an aws-chunked body;
+	// refuse one elsewhere before a handler reads or acts on it.
+	if streamingBody(r) && r.Method != http.MethodPut {
+		writeStreamingNotImplemented(w)
 		return
 	}
 
@@ -208,6 +210,10 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	if key == "" {
+		if streamingBody(r) {
+			writeStreamingNotImplemented(w)
+			return
+		}
 		// Check for sub-resource queries before bucket-level operations.
 		query := r.URL.Query()
 		if _, ok := query["uploads"]; ok && r.Method == http.MethodGet {

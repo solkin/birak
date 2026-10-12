@@ -797,16 +797,24 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	// Cap the upload size when configured, translating an overflow into 413.
+	// Decode an aws-chunked body and check its signatures, decoded length, and
+	// flexible checksum as it is read.
+	body, failure := g.newPayload(r)
+	if failure != nil {
+		writeS3Error(w, failure.status, failure.code, failure.message)
+		return
+	}
+	// Cap the decoded upload size when configured, translating an overflow into 413.
+	var src io.Reader = body
 	if g.config.MaxUploadBytes > 0 {
-		r.Body = http.MaxBytesReader(w, r.Body, g.config.MaxUploadBytes)
+		src = http.MaxBytesReader(w, body, g.config.MaxUploadBytes)
 	}
 
 	// When the client declares a concrete payload SHA-256 (the value the SigV4
 	// signature is computed over), verify the streamed body against it and reject a
 	// mismatch. This closes the integrity gap where a captured signed request could
-	// be replayed with a swapped body. UNSIGNED-PAYLOAD and aws-chunked streaming
-	// markers carry no verifiable digest, so they are not checked.
+	// be replayed with a swapped body. UNSIGNED-PAYLOAD and the streaming markers
+	// carry no whole-body digest; a signed stream is verified chunk by chunk.
 	declaredHash := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Amz-Content-Sha256")))
 	var hasher hash.Hash
 	if isHexSHA256(declaredHash) {
@@ -850,13 +858,18 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	if md5Hasher != nil {
 		writers = append(writers, md5Hasher)
 	}
-	size, err := io.Copy(io.MultiWriter(writers...), r.Body)
+	size, err := io.Copy(io.MultiWriter(writers...), src)
 	tmpFile.Close()
 	if err != nil {
 		os.Remove(tmpPath)
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size")
+			return
+		}
+		if errors.As(err, &failure) {
+			g.logger.Warn("put object: payload rejected", "bucket", bucket, "key", key, "code", failure.code)
+			writeS3Error(w, failure.status, failure.code, failure.message)
 			return
 		}
 		g.logger.Error("put object: write failed", "bucket", bucket, "key", key, "error", err)
@@ -899,6 +912,7 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	g.logger.Info("object created", "bucket", bucket, "key", key, "size", size)
 
 	w.Header().Set("ETag", etagFor(info))
+	body.setChecksumHeader(w)
 	w.WriteHeader(http.StatusOK)
 }
 

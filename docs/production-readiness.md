@@ -6,7 +6,9 @@
 
 Межпроектная проверка 12 октября 2026 года и исправления общего файлового слоя
 описаны в [отчёте повторной приёмки](audits/protocol-parity-production-fixes-20261012.md).
-В текущем кандидате aws-chunked явно отклоняется с 501, filesystem LIST не
+В текущем кандидате PutObject и UploadPart декодируют aws-chunked с проверкой
+подписей чанков, flexible checksum и decoded length (остальные запросы и
+неподдержанные варианты отклоняются с 501), filesystem LIST не
 обрезается на 100000 объектах, multipart сообщает ошибки directory fsync,
 фоновые cleanup соблюдают storage fence, а auth query fields исключены из логов.
 
