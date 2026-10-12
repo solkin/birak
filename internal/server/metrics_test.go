@@ -25,7 +25,7 @@ type metricsProvider struct {
 
 func (p metricsProvider) PeerStats() []PeerStatus        { return p.peers }
 func (p metricsProvider) ScanStatus() watcher.ScanStatus { return p.w.Status() }
-func (p metricsProvider) CheckStorage() error            { return p.w.CheckStorage() }
+func (p metricsProvider) CheckStorage() error            { return p.w.ProbeStorage() }
 func (p metricsProvider) SkippedEntries() int64          { return p.skipped }
 
 func TestMetricsExposeWhatOperatorsAlertOn(t *testing.T) {

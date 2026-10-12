@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/store"
 	"github.com/birak/birak/internal/watcher"
 )
@@ -20,7 +21,7 @@ type readinessProvider struct{ w *watcher.Watcher }
 
 func (p readinessProvider) PeerStats() []PeerStatus        { return nil }
 func (p readinessProvider) ScanStatus() watcher.ScanStatus { return p.w.Status() }
-func (p readinessProvider) CheckStorage() error            { return p.w.CheckStorage() }
+func (p readinessProvider) CheckStorage() error            { return p.w.ProbeStorage() }
 
 func TestReadinessRequiresScanAndBoundStorage(t *testing.T) {
 	root := t.TempDir()
@@ -78,6 +79,61 @@ func TestReadinessRequiresScanAndBoundStorage(t *testing.T) {
 	}
 	if status.Local == nil || status.Local.Ready || status.Local.LastError == "" {
 		t.Fatalf("storage fault missing from status: %+v", status.Local)
+	}
+}
+
+// A probe that queued behind a large replica apply would take a healthy node
+// out of rotation for as long as the apply held the commit lock.
+func TestReadinessDoesNotWaitForTheCommitLock(t *testing.T) {
+	root := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := store.New(filepath.Join(t.TempDir(), "node.db"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	w := watcher.New(root, st, logger, time.Millisecond, time.Hour, nil)
+	srv := New(st, root, "node", nil, Config{Stats: readinessProvider{w}}, logger)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case <-w.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial scan did not finish")
+	}
+	probe := func() int {
+		t.Helper()
+		codes := make(chan int, 1)
+		go func() {
+			out := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(out, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			codes <- out.Code
+		}()
+		select {
+		case code := <-codes:
+			return code
+		case <-time.After(5 * time.Second):
+			t.Fatal("/readyz waited for the commit lock")
+			return 0
+		}
+	}
+	unlock := fileops.Lock(root)
+	defer unlock()
+	if got := probe(); got != http.StatusOK {
+		t.Fatalf("/readyz while a commit holds the lock: %d", got)
+	}
+	if err := os.Remove(filepath.Join(root, ".birak", "storage-id")); err != nil {
+		t.Fatal(err)
+	}
+	if got := probe(); got != http.StatusServiceUnavailable {
+		t.Fatalf("missing storage sentinel reported ready while the lock is held: %d", got)
 	}
 }
 

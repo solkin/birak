@@ -22,9 +22,15 @@ var ErrBusy = errors.New("file is being written")
 type rootState struct {
 	mu      sync.Mutex
 	writers map[*os.File]*writer
-	readers map[*Reader]struct{}
-	hooks   Hooks
-	notify  func()
+	// hooks is replaced under mu but loaded without it: the read path checks
+	// the storage fence and quarantine without joining the commit queue.
+	hooks  atomic.Pointer[Hooks]
+	notify func()
+
+	// readersMu guards only the reader registry. Opening and closing a reader
+	// never takes mu, so a GET neither waits for a commit nor makes one wait.
+	readersMu sync.Mutex
+	readers   map[*Reader]struct{}
 
 	// Every commit on a volume queues behind mu, so how long it is held is the
 	// one number that explains write latency under load — and the only way to
@@ -87,6 +93,16 @@ func Lock(dir string) func() {
 	return r.release(time.Now())
 }
 
+// TryLock is Lock for work that has a lock-free fallback and must not queue
+// behind a commit, such as revalidating storage for a read.
+func TryLock(dir string) (func(), bool) {
+	r := root(dir)
+	if !r.mu.TryLock() {
+		return nil, false
+	}
+	return r.release(time.Now()), true
+}
+
 // release unlocks and accounts for the time the lock was held.
 func (r *rootState) release(acquired time.Time) func() {
 	return func() {
@@ -127,13 +143,22 @@ type Published struct {
 	Hash string
 }
 
-// Hooks run under the root lock. The watcher owns validation and durable
-// indexing; fileops owns filesystem mutations. No callback reacquires Lock.
+// Hooks run under the root lock unless noted. The watcher owns validation and
+// durable indexing; fileops owns filesystem mutations. No callback reacquires
+// Lock.
 type Hooks struct {
-	Validate     func() error
+	Validate func() error
+	// ValidateRead applies the storage fence to a read without the root lock,
+	// so a GET does not wait for a commit. Without it a read falls back to
+	// Validate under the lock.
+	ValidateRead func() error
 	CheckSources func([]string) error
-	CheckRead    func(string, os.FileInfo) error
-	Begin        func([]string) error
+	// CheckRead runs without the root lock, after the reader is registered. A
+	// quarantine fences a generation before it revokes that generation's
+	// readers, so either this check sees the fence or the revocation sees the
+	// reader.
+	CheckRead func(string, os.FileInfo) error
+	Begin     func([]string) error
 	// Finish indexes the result. Every commit fsyncs both what it publishes and
 	// the directories it changes before Finish runs, so Finish is told the
 	// result is durable and needs no second pass over the disk, and is handed
@@ -142,9 +167,21 @@ type Hooks struct {
 	Finish func(paths []string, published map[string]Published) error
 }
 
-func SetHooks(dir string, hooks Hooks) { unlock := Lock(dir); defer unlock(); root(dir).hooks = hooks }
+func SetHooks(dir string, hooks Hooks) {
+	unlock := Lock(dir)
+	defer unlock()
+	root(dir).hooks.Store(&hooks)
+}
+
+func (r *rootState) hook() Hooks {
+	if h := r.hooks.Load(); h != nil {
+		return *h
+	}
+	return Hooks{}
+}
+
 func validateLocked(dir string) error {
-	if fn := root(dir).hooks.Validate; fn != nil {
+	if fn := root(dir).hook().Validate; fn != nil {
 		return fn()
 	}
 	return nil
@@ -165,7 +202,7 @@ func CommitFrom(dir string, sources, paths []string, fn func() error) error {
 	return commitLocked(dir, sources, paths, fn)
 }
 func checkSourcesLocked(dir string, paths []string) error {
-	if fn := root(dir).hooks.CheckSources; fn != nil && len(paths) != 0 {
+	if fn := root(dir).hook().CheckSources; fn != nil && len(paths) != 0 {
 		return fn(paths)
 	}
 	return nil
@@ -182,7 +219,7 @@ func commitPublishedLocked(dir string, sources, paths []string, published map[st
 	if err := checkSourcesLocked(dir, sources); err != nil {
 		return err
 	}
-	h := root(dir).hooks
+	h := root(dir).hook()
 	if h.Begin != nil {
 		if err := h.Begin(paths); err != nil {
 			return err

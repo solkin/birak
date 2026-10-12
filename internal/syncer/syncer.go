@@ -325,7 +325,11 @@ func (s *Syncer) ScanStatus() watcher.ScanStatus {
 	status.Ready = status.Ready && status.ReplicaInitialized
 	return status
 }
-func (s *Syncer) CheckStorage() error { return s.watcher.CheckStorage() }
+
+// CheckStorage serves /readyz, /status and /metrics, so it never waits for
+// the commit lock: a probe that queued behind a large replica apply would take
+// a healthy node out of rotation.
+func (s *Syncer) CheckStorage() error { return s.watcher.ProbeStorage() }
 
 // SkippedEntries counts peer entries this node decided never to apply.
 func (s *Syncer) SkippedEntries() int64 { return s.skipped.Load() }
@@ -617,9 +621,9 @@ func (s *Syncer) applyChange(ctx context.Context, peerURL string, change store.F
 	// Entries this node already holds are the common case, not the exception: a
 	// peer restart resets our cursor and replays its whole manifest. Answering
 	// those from the index alone is what keeps a restart cheap — the check below
-	// re-reads and re-hashes the local file under the shared commit lock, so
-	// without this the replay costs one full pass over the dataset and stalls
-	// every gateway write behind it.
+	// takes the shared commit lock for every entry and re-reads any local file
+	// whose size or timestamp has moved, so without this the replay queues the
+	// whole manifest behind gateway writes.
 	//
 	// Skipping is safe because indexing can only move a local name forward:
 	// re-reading it could make the local state win, never lose. Detecting bytes
@@ -640,7 +644,10 @@ func (s *Syncer) applyChange(ctx context.Context, peerURL string, change store.F
 		commitUnlock()
 		return err
 	}
-	refreshErr := s.watcher.RefreshLocked(change.Name)
+	// Observing the local file trusts an unchanged size and timestamp, as a
+	// commit does for the destination it replaces. Re-reading it would hold the
+	// lock for a full hash of a file the index already describes.
+	refreshErr := s.watcher.RefreshTrustedLocked(change.Name)
 	damaged := errors.Is(refreshErr, watcher.ErrIntegrity)
 	if refreshErr != nil && !damaged {
 		err := refreshErr
@@ -1261,6 +1268,14 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		os.Remove(tmpPath)
 		return fmt.Errorf("close file %s: %w", meta.Name, err)
 	}
+	// These bytes were hashed on the way in and are now durable. The rename
+	// below keeps the inode, so this stat and that hash describe the published
+	// file, and indexing it needs no second read under the lock.
+	staged, err := os.Stat(tmpPath)
+	if err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("stat file %s: %w", meta.Name, err)
+	}
 
 	// Downloading does not reserve the destination. Reinspect after the entire
 	// transfer, under the lock also used by gateways and the watcher.
@@ -1276,7 +1291,7 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	if err != nil {
 		return err
 	}
-	refreshErr := s.watcher.RefreshLocked(meta.Name)
+	refreshErr := s.watcher.RefreshTrustedLocked(meta.Name)
 	damaged := errors.Is(refreshErr, watcher.ErrIntegrity)
 	if refreshErr != nil && !damaged {
 		return refreshErr
@@ -1329,7 +1344,7 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		return fmt.Errorf("update store for %s: %w", meta.Name, err)
 	}
 
-	if err := s.watcher.RefreshLocked(meta.Name); err != nil {
+	if err := s.watcher.RefreshPublishedLocked(meta.Name, staged, gotHash); err != nil {
 		return err
 	}
 	s.logger.Info("file synced", "name", meta.Name, "size", meta.Size, "hash", meta.Hash[:12], "peer", peerURL)
@@ -1346,7 +1361,7 @@ func (s *Syncer) applyDeletion(ctx context.Context, meta store.FileMeta) error {
 		return err
 	}
 
-	refreshErr := s.watcher.RefreshLocked(meta.Name)
+	refreshErr := s.watcher.RefreshTrustedLocked(meta.Name)
 	damaged := errors.Is(refreshErr, watcher.ErrIntegrity)
 	if refreshErr != nil && !damaged {
 		return refreshErr

@@ -59,6 +59,27 @@ func (s *Store) QuarantinedNames() []string {
 	return names
 }
 
+// QuarantineSnapshot returns the quarantined names together with the
+// generation they belong to. A caller that caches something derived from them
+// rebuilds it when QuarantineGeneration moves past that generation.
+func (s *Store) QuarantineSnapshot() (uint64, []string) {
+	s.integrityMu.RLock()
+	defer s.integrityMu.RUnlock()
+	names := make([]string, 0, len(s.quarantined))
+	for name := range s.quarantined {
+		names = append(names, name)
+	}
+	return s.integrityGen, names
+}
+
+// QuarantineGeneration reports the current integrity generation and how many
+// names are quarantined, without copying them.
+func (s *Store) QuarantineGeneration() (uint64, int) {
+	s.integrityMu.RLock()
+	defer s.integrityMu.RUnlock()
+	return s.integrityGen, len(s.quarantined)
+}
+
 func (s *Store) QuarantineCount() int {
 	s.integrityMu.RLock()
 	defer s.integrityMu.RUnlock()
@@ -73,6 +94,7 @@ func (s *Store) SetQuarantined(name, key string) error {
 	s.integrityMu.Lock()
 	s.quarantined[name] = true
 	s.damagedObjects[key] = true
+	s.integrityGen++
 	s.integrityMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -110,6 +132,7 @@ func (s *Store) ClearQuarantine(name, verifiedKey string) error {
 	s.integrityMu.Lock()
 	delete(s.quarantined, name)
 	delete(s.damagedObjects, verifiedKey)
+	s.integrityGen++
 	s.integrityMu.Unlock()
 	return nil
 }

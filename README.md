@@ -488,7 +488,7 @@ Authentication query parameters are removed from gateway access logs.
 1. Every indexed create, modification, or deletion receives a new monotonic **version**. SQLite commits the file state and its persistent version counter in one transaction with `WAL + synchronous=FULL`.
 2. Each peer polls `GET /changes?since=<cursor>`. The batch is collapsed to the newest entry per name and recorded as queued work; nothing is transferred while reading.
 3. Incoming state is compared with current local bytes. A winning file is downloaded to a temporary file, checked against its size and SHA256, fsynced, and compared again before publication.
-4. Gateways, indexing, and replication share a filesystem commit lock. A gateway records its mutation intent before changing files and indexes the result before acknowledging success. Replica intents preserve the incoming conflict clock if a process stops between filesystem publication and SQLite commit. Writable SFTP handles use staging files: CLOSE publishes, disconnect aborts; aliases of an active inode are protected too.
+4. Gateways, indexing, and replication share a filesystem commit lock. A gateway records its mutation intent before changing files and indexes the result before acknowledging success. Replica intents preserve the incoming conflict clock if a process stops between filesystem publication and SQLite commit. Writable SFTP handles use staging files: CLOSE publishes, disconnect aborts; aliases of an active inode are protected too. Reads, `/readyz`, `/status` and `/metrics` never wait for that lock, so neither a large replica apply nor the scratch-file sweep stalls a GET.
 5. The cursor advances only once the whole page is durably recorded in the queue. It means "read this far", never "applied": cancellation or a queue write failure prevents advancement, and a full queue stops the cursor rather than dropping work.
 6. A new node starts at `since=0`, receiving both live files and deletion history.
 
@@ -709,7 +709,7 @@ Alert on `birak_peer_healthy`, `birak_repair_oldest_seconds`,
 counters answer the question a latency graph cannot: every write on a volume
 queues behind one lock, so `rate(birak_commit_lock_held_seconds_total[5m])`
 approaching 1 means the node is serialized rather than slow — a difference that
-is fixed in completely different places.
+is fixed in completely different places. Reads never wait for this lock.
 `birak_skipped_entries_total` counts peer entries this node decided never to
 apply — malformed metadata, or names excluded by an `ignore` rule that differs
 between nodes. Those leave no repair row, so a node that diverges this way is

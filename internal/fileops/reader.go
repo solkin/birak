@@ -50,10 +50,13 @@ type Reader struct {
 	err  error // protected by mu
 }
 
+// OpenReader takes no commit lock: a GET must not queue behind a replica
+// apply or a maintenance pass, and thousands of them must not queue behind
+// each other. The storage fence and the quarantine check are both safe to run
+// alongside commits; see Hooks.
 func OpenReader(dir, path string) (*Reader, error) {
-	unlock := Lock(dir)
-	defer unlock()
-	if err := validateLocked(dir); err != nil {
+	root := root(dir)
+	if err := root.validateRead(dir); err != nil {
 		return nil, err
 	}
 	f, err := os.OpenFile(path, os.O_RDONLY|nonblockFlag, 0)
@@ -64,38 +67,77 @@ func OpenReader(dir, path string) (*Reader, error) {
 	if err == nil && !info.Mode().IsRegular() {
 		err = fmt.Errorf("not a regular file: %s", path)
 	}
-	if err == nil && root(dir).hooks.CheckRead != nil {
-		err = root(dir).hooks.CheckRead(path, info)
-	}
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	r := &Reader{file: f, root: root(dir), info: info}
-	if r.root.readers == nil {
-		r.root.readers = make(map[*Reader]struct{})
+	r := &Reader{file: f, root: root, info: info}
+	// Register before checking. A quarantine that lands between the two then
+	// either is seen by the check or finds this reader to revoke.
+	root.readersMu.Lock()
+	if root.readers == nil {
+		root.readers = make(map[*Reader]struct{})
 	}
-	r.root.readers[r] = struct{}{}
-	r.root.readerCount.Add(1)
+	root.readers[r] = struct{}{}
+	root.readerCount.Add(1)
+	root.readersMu.Unlock()
+	if check := root.hook().CheckRead; check != nil {
+		if err := check(path, info); err != nil {
+			r.Close()
+			return nil, err
+		}
+	}
 	return r, nil
 }
 
+// validateRead applies the storage fence to a read. A fence that has no
+// read-side check is applied the way commits apply it, under the lock.
+func (r *rootState) validateRead(dir string) error {
+	h := r.hook()
+	if h.ValidateRead != nil {
+		return h.ValidateRead()
+	}
+	if h.Validate == nil {
+		return nil
+	}
+	unlock := Lock(dir)
+	defer unlock()
+	return h.Validate()
+}
+
 // RevokeReadersLocked also fences aliases and descriptors opened before the
-// damage was discovered. The caller holds the volume's commit lock.
+// damage was discovered. The caller holds the volume's commit lock and has
+// already fenced the generation against new readers.
 func RevokeReadersLocked(dir, path string) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return
 	}
-	for reader := range root(dir).readers {
+	RevokeGenerationLocked(dir, info)
+}
+
+// RevokeGenerationLocked revokes every registered reader of the object info
+// describes. Readers registered after it has collected its targets run their
+// own quarantine check, which already sees the caller's fence.
+func RevokeGenerationLocked(dir string, info os.FileInfo) {
+	root := root(dir)
+	var targets []*Reader
+	root.readersMu.Lock()
+	for reader := range root.readers {
 		if os.SameFile(info, reader.info) {
-			reader.mu.Lock()
-			if reader.err == nil {
-				reader.err = ErrUnreadable
-				reader.root.readerRevocations.Add(1)
-			}
-			reader.mu.Unlock()
+			targets = append(targets, reader)
 		}
+	}
+	root.readersMu.Unlock()
+	// Waiting for an in-flight read happens outside readersMu, so a slow disk
+	// under one descriptor does not hold up every other open and close.
+	for _, reader := range targets {
+		reader.mu.Lock()
+		if reader.err == nil {
+			reader.err = ErrUnreadable
+			reader.root.readerRevocations.Add(1)
+		}
+		reader.mu.Unlock()
 	}
 }
 
@@ -144,14 +186,14 @@ func (r *Reader) Chmod(mode os.FileMode) error             { return r.file.Chmod
 func (r *Reader) Truncate(size int64) error                { return r.file.Truncate(size) }
 func (r *Reader) WriteAt(p []byte, off int64) (int, error) { return 0, os.ErrPermission }
 func (r *Reader) Close() error {
-	r.root.mu.Lock()
-	defer r.root.mu.Unlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.root.readersMu.Lock()
 	if _, exists := r.root.readers[r]; exists {
 		delete(r.root.readers, r)
 		r.root.readerCount.Add(-1)
 	}
+	r.root.readersMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.err = os.ErrClosed
 	return r.file.Close()
 }

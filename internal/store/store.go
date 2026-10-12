@@ -110,10 +110,13 @@ type Store struct {
 	integrityMu    sync.RWMutex
 	quarantined    map[string]bool
 	damagedObjects map[string]bool
-	countMu        sync.Mutex
-	countVersion   int64
-	countValid     bool
-	countCached    int64
+	// integrityGen advances with every change to the two sets above, so a
+	// reader can cache what it derived from them. Guarded by integrityMu.
+	integrityGen uint64
+	countMu      sync.Mutex
+	countVersion int64
+	countValid   bool
+	countCached  int64
 }
 
 // SetRepairLimit changes the per-peer queue cap. Zero disables it.

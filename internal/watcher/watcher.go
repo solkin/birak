@@ -52,7 +52,15 @@ type Watcher struct {
 	readyOnce   sync.Once
 	recovered   bool
 	repairPeers []string
-	storageID   string // accessed under the shared filesystem commit lock
+	// storageID is written under the shared filesystem commit lock and read
+	// without it by the lock-free volume check.
+	storageID atomic.Pointer[string]
+	// fence is the outcome of the last full storage validation. Reads and
+	// probes consult it instead of queueing for the commit lock to repeat it.
+	fence atomic.Pointer[storageFence]
+	// quarantined answers the read-path alias check without a stat of every
+	// quarantined name on every GET.
+	quarantined quarantineIndex
 
 	// work carries debounced batches from the fsnotify loop to the processing
 	// goroutine. Hashing and directory scans must never run on the event loop:
@@ -106,7 +114,7 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 	}
 	w.scrubRate.Store(DefaultScrubRate)
 	fileops.SetNotifier(dir, w.requestRescan)
-	fileops.SetHooks(dir, fileops.Hooks{Validate: w.prepareStorageLocked, CheckSources: w.checkSourcesLocked, CheckRead: w.checkReadLocked, Begin: w.beginCommitLocked, Finish: w.finishCommitLocked})
+	fileops.SetHooks(dir, fileops.Hooks{Validate: w.prepareStorageLocked, ValidateRead: w.validateRead, CheckSources: w.checkSourcesLocked, CheckRead: w.checkRead, Begin: w.beginCommitLocked, Finish: w.finishCommitLocked})
 	return w
 }
 
@@ -455,6 +463,28 @@ func (w *Watcher) RefreshLocked(name string) error {
 	return w.refreshFileLocked(name, indexOptions{})
 }
 
+// RefreshTrustedLocked observes a name the way a commit observes the
+// destination it is about to replace: a file whose size and timestamp still
+// match the index is taken as unchanged rather than read again under the lock.
+// A quarantined name is always read. Caller holds Lock.
+func (w *Watcher) RefreshTrustedLocked(name string) error {
+	if err := w.prepareStorageLocked(); err != nil {
+		return err
+	}
+	return w.refreshFileLocked(name, indexOptions{trustStat: true})
+}
+
+// RefreshPublishedLocked indexes a name whose bytes the caller has just
+// published and already hashed, the way a commit hands its hash to Finish.
+// info must describe the published inode; if the path no longer names that
+// unchanged generation, the file is read again. Caller holds Lock.
+func (w *Watcher) RefreshPublishedLocked(name string, info os.FileInfo, hash string) error {
+	if err := w.prepareStorageLocked(); err != nil {
+		return err
+	}
+	return w.refreshFileLocked(name, indexOptions{published: map[string]*hashed{name: {info: info, hash: hash}}})
+}
+
 // hashed carries bytes read outside the commit lock. It is used only while the
 // file's generation is provably unchanged; otherwise the file is read again.
 type hashed struct {
@@ -716,42 +746,135 @@ func (w *Watcher) CheckStorage() error {
 // CheckStorageLocked validates recovery/storage while the caller holds Lock.
 func (w *Watcher) CheckStorageLocked() error { return w.prepareStorageLocked() }
 
+// storageFence is the outcome of one full storage validation. Only a holder of
+// the commit lock runs that validation, since it may recover interrupted
+// replacements and bind the volume.
+type storageFence struct {
+	err error
+	at  time.Time // when the validation began
+}
+
+// readFenceTTL is how long a read trusts the last full validation before it
+// revalidates. Every commit validates on its way in, so on a node taking
+// writes this is refreshed long before it expires.
+const readFenceTTL = time.Second
+
+var errStorageUnvalidated = errors.New("storage has not been validated yet")
+
+// validateRead is the storage fence for a read. A GET must not queue behind a
+// replica apply for something a commit re-establishes on every acquisition.
+func (w *Watcher) validateRead() error {
+	if w.fence.Load() == nil {
+		// Nothing has validated this volume yet. That happens once, before any
+		// gateway is serving, and a read must not skip recovery to get there.
+		return w.CheckStorage()
+	}
+	return w.checkStorageWithoutWaiting(readFenceTTL)
+}
+
+// ProbeStorage reports what CheckStorage would, without waiting for the commit
+// lock: a readiness probe must answer while a large replica is being applied.
+func (w *Watcher) ProbeStorage() error { return w.checkStorageWithoutWaiting(0) }
+
+// checkStorageWithoutWaiting accepts a successful validation younger than
+// maxAge. Otherwise it revalidates if the commit lock is free, and if it is not
+// it relies on the holder: every commit validated recovery state on its way in
+// and a replacement journal written since is the holder's own, so only the
+// volume binding can have changed — and that needs no lock to check.
+func (w *Watcher) checkStorageWithoutWaiting(maxAge time.Duration) error {
+	fence := w.fence.Load()
+	if fence != nil && fence.err == nil && time.Since(fence.at) < maxAge {
+		return nil
+	}
+	if unlock, ok := fileops.TryLock(w.dir); ok {
+		defer unlock()
+		return w.prepareStorageLocked()
+	}
+	if fence == nil {
+		return errStorageUnvalidated
+	}
+	if fence.err != nil {
+		return fence.err
+	}
+	return w.checkBoundVolume()
+}
+
+// checkBoundVolume repeats the read-only half of checkStorageLocked for a
+// volume that is already bound.
+func (w *Watcher) checkBoundVolume() error {
+	id := w.storageID.Load()
+	if id == nil {
+		return errStorageUnvalidated
+	}
+	return w.checkVolume(*id)
+}
+
 // A persisted sentinel binds this metadata database to its data volume. A
 // missing/remounted root after restart must fail closed, not delete the cluster.
 func (w *Watcher) checkStorageLocked() error {
-	info, err := os.Stat(w.dir)
+	if id := w.storageID.Load(); id != nil {
+		return w.checkVolume(*id)
+	}
+	id, err := w.store.NodeValue("storage_id")
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() {
-		return fmt.Errorf("sync root is not a directory")
+	if id != "" {
+		w.storageID.Store(&id)
+		return w.checkVolume(id)
 	}
-	if w.storageID == "" {
-		w.storageID, err = w.store.NodeValue("storage_id")
-		if err != nil {
-			return err
-		}
+	return w.bindVolumeLocked()
+}
+
+// storageMarker checks the layout every validation relies on and returns the
+// sentinel's path.
+func (w *Watcher) storageMarker() (string, error) {
+	info, err := os.Stat(w.dir)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("sync root is not a directory")
 	}
 	private := filepath.Join(w.dir, ".birak")
 	if info, err := os.Lstat(private); err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
-		return fmt.Errorf("storage state directory must be a real directory")
+		return "", fmt.Errorf("storage state directory must be a real directory")
 	} else if err != nil && !os.IsNotExist(err) {
-		return err
+		return "", err
 	}
 	marker := filepath.Join(private, "storage-id")
 	if info, err := os.Lstat(marker); err == nil && !info.Mode().IsRegular() {
-		return fmt.Errorf("invalid storage sentinel")
+		return "", fmt.Errorf("invalid storage sentinel")
+	}
+	return marker, nil
+}
+
+// checkVolume confirms, changing nothing, that the sync root still holds the
+// volume bound to id. It needs no lock.
+func (w *Watcher) checkVolume(id string) error {
+	marker, err := w.storageMarker()
+	if err != nil {
+		return err
 	}
 	data, err := os.ReadFile(marker)
-	if w.storageID != "" {
-		if err != nil {
-			return fmt.Errorf("data volume sentinel unavailable: %w", err)
-		}
-		if string(data) != w.storageID {
-			return fmt.Errorf("data volume identity mismatch")
-		}
-		return nil
+	if err != nil {
+		return fmt.Errorf("data volume sentinel unavailable: %w", err)
 	}
+	if string(data) != id {
+		return fmt.Errorf("data volume identity mismatch")
+	}
+	return nil
+}
+
+// bindVolumeLocked binds a database that has no volume yet: it adopts the
+// volume's sentinel, or writes one. Caller holds Lock.
+func (w *Watcher) bindVolumeLocked() error {
+	marker, err := w.storageMarker()
+	if err != nil {
+		return err
+	}
+	private := filepath.Dir(marker)
+	data, err := os.ReadFile(marker)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -797,7 +920,7 @@ func (w *Watcher) checkStorageLocked() error {
 	if err := w.store.SetNodeValue("storage_id", id); err != nil {
 		return err
 	}
-	w.storageID = id
+	w.storageID.Store(&id)
 	return nil
 }
 

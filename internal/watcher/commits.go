@@ -6,6 +6,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -183,7 +185,17 @@ func (w *Watcher) indexPathsLocked(paths []string, opts indexOptions) error {
 	}
 	return nil
 }
+
+// prepareStorageLocked is the full storage validation. Its outcome is kept so
+// reads and probes can use it without queueing for the lock to repeat it.
 func (w *Watcher) prepareStorageLocked() error {
+	started := time.Now()
+	err := w.validateStorageLocked()
+	w.fence.Store(&storageFence{err: err, at: started})
+	return err
+}
+
+func (w *Watcher) validateStorageLocked() error {
 	if err := w.checkStorageLocked(); err != nil {
 		return err
 	}
@@ -250,7 +262,9 @@ func (w *Watcher) clearIntegrity(name string, verifiedKey ...string) error {
 	return nil
 }
 
-func (w *Watcher) checkReadLocked(path string, info os.FileInfo) error {
+// checkRead runs for every GET without the commit lock. See fileops.Hooks for
+// why that cannot let a reader slip past a concurrent quarantine.
+func (w *Watcher) checkRead(path string, info os.FileInfo) error {
 	key, err := fileops.GenerationKey(path, info)
 	if err != nil {
 		return err
@@ -258,24 +272,82 @@ func (w *Watcher) checkReadLocked(path string, info os.FileInfo) error {
 	if w.store.IsDamagedObject(key) {
 		return fileops.ErrUnreadable
 	}
-	for _, name := range w.store.QuarantinedNames() {
-		damaged := filepath.Join(w.dir, filepath.FromSlash(name))
-		if path == damaged {
-			return fileops.ErrUnreadable
-		}
-		// A symlink or hard link must not bypass a name's quarantine.
-		if other, err := os.Stat(damaged); err == nil && os.SameFile(other, info) {
-			return fileops.ErrUnreadable
-		}
+	if w.quarantined.fences(w, path, info) {
+		return fileops.ErrUnreadable
 	}
 	return nil
 }
+
+// quarantineIndexTTL bounds how long the index trusts the stat results it was
+// built from. Every quarantine change rebuilds it at once; the TTL covers only
+// a quarantined name replaced outside Birak and not yet re-indexed.
+const quarantineIndexTTL = time.Second
+
+// quarantineIndex holds, for every quarantined name, its path and the object it
+// named when the index was built, so a read compares against memory instead of
+// stating every quarantined name. Reads share an immutable snapshot; only a
+// rebuild takes mu.
+type quarantineIndex struct {
+	mu       sync.Mutex
+	snapshot atomic.Pointer[quarantineSnapshot]
+}
+
+type quarantineSnapshot struct {
+	gen   uint64
+	built time.Time
+	paths map[string]bool
+	files []os.FileInfo
+}
+
+func (q *quarantineSnapshot) current(gen uint64) bool {
+	return q != nil && q.gen >= gen && time.Since(q.built) < quarantineIndexTTL
+}
+
+func (q *quarantineIndex) fences(w *Watcher, path string, info os.FileInfo) bool {
+	gen, count := w.store.QuarantineGeneration()
+	if count == 0 {
+		return false
+	}
+	snapshot := q.snapshot.Load()
+	if !snapshot.current(gen) {
+		snapshot = q.rebuild(w, gen)
+	}
+	if snapshot.paths[path] {
+		return true
+	}
+	// A symlink or hard link must not bypass a name's quarantine.
+	for _, damaged := range snapshot.files {
+		if os.SameFile(damaged, info) {
+			return true
+		}
+	}
+	return false
+}
+
+func (q *quarantineIndex) rebuild(w *Watcher, gen uint64) *quarantineSnapshot {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if snapshot := q.snapshot.Load(); snapshot.current(gen) {
+		return snapshot
+	}
+	gen, names := w.store.QuarantineSnapshot()
+	snapshot := &quarantineSnapshot{gen: gen, built: time.Now(), paths: make(map[string]bool, len(names))}
+	for _, name := range names {
+		damaged := filepath.Join(w.dir, filepath.FromSlash(name))
+		snapshot.paths[damaged] = true
+		if info, err := os.Stat(damaged); err == nil {
+			snapshot.files = append(snapshot.files, info)
+		}
+	}
+	q.snapshot.Store(snapshot)
+	return snapshot
+}
+
 func (w *Watcher) quarantine(meta *store.FileMeta) error {
 	err := fmt.Errorf("%w: %s", ErrIntegrity, meta.Name)
 	// The name is recorded and repaired from a peer; it is reported as a count
 	// rather than as this node's last error, so one damaged file does not claim
 	// the whole node is faulty.
-	fileops.RevokeReadersLocked(w.dir, filepath.Join(w.dir, filepath.FromSlash(meta.Name)))
 	path := filepath.Join(w.dir, filepath.FromSlash(meta.Name))
 	info, statErr := os.Stat(path)
 	if statErr != nil {
@@ -283,9 +355,16 @@ func (w *Watcher) quarantine(meta *store.FileMeta) error {
 	}
 	key, keyErr := fileops.GenerationKey(path, info)
 	if keyErr != nil {
+		fileops.RevokeGenerationLocked(w.dir, info)
 		return keyErr
 	}
-	if qerr := w.store.SetQuarantined(meta.Name, key); qerr != nil {
+	// Fence first, then revoke: reads do not take the commit lock, and a reader
+	// registers before it checks the fence, so a reader the revocation misses
+	// is refused by the fence. SetQuarantined fences reads even when persisting
+	// fails.
+	qerr := w.store.SetQuarantined(meta.Name, key)
+	fileops.RevokeGenerationLocked(w.dir, info)
+	if qerr != nil {
 		return fmt.Errorf("persist quarantine %q: %w", meta.Name, qerr)
 	}
 	// An unindexed alias has no trusted version to request yet.
