@@ -235,7 +235,7 @@ export BIRAK_HTTP_ENABLED=true
 | `multipart.temp_file_max_age` | `BIRAK_MULTIPART_TEMP_FILE_MAX_AGE` | `24h` | Age for orphaned atomic-write scratch cleanup |
 | `sync.poll_interval` | `BIRAK_SYNC_POLL_INTERVAL` | `3s` | Peer polling interval |
 | `sync.batch_limit` | `BIRAK_SYNC_BATCH_LIMIT` | `1000` | Max entries per sync request |
-| `sync.max_concurrent_downloads` | `BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS` | `5` | Combined polling and repair downloads per peer; also bounds active repair operations |
+| `sync.max_concurrent_downloads` | `BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS` | `5` | Active repair operations and downloads per peer, in each of two lanes: files of 8 MiB and more, and everything else |
 | `sync.tombstone_ttl` | `BIRAK_SYNC_TOMBSTONE_TTL` | `168h` | Legacy compatibility setting; tombstones are retained indefinitely |
 | `sync.scan_interval` | `BIRAK_SYNC_SCAN_INTERVAL` | `5m` | Stat-only sweep interval; indexes anything whose size or timestamp moved |
 | `sync.scrub_bytes_per_second` | `BIRAK_SYNC_SCRUB_BYTES_PER_SECOND` | `8388608` | Continuous checksum verification budget; 0 disables verification |
@@ -486,15 +486,15 @@ Authentication query parameters are removed from gateway access logs.
 ## How Sync Works
 
 1. Every indexed create, modification, or deletion receives a new monotonic **version**. SQLite commits the file state and its persistent version counter in one transaction with `WAL + synchronous=FULL`.
-2. Each peer polls `GET /changes?since=<cursor>`. The batch is collapsed to the newest entry per name and recorded as queued work; nothing is transferred while reading.
-3. Incoming state is compared with current local bytes. A winning file is downloaded to a temporary file, checked against its size and SHA256, fsynced, and compared again before publication.
+2. Each peer polls `GET /changes?since=<cursor>`. The batch is collapsed to the newest entry per name and compared with the local index in one query; entries that would change something here are recorded as queued work, in one transaction per page. Nothing is transferred while reading.
+3. Incoming state is compared with current local bytes. A winning file is downloaded to a temporary file, checked against its size and SHA256, fsynced, and compared again before publication. An interrupted download of 1 MiB or more is kept and resumed (see below).
 4. Gateways, indexing, and replication share a filesystem commit lock. A gateway records its mutation intent before changing files and indexes the result before acknowledging success. Replica intents preserve the incoming conflict clock if a process stops between filesystem publication and SQLite commit. Writable SFTP handles use staging files: CLOSE publishes, disconnect aborts; aliases of an active inode are protected too. Reads, `/readyz`, `/status` and `/metrics` never wait for that lock, so neither a large replica apply nor the scratch-file sweep stalls a GET.
 5. The cursor advances only once the whole page is durably recorded in the queue. It means "read this far", never "applied": cancellation or a queue write failure prevents advancement, and a full queue stops the cursor rather than dropping work.
 6. A new node starts at `since=0`, receiving both live files and deletion history.
 
 Each peer may hold at most `max_repair_queue` queued names. A full queue refuses new names, which stops that peer's cursor instead of growing the database without bound; entries already queued can still record newer state, and the backlog is visible in `/status`. A manifest comparison resumes where the last one stopped and consumes at most `reconcile_page_budget` pages per pass, so a large tree is compared continuously instead of in a burst every `reconcile_interval`. The position is per peer and persisted; finishing a cycle starts the next one from the beginning. Repairs retry with exponential backoff. A queued deletion survives loss of the source's metadata and can be applied while that source is offline. A persistent permission, disk, or connectivity failure stays visible in `/status`. A valid peer name blocked by a local symlink also remains queued until the obstruction is resolved; malformed or misrouted `/meta` replies cannot erase accepted work. Explicitly ignored names are skipped. **Full reconciliation** compares peer manifests every `reconcile_interval`; `0` disables it.
 
-The apply loop runs up to `max_concurrent_downloads` transfers, with at most one active operation per name and peer, so every transfer for a peer comes out of one budget. A slow transfer leaves the other slots available, including for work queued while it runs. Newly discovered work wakes the loop at once; completed workers immediately pick up the next due entry, and periodic rescans catch elapsed backoffs. A retry starts at half a second and doubles to a fifteen-minute ceiling. Queue write failures pause new dispatch until the next rescan. Shutdown waits for workers; unfinished operations remain in SQLite for restart.
+The apply loop runs up to `max_concurrent_downloads` transfers in each of two lanes per peer — one for files of 8 MiB and more, one for everything else — with at most one active operation per name and peer. A few slow APK transfers on a slow link therefore never hold back the images queued behind them, and a slow transfer leaves the other slots of its lane available, including for work queued while it runs. A queued state this node already holds, because another peer delivered it first, is resolved without asking its peer. Newly discovered work wakes the loop at once; completed workers immediately pick up the next due entry, and periodic rescans catch elapsed backoffs. A retry starts at half a second and doubles to a fifteen-minute ceiling. Queue write failures pause new dispatch until the next rescan. Shutdown waits for workers; unfinished operations remain in SQLite and start again as soon as the node does.
 
 Polling and reconciliation only *discover* work: each records what it finds in
 the queue and moves on. One loop per peer applies it, which is the only place
@@ -503,6 +503,8 @@ longer delays later pages — the stream keeps advancing while the transfer runs
 Transfers with continuing progress still have no overall deadline, so neither
 the queue nor the inactivity floor bounds replication lag. Include large files
 and constrained bandwidth when measuring the cluster's convergence time.
+
+**Resumable downloads.** A download of 1 MiB or more that stops part-way — a dropped connection, a stalled peer, a shutdown — keeps its scratch file and records how far it got, after flushing those bytes, with the SHA-256 of that prefix. A running transfer also records a checkpoint every 16 MiB, which bounds what a crash or power loss costs. The next attempt, from any peer and after a restart too, rehashes the prefix and asks for the rest with `Range` and an `If-Range` naming the content hash. Peers send that hash as the `ETag` of `/files` while the file still has the size and timestamp it was indexed with, so a range is only ever served of exactly the content the download started with. A peer whose content changed sends the whole new file instead, and the transfer is dropped; a prefix that no longer matches its record, or a peer that ignores the range, means a full download. The whole file is still verified against its hash before it is published. A partial download is dropped as soon as the node holds that state or a newer one, and at startup when nothing queued would resume it or it has not been touched for a week.
 
 Connect and TLS establishment are limited to 10 seconds each, and response headers to 15 seconds. A file transfer must deliver at least 64 KiB per minute — roughly 1 KB/s, and only the remaining bytes once a file is nearly done — otherwise it is aborted and requeued. A peer that trickles bytes therefore cannot hold a download slot and a path lock indefinitely. Large transfers still have no overall deadline while they keep making progress.
 
@@ -540,6 +542,10 @@ Two separate jobs, with separate costs. The **sweep** runs every `scan_interval`
 
 The **scrub** re-reads and re-hashes stored files continuously at `scrub_bytes_per_second`, cycling through the tree in name order and persisting its position, so it resumes where it stopped after a restart. It is what detects a rewrite that preserved size and timestamp, and bit rot. Set the budget from the storage you have: at the 8 MiB/s default a 100 GB node completes a cycle in about three hours. `0` disables verification entirely, which leaves silent corruption to be found by a peer or not at all. Hashing happens outside the shared commit lock; only the short index update holds it.
 
+A name the node cannot index is that name's problem, not the node's: a spelling that collides with one already reserved (for example `0.PNG` next to an indexed `0.png`), or a name that is not valid UTF-8. The sweep leaves such files alone, counts them in `/status.local.skipped` and `birak_scan_skipped_files`, names a few in `/status.local.skipped_samples`, and completes; so does an entry removed while the sweep was reading it. The node stays ready and, after a restart, replication starts. Rename or remove the stray file to have it indexed.
+
+Changes reported by the filesystem are indexed one name at a time from a backlog. A sweep that comes due runs between two names rather than after the whole backlog, and leaves the backlog's names to it, so indexing a bulk import that takes longer than the readiness window does not make the node unready. Shutdown stops between two names; what was not indexed yet is found by the next start's initial sweep.
+
 An incomplete or unreadable directory walk never triggers the scan's deletion pass. A persistent marker at `sync_dir/.birak/storage-id` binds the data volume to its metadata database. A missing or mismatched marker makes local storage unready and prevents indexing, gateway mutations, and applying peer changes. Preserve this file with the data volume; do not delete it to bypass a storage fault. A legacy database is bound on first successful validation; an empty data root with existing live metadata is rejected.
 
 `/readyz` answers whether this node can serve and accept writes: storage is bound and the last sweep completed recently. An empty new replica with configured peers also stays unready until it completes a manifest comparison and applies the observed changes from at least one source. That admission is persisted, including a negative marker during incomplete catch-up; a partial restart cannot bypass it. Once admitted, peer outages never revoke admission. A standalone node or a node seeded with local files is an independent origin. This is not a certificate of global freshness; route client traffic using `/readyz`, since the gateways themselves remain reachable during catch-up. `/healthz` reports process liveness. A quarantined file is *not* a node fault — it is unavailable by name, counted in `/status.local.quarantined` and in `birak_quarantined_files`, and repaired from a peer. Quarantine is persisted in SQLite and restored before reads or repair replay. S3, WebDAV, SFTP, HTTP UI and peer downloads share a read fence; detecting damage revokes open readers of that inode, including aliases. Bytes delivered before detection cannot be recalled. A repaired name does not make an old descriptor or a hard link to the damaged generation readable again. Local damaged-generation records are retained conservatively until that same generation is verified healthy. One damaged file therefore no longer removes a node from a load balancer, which it previously did permanently when no peer held a healthy copy. Alert on the quarantine count. `/status.local` also exposes sweep age, scrub cycle age and the last error. Peer outages and queued repairs must be monitored separately.
@@ -572,7 +578,7 @@ A polling cursor acknowledges receipt, not successful application. It cannot saf
 
 ### Node Identity and Recovery
 
-Run one daemon per data volume and metadata directory; OS-held leases reject a second process and are released automatically on exit. Assign a unique `node_id` to each node. Replication rejects a peer advertising the same ID as the local node. Each database has a persistent identity, while every daemon start generates a fresh **process incarnation**, returned as `X-Birak-Epoch`. Peers reset their cursors on an incarnation change and replay current metadata. This also covers a restored backup whose version counter has already caught up with an old cursor.
+Run one daemon per data volume and metadata directory; OS-held leases reject a second process and are released automatically on exit. Assign a unique `node_id` to each node. Replication rejects a peer advertising the same ID as the local node. Each database has a persistent identity, while every daemon start generates a fresh **process incarnation**, returned as `X-Birak-Epoch`. Peers reset their cursors on an incarnation change and replay current metadata. This also covers a restored backup whose version counter has already caught up with an old cursor. For a replayed entry it already holds, the replaying node pays its share of one index query per page: no queue row, no `/meta` request and no download, which `birak_repairs_enqueued_total` lets you confirm.
 
 **Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 4`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds the extended clock, namespace reservations, and admission marker automatically. Release builds pin Go 1.26.9; use a patched supported Go toolchain when building from source. Keep a pre-upgrade metadata backup if a binary rollback is required.
 
@@ -625,7 +631,7 @@ curl 'http://localhost:9100/changes?since=0&limit=100'
 
 ### GET /files/{name...}
 
-Downloads a file by path. The response carries `X-Birak-Mode` with the source's permission bits, so replicas keep the original mode.
+Downloads a file by path. The response carries `X-Birak-Mode` with the source's permission bits, so replicas keep the original mode, and an `ETag` of the quoted content hash while the file matches its index entry. `Range` requests are supported; a resumed download sends `If-Range` with the hash it expects.
 
 ```bash
 curl -O 'http://localhost:9100/files/report.txt'
@@ -679,7 +685,7 @@ curl 'http://localhost:9100/status'
 
 Watch `local.ready`, `local.last_scan_ms_ago`, `peers[].lag`, `peers[].healthy` and `repairs.total` to spot a stalled peer: a stream that has stopped moving shows up here rather than only as a file-count drift between nodes.
 
-`last_reconcile_ms_ago` is the age of the last *completed* manifest comparison, or `-1` when none has finished yet; a paced pass that stopped on its page budget does not count. `local.quarantined` counts files awaiting repair from a peer, and `local.last_scrub_ms_ago` is the age of the last finished verification cycle (`-1` before the first one).
+`last_reconcile_ms_ago` is the age of the last *completed* manifest comparison, or `-1` when none has finished yet; a paced pass that stopped on its page budget does not count. `local.quarantined` counts files awaiting repair from a peer, and `local.last_scrub_ms_ago` is the age of the last finished verification cycle (`-1` before the first one). `local.skipped` counts, by reason, the files the last sweep found but could not index (`name_collision`, `invalid_name`, `vanished`), with a few named in `local.skipped_samples`; `local.skipped_total` counts every skip since start.
 
 ### GET /metrics
 
@@ -691,6 +697,10 @@ birak_repairs_queued 0
 birak_repair_oldest_seconds 0
 birak_quarantined_files 0
 birak_skipped_entries_total 0
+birak_scan_skipped_files{reason="name_collision"} 0
+birak_repairs_enqueued_total 0
+birak_downloads_resumed_total 0
+birak_download_resumed_bytes_total 0
 birak_local_ready 1
 birak_last_scan_seconds 0.8
 birak_peer_lag{peer="http://192.168.1.2:9100"} 0
@@ -713,7 +723,13 @@ is fixed in completely different places. Reads never wait for this lock.
 `birak_skipped_entries_total` counts peer entries this node decided never to
 apply — malformed metadata, or names excluded by an `ignore` rule that differs
 between nodes. Those leave no repair row, so a node that diverges this way is
-visible here and nowhere else.
+visible here and nowhere else. `birak_scan_skipped_files` is the local
+counterpart: files on this node's disk that it cannot index. Alert on its
+`name_collision` series. `birak_repairs_enqueued_total` counts repair rows
+written; on a converged node it stays flat through a peer restart.
+`birak_downloads_resumed_total` and `birak_download_resumed_bytes_total` count
+downloads continued from a partial transfer and the bytes that did not cross
+the link again.
 
 Reader metrics cover shared file descriptors across gateways and replication.
 The bytes counter measures bytes read from files, including internal probes;

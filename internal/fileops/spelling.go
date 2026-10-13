@@ -11,6 +11,10 @@ import (
 	"syscall"
 )
 
+// ErrSpellingAlias marks a path that reaches an existing entry through another
+// spelling of its name, as case-insensitive filesystems allow.
+var ErrSpellingAlias = errors.New("physical namespace alias")
+
 // CheckSpelling rejects a physical case alias before publication or deletion.
 // The metadata reservation handles indexed names; this also protects existing
 // files that the watcher has not indexed yet. Caller holds the volume lock.
@@ -80,7 +84,7 @@ func CheckSpelling(dir, path string) error {
 			}
 			f.Close()
 			if !found {
-				return fmt.Errorf("physical namespace alias: requested %q is not its stored spelling", full)
+				return fmt.Errorf("%w: requested %q is not its stored spelling", ErrSpellingAlias, full)
 			}
 		}
 		parent = full

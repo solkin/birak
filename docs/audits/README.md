@@ -24,6 +24,7 @@
 | [filesystem-production-hardening](filesystem-production-hardening.md) | Portable names, backup mtime, extended clock, initial admission и четыре Docker-инстанса |
 
 | [apk-read-production-load](apk-read-production-load.md) | 500000 файлов, APK 10–500 MiB, частые icons, индексированный LIST и TLS read workload |
+| [intermittent-peers-and-resume](intermittent-peers-and-resume.md) | Дешёвый replay после рестарта peer, докачка, readiness при неиндексируемых именах и длинных batch, быстрый SIGTERM |
 
 Замысел, из которого выросли предыдущие заходы, — в
 [../sync-simplification-plan.md](../sync-simplification-plan.md): что именно

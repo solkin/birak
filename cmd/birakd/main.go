@@ -142,7 +142,6 @@ func run(configPath string) error {
 	if err := w.CheckStorage(); err != nil {
 		return fmt.Errorf("recover storage: %w", err)
 	}
-	gateway.SweepTempFiles(cfg.SyncDir, 0, logger)
 
 	// Forget stream positions for removed peers. Accepted repair work remains
 	// durable and visible even when its source is temporarily unconfigured.
@@ -169,6 +168,9 @@ func run(configPath string) error {
 			Secret:                 cfg.ClusterSecret,
 		},
 	)
+	// The syncer has adopted the partial downloads it can resume by now, so
+	// this removes every other scratch file a previous process left behind.
+	gateway.SweepTempFiles(cfg.SyncDir, 0, logger)
 
 	// Set up HTTP server. The syncer is attached afterwards so /status can
 	// report live per-peer replication state.

@@ -72,7 +72,7 @@ func TestEventBatchForAFileBeingWrittenDoesNotFailReadiness(t *testing.T) {
 	f.Write([]byte("in flight"))
 
 	// A debounced batch names the file the writer currently holds.
-	w.processBatch([]string{"existing.bin"})
+	w.processBatch(context.Background(), []string{"existing.bin"})
 	status := w.Status()
 	if err := commit(); err != nil {
 		t.Fatal(err)

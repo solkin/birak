@@ -172,7 +172,7 @@ func TestAuditSameContentNewMtimeKeepsRecordedRank(t *testing.T) {
 	if err := os.Chtimes(path, after, after); err != nil {
 		t.Fatal(err)
 	}
-	w.processBatch([]string{"same-content"})
+	w.processBatch(context.Background(), []string{"same-content"})
 	w.periodicScan(context.Background())
 	meta, err := w.store.GetFile("same-content")
 	if err != nil {

@@ -14,9 +14,12 @@ import (
 	"time"
 
 	"github.com/birak/birak/internal/fileops"
+	"github.com/birak/birak/internal/watcher"
 )
 
 type skipCounter interface{ SkippedEntries() int64 }
+
+type resumeCounter interface{ ResumedDownloads() (count, bytes int64) }
 
 var started = time.Now()
 
@@ -35,6 +38,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		out.gauge("birak_repairs_due", "Repair entries whose backoff has elapsed.", nil, float64(repairs.Due))
 		out.gauge("birak_repair_oldest_seconds", "Age of the oldest queued repair.", nil, float64(repairs.OldestAgeMS)/1000)
 	}
+	// A peer restart replays its whole stream; on a converged node this stays
+	// flat. A steady climb means work is being queued that the index already
+	// answers.
+	out.counter("birak_repairs_enqueued_total", "Repair queue rows written, new or updated.", float64(s.store.RepairEnqueued()))
 
 	if local, ok := s.stats.(localStatsProvider); ok {
 		status := local.ScanStatus()
@@ -51,11 +58,23 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		if status.LastScanAgoMS >= 0 {
 			out.gauge("birak_last_scan_seconds", "Age of the last complete checksum scan.", nil, float64(status.LastScanAgoMS)/1000)
 		}
+		// Always present, so an alert on a name collision has a series to
+		// watch before the first one happens.
+		for _, reason := range []string{watcher.SkipNameCollision, watcher.SkipInvalidName, watcher.SkipVanished} {
+			labels := map[string]string{"reason": reason}
+			out.gauge("birak_scan_skipped_files", "Files the last complete scan found but could not index, by reason.", labels, float64(status.Skipped[reason]))
+			out.labeledCounter("birak_scan_skipped_total", "Files left unindexed since start, by reason, event batches included.", labels, float64(status.SkippedTotal[reason]))
+		}
 	}
 	if counter, ok := s.stats.(skipCounter); ok {
 		out.counter("birak_skipped_entries_total",
 			"Peer entries dropped as unusable or excluded, which leave no repair row.",
 			float64(counter.SkippedEntries()))
+	}
+	if counter, ok := s.stats.(resumeCounter); ok {
+		count, bytes := counter.ResumedDownloads()
+		out.counter("birak_downloads_resumed_total", "Replica downloads continued from a partial transfer.", float64(count))
+		out.counter("birak_download_resumed_bytes_total", "Bytes a resumed download did not have to transfer again.", float64(bytes))
 	}
 
 	if s.stats != nil {
@@ -103,6 +122,10 @@ func (e *exposition) gauge(name, help string, labels map[string]string, value fl
 
 func (e *exposition) counter(name, help string, value float64) {
 	e.write(name, "counter", help, nil, value)
+}
+
+func (e *exposition) labeledCounter(name, help string, labels map[string]string, value float64) {
+	e.write(name, "counter", help, labels, value)
 }
 
 func (e *exposition) write(name, kind, help string, labels map[string]string, value float64) {

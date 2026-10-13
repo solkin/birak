@@ -19,3 +19,11 @@ func CreateTemp(dir, pattern string) (*os.File, error) {
 }
 func ReleaseTemp(f *os.File)         { activeScratch.Delete(canonical(f.Name())) }
 func ScratchActive(path string) bool { _, ok := activeScratch.Load(canonical(path)); return ok }
+
+// RetainTemp reserves an existing scratch file against the janitor, the way
+// CreateTemp reserves a new one. A partial download is kept between attempts,
+// and across a restart, until its owner resumes or discards it.
+func RetainTemp(path string) { activeScratch.Store(canonical(path), true) }
+
+// ReleaseTempPath ends a reservation made by CreateTemp or RetainTemp.
+func ReleaseTempPath(path string) { activeScratch.Delete(canonical(path)) }

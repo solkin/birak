@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -117,6 +118,10 @@ type Store struct {
 	countVersion int64
 	countValid   bool
 	countCached  int64
+	// enqueued counts repair rows written, new or updated. A peer restart that
+	// replays a converged manifest should leave it where it was; this is how
+	// that can be checked from outside.
+	enqueued atomic.Int64
 }
 
 // SetRepairLimit changes the per-peer queue cap. Zero disables it.
@@ -284,6 +289,17 @@ func (s *Store) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_repair_due ON repair_queue(peer_id, next_attempt);
 
+	-- Downloads interrupted part-way, kept so the next attempt asks the peer
+	-- only for the rest. One per name: a newer state replaces an older one.
+	CREATE TABLE IF NOT EXISTS partial_downloads (
+		name           TEXT    PRIMARY KEY,
+		metadata       TEXT    NOT NULL,
+		path           TEXT    NOT NULL,
+		verified_bytes INTEGER NOT NULL,
+		prefix_hash    TEXT    NOT NULL,
+		updated_at     INTEGER NOT NULL
+	);
+
 	-- How far each peer has consumed OUR change stream, learned from the
 	-- "since" parameter of its polls. This is diagnostic consumption progress,
 	-- not proof of application, and never authorizes automatic tombstone GC.
@@ -311,11 +327,15 @@ func (s *Store) migrate() error {
 		{"files", "conflict_of", "TEXT NOT NULL DEFAULT ''"},
 		{"repair_queue", "metadata", "TEXT NOT NULL DEFAULT ''"},
 		{"repair_queue", "revision", "INTEGER NOT NULL DEFAULT 1"},
+		{"repair_queue", "large", "INTEGER NOT NULL DEFAULT 0"},
 		{"peer_acks", "epoch", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := s.addColumnIfMissing(column.table, column.name, column.definition); err != nil {
 			return err
 		}
+	}
+	if err := s.migrateRepairLanes(); err != nil {
+		return err
 	}
 
 	// Repair generations must survive deletion/reinsertion, not just UPSERT.
@@ -333,6 +353,35 @@ func (s *Store) migrate() error {
 		return err
 	}
 	return nil
+}
+
+// migrateRepairLanes sorts rows queued before lanes existed by their size, once.
+func (s *Store) migrateRepairLanes() error {
+	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_repair_lane ON repair_queue(peer_id, large, next_attempt)"); err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var done string
+	err = tx.QueryRow("SELECT value FROM node_meta WHERE key='repair_lanes_v1'").Scan(&done)
+	if err == nil {
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE repair_queue SET large=1 WHERE metadata<>''
+		AND json_valid(metadata) AND json_extract(metadata,'$.deleted')=0
+		AND json_extract(metadata,'$.size')>=?`, LargeRepairBytes); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO node_meta(key,value) VALUES ('repair_lanes_v1','1')"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // addColumnIfMissing performs an idempotent ALTER TABLE ADD COLUMN.
@@ -910,74 +959,172 @@ func (s *Store) EnqueueChange(peerID string, meta FileMeta, reason string) error
 	return s.enqueueRepair(peerID, meta.Name, meta.Version, reason, &meta)
 }
 
+// EnqueueChanges records a page of changes in one transaction. A replayed page
+// used to cost one synchronous commit per entry; on a node holding millions of
+// names that was most of the price of a peer restart.
+//
+// Rows are written in order; a row that already holds the same or a newer
+// state is left as it is and not counted. When the queue cap is reached
+// part-way, the rows before it are kept and ErrRepairQueueFull is returned with
+// their count: the caller must not advance past the entry that did not fit, and
+// re-reading the page later merges into the same rows.
+func (s *Store) EnqueueChanges(peerID string, metas []FileMeta, reason string) (int, error) {
+	batch := make([]queuedChange, len(metas))
+	for i := range metas {
+		batch[i] = queuedChange{name: metas[i].Name, version: metas[i].Version, meta: &metas[i]}
+	}
+	return s.enqueue(peerID, reason, batch)
+}
+
+// RepairEnqueued counts repair rows written since this store was opened.
+func (s *Store) RepairEnqueued() int64 { return s.enqueued.Load() }
+
+// LargeRepairBytes splits queued work into two lanes. A file at least this
+// large is scheduled apart from smaller ones, so a slow transfer of a big file
+// never holds back the many small files queued behind it.
+const LargeRepairBytes = 8 << 20
+
+// IsLargeRepair reports which lane a state is scheduled in.
+func IsLargeRepair(meta *FileMeta) bool {
+	return meta != nil && !meta.Deleted && meta.Size >= LargeRepairBytes
+}
+
+type queuedChange struct {
+	name    string
+	version int64
+	meta    *FileMeta
+}
+
 func (s *Store) enqueueRepair(peerID, name string, version int64, reason string, meta *FileMeta) error {
+	_, err := s.enqueue(peerID, reason, []queuedChange{{name: name, version: version, meta: meta}})
+	return err
+}
+
+func (s *Store) enqueue(peerID, reason string, batch []queuedChange) (int, error) {
+	if len(batch) == 0 {
+		return 0, nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var encoded string
-	err := s.db.QueryRow("SELECT metadata FROM repair_queue WHERE peer_id=? AND name=?", peerID, name).Scan(&encoded)
-	if err != nil && err != sql.ErrNoRows {
-		return err
-	}
-	// Only a new name can grow the queue; updating a row already in it must
-	// always be allowed, or a full queue could never record newer state.
-	fresh := err == sql.ErrNoRows
-	if fresh && s.repairLimit > 0 {
-		if queued := s.queuedFor(peerID); queued >= s.repairLimit {
-			return fmt.Errorf("%w: peer %s holds %d entries", ErrRepairQueueFull, peerID, queued)
-		}
-	}
-	if meta != nil {
-		var previous FileMeta
-		if encoded == "" || json.Unmarshal([]byte(encoded), &previous) != nil || CompareState(meta, &previous) >= 0 {
-			data, err := json.Marshal(meta)
-			if err != nil {
-				return err
-			}
-			encoded = string(data)
-		}
-	}
-
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
-	var revision int64
-	if err := tx.QueryRow(`UPDATE node_meta SET value=CAST(value AS INTEGER)+1 WHERE key='repair_revision' RETURNING CAST(value AS INTEGER)`).Scan(&revision); err != nil {
-		return err
+	lookup, err := tx.Prepare("SELECT metadata FROM repair_queue WHERE peer_id=? AND name=?")
+	if err != nil {
+		return 0, err
 	}
-	now := time.Now().UnixNano()
-	_, err = tx.Exec(`
-  INSERT INTO repair_queue (peer_id, name, version, attempts, next_attempt, first_seen, last_error, metadata, revision)
-		VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)
+	defer lookup.Close()
+	upsert, err := tx.Prepare(`
+		INSERT INTO repair_queue (peer_id, name, version, attempts, next_attempt, first_seen, last_error, metadata, revision, large)
+		VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(peer_id, name) DO UPDATE SET
 			version    = MAX(repair_queue.version, excluded.version),
 			metadata   = excluded.metadata,
 			revision   = excluded.revision,
-			last_error = excluded.last_error
-	`, peerID, name, version, now, now, reason, encoded, revision)
+			last_error = excluded.last_error,
+			large      = excluded.large
+	`)
 	if err != nil {
-		return err
+		return 0, err
+	}
+	defer upsert.Close()
+	// Revisions must survive deletion and reinsertion, so they come from one
+	// persisted counter; every row of the batch takes the next one.
+	var revision int64
+	if err := tx.QueryRow("SELECT CAST(value AS INTEGER) FROM node_meta WHERE key='repair_revision'").Scan(&revision); err != nil {
+		return 0, err
+	}
+
+	now := time.Now().UnixNano()
+	queued := s.queuedFor(peerID)
+	var fresh int64
+	written := 0
+	var full error
+	for _, change := range batch {
+		var encoded string
+		err := lookup.QueryRow(peerID, change.name).Scan(&encoded)
+		if err != nil && err != sql.ErrNoRows {
+			return 0, err
+		}
+		// Only a new name can grow the queue; updating a row already in it must
+		// always be allowed, or a full queue could never record newer state.
+		isNew := err == sql.ErrNoRows
+		if isNew && s.repairLimit > 0 && queued+fresh >= s.repairLimit {
+			full = fmt.Errorf("%w: peer %s holds %d entries", ErrRepairQueueFull, peerID, queued+fresh)
+			break
+		}
+		var kept *FileMeta
+		if encoded != "" {
+			var previous FileMeta
+			if json.Unmarshal([]byte(encoded), &previous) == nil {
+				kept = &previous
+			}
+		}
+		if change.meta != nil && kept != nil && CompareState(change.meta, kept) <= 0 {
+			// The row already holds this state or a newer one. Rewriting it
+			// would only bump its revision, so a worker applying that very
+			// state could no longer clear it. While a new replica catches up,
+			// reconciliation passes over every name still queued once a second.
+			continue
+		}
+		if change.meta != nil {
+			data, err := json.Marshal(change.meta)
+			if err != nil {
+				return 0, err
+			}
+			encoded, kept = string(data), change.meta
+		}
+		revision++
+		if _, err := upsert.Exec(peerID, change.name, change.version, now, now, reason, encoded, revision, IsLargeRepair(kept)); err != nil {
+			return 0, err
+		}
+		written++
+		if isNew {
+			fresh++
+		}
+	}
+	if written == 0 {
+		return 0, full
+	}
+	if _, err := tx.Exec("UPDATE node_meta SET value=? WHERE key='repair_revision'", revision); err != nil {
+		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return 0, err
 	}
-	if fresh {
-		s.addQueueSize(peerID, 1)
+	s.enqueued.Add(int64(written))
+	if fresh > 0 {
+		s.addQueueSize(peerID, fresh)
 	} else {
 		s.invalidateQueueStats()
 	}
-	return nil
+	return written, full
 }
 
 // DueRepairs returns repair items for a peer whose backoff has elapsed.
 func (s *Store) DueRepairs(peerID string, limit int) ([]RepairItem, error) {
-	rows, err := s.db.Query(`
+	return s.dueRepairs(`
 		SELECT peer_id, name, version, attempts, first_seen, last_error, revision, metadata
 		FROM repair_queue
 		WHERE peer_id = ? AND next_attempt <= ?
 		ORDER BY next_attempt ASC LIMIT ?
 	`, peerID, time.Now().UnixNano(), limit)
+}
+
+// DueRepairsInLane returns due items of one lane (see LargeRepairBytes).
+func (s *Store) DueRepairsInLane(peerID string, large bool, limit int) ([]RepairItem, error) {
+	return s.dueRepairs(`
+		SELECT peer_id, name, version, attempts, first_seen, last_error, revision, metadata
+		FROM repair_queue
+		WHERE peer_id = ? AND large = ? AND next_attempt <= ?
+		ORDER BY next_attempt ASC LIMIT ?
+	`, peerID, large, time.Now().UnixNano(), limit)
+}
+
+func (s *Store) dueRepairs(query string, args ...any) ([]RepairItem, error) {
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -999,6 +1146,34 @@ func (s *Store) DueRepairs(peerID string, limit int) ([]RepairItem, error) {
 		items = append(items, it)
 	}
 	return items, rows.Err()
+}
+
+// QueuedNames returns which of names have a repair row for any peer.
+func (s *Store) QueuedNames(names []string) (map[string]bool, error) {
+	queued := make(map[string]bool, len(names))
+	for start := 0; start < len(names); start += 500 {
+		chunk := names[start:min(start+500, len(names))]
+		args := make([]any, len(chunk))
+		for i, name := range chunk {
+			args[i] = name
+		}
+		rows, err := s.db.Query("SELECT DISTINCT name FROM repair_queue WHERE name IN (?"+strings.Repeat(",?", len(chunk)-1)+")", args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			queued[name] = true
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return nil, err
+		}
+	}
+	return queued, nil
 }
 
 // ResolveRepair removes an item that was applied successfully.

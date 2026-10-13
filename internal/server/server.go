@@ -319,6 +319,15 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	// downloader's temp file, which would make it unreadable to other UIDs.
 	w.Header().Set(HeaderMode, strconv.FormatUint(uint64(info.Mode().Perm()), 8))
 	w.Header().Set("Content-Type", "application/octet-stream")
+	// The content hash is the validator a resumed download sends in If-Range,
+	// so a range is served only of the bytes the downloader started with. It is
+	// claimed only while the open file still has the size and timestamp it was
+	// indexed with; otherwise If-Range fails and the whole file is sent, and
+	// the downloader's own checksum is the final word either way.
+	if meta, err := s.store.GetFile(cleaned); err == nil && meta != nil && !meta.Deleted &&
+		meta.Size == info.Size() && meta.ModTime == info.ModTime().UnixNano() {
+		w.Header().Set("ETag", strconv.Quote(meta.Hash))
+	}
 	http.ServeContent(w, r, "", info.ModTime(), f)
 }
 

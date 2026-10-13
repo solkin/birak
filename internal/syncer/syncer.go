@@ -112,8 +112,10 @@ func decodePage(body io.Reader, entries int, target any) error {
 type Options struct {
 	PollInterval time.Duration
 	BatchLimit   int
-	// MaxConcurrentDownloads bounds polling and repair transfers together for
-	// each peer, and the number of that peer's active repair operations.
+	// MaxConcurrentDownloads bounds a peer's active repair operations and
+	// transfers in each of two lanes: files of store.LargeRepairBytes and more,
+	// and everything else. A slow large transfer never holds a slot a small
+	// file is waiting for.
 	MaxConcurrentDownloads int
 	// RepairInterval is the rescan interval for newly queued/due work. Completing
 	// a repair immediately makes its worker slot available to the next due row.
@@ -184,6 +186,13 @@ type Syncer struct {
 	// was previously visible only as a log line nobody reads.
 	initialized atomic.Bool
 	skipped     atomic.Int64
+
+	// partials are transfers that stopped part-way and can be resumed, by name.
+	// A name's entry is used only under that name's path lock.
+	partialsMu   sync.Mutex
+	partials     map[string]store.PartialDownload
+	resumed      atomic.Int64
+	resumedBytes atomic.Int64
 
 	// Unexported checkpoint for process-boundary regression tests.
 	namespaceCheckpoint func(step, name string) error
@@ -265,6 +274,7 @@ func New(
 		},
 	}
 	result.initializeAdmission()
+	result.loadPartials()
 	return result
 }
 
@@ -299,6 +309,8 @@ func (s *Syncer) Run(ctx context.Context) {
 
 	var wg sync.WaitGroup
 	for _, peer := range s.peers {
+		// Work queued before a restart is due now, not a repair interval from now.
+		s.notifyApply(peer)
 		// Two discovery loops and one apply loop per peer. Polling and manifest
 		// reconciliation only record what they find; repairPeer is the single
 		// place that transfers bytes and changes the filesystem. Separate
@@ -333,6 +345,12 @@ func (s *Syncer) CheckStorage() error { return s.watcher.ProbeStorage() }
 
 // SkippedEntries counts peer entries this node decided never to apply.
 func (s *Syncer) SkippedEntries() int64 { return s.skipped.Load() }
+
+// ResumedDownloads counts transfers continued from a partial download, and
+// the bytes that did not have to cross the link again.
+func (s *Syncer) ResumedDownloads() (count, bytes int64) {
+	return s.resumed.Load(), s.resumedBytes.Load()
+}
 
 // PeerStats implements server.StatsProvider.
 func (s *Syncer) PeerStats() []server.PeerStatus {
@@ -582,14 +600,22 @@ func (s *Syncer) syncBatch(ctx context.Context, peerURL string) (int, bool, erro
 // one place that decides what wins and touches the filesystem, instead of two
 // that have to be kept in agreement by hand.
 //
+// Only entries that would change something here are recorded. Every peer
+// restart resets this node's cursor and replays the peer's whole stream, and a
+// node echoes back every file it has just applied from another peer; both are
+// overwhelmingly states this node already holds. Comparing a page against the
+// index costs one query, where queueing it cost a commit, a /meta request and a
+// delete per entry.
+//
 // A page that cannot be recorded in full leaves the cursor where it is. Nothing
 // is lost by re-reading it: every entry merges into the same (peer, name) row,
 // keeping whichever state is greater.
 func (s *Syncer) enqueueBatch(ctx context.Context, peerURL string, changes []store.FileMeta) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	usable := make([]store.FileMeta, 0, len(changes))
 	for _, change := range changes {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		if err := s.validateChange(change); err != nil {
 			// Unusable or excluded metadata is not transient; retrying cannot
 			// help, so it never enters the queue. The counter is what makes an
@@ -599,11 +625,40 @@ func (s *Syncer) enqueueBatch(ctx context.Context, peerURL string, changes []sto
 				"name", change.Name, "peer", peerURL, "error", err)
 			continue
 		}
-		if err := s.store.EnqueueChange(peerURL, change, "polled"); err != nil {
-			return fmt.Errorf("record change %q from %s: %w", change.Name, peerURL, err)
-		}
+		usable = append(usable, change)
+	}
+	wanted, err := s.newerThanLocal(usable)
+	if err != nil {
+		return fmt.Errorf("compare changes from %s: %w", peerURL, err)
+	}
+	if _, err := s.store.EnqueueChanges(peerURL, wanted, "polled"); err != nil {
+		return fmt.Errorf("record changes from %s: %w", peerURL, err)
 	}
 	return nil
+}
+
+// newerThanLocal keeps the entries that should replace what this node holds,
+// and those that would restore a quarantined name's bytes.
+func (s *Syncer) newerThanLocal(entries []store.FileMeta) ([]store.FileMeta, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	names := make([]string, len(entries))
+	for i, entry := range entries {
+		names[i] = entry.Name
+	}
+	local, err := s.store.GetFilesBatch(names)
+	if err != nil {
+		return nil, err
+	}
+	wanted := make([]store.FileMeta, 0, len(entries))
+	for _, entry := range entries {
+		mine := local[entry.Name]
+		if remoteWins(mine, entry) || (s.watcher.NeedsRepair(entry.Name) && store.CompareState(&entry, mine) == 0) {
+			wanted = append(wanted, entry)
+		}
+	}
+	return wanted, nil
 }
 
 // applyChange brings one file in line with a peer's metadata. The decision and
@@ -759,16 +814,23 @@ func validateSyncName(name string) error {
 
 // repairPeer is the apply loop: the only place that acts on a peer's changes.
 // Polling and reconciliation feed the queue; this drains it, at most one worker
-// per name and no more than MaxConcurrentDownloads at a time. Rows stay in
+// per name. Work runs in two lanes of MaxConcurrentDownloads workers each: one
+// for large files and one for everything else, so a link busy with a few big
+// transfers still delivers the small files queued behind them. Rows stay in
 // SQLite until completion, so stopping this scheduler needs no recovery state.
 func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
 	limit := s.opts.MaxConcurrentDownloads
-	active := make(map[string]bool, limit)
+	lanes := [2]struct {
+		large  bool
+		active int
+	}{{large: false}, {large: true}}
+	active := make(map[string]bool, 2*limit)
 	type completion struct {
 		name string
+		lane int
 		err  error
 	}
-	completed := make(chan completion, limit)
+	completed := make(chan completion, 2*limit)
 	var workers sync.WaitGroup
 	defer workers.Wait()
 	timer := time.NewTimer(jitter(s.opts.RepairInterval))
@@ -788,6 +850,7 @@ func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
 			// after failed bookkeeping is deliberately not cleared here.
 		case result := <-completed:
 			delete(active, result.name)
+			lanes[result.lane].active--
 			// If queue bookkeeping failed, the row is still immediately due.
 			// Wait for the next sweep instead of retrying it in a tight loop.
 			if result.err != nil {
@@ -797,37 +860,45 @@ func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
 		if ctx.Err() != nil {
 			return
 		}
-		if paused || len(active) == limit {
+		if paused {
 			continue
 		}
-
-		// At most len(active) of these oldest rows are already running. Fetching
-		// limit rows therefore supplies every available slot without offset
-		// pagination, persistent claims, or an unbounded in-memory work list.
-		items, err := s.store.DueRepairs(peerURL, limit)
-		if err != nil {
-			s.logger.Error("read repair queue failed", "peer", peerURL, "error", err)
-			paused = true
-			continue
-		}
-		for _, item := range items {
-			if ctx.Err() != nil {
-				return
-			}
-			if active[item.Name] {
+		for i := range lanes {
+			lane := &lanes[i]
+			if lane.active == limit {
 				continue
 			}
-			active[item.Name] = true
-			workers.Add(1)
-			go func(item store.RepairItem) {
-				defer workers.Done()
-				err := s.repairOne(ctx, peerURL, item)
-				// Capacity equals the maximum worker count, so shutdown can wait
-				// for all workers without draining completion notifications.
-				completed <- completion{name: item.Name, err: err}
-			}(item)
-			if len(active) == limit {
+			// At most lane.active of these oldest rows are already running.
+			// Fetching limit rows therefore supplies every available slot
+			// without offset pagination, persistent claims, or an unbounded
+			// in-memory work list.
+			items, err := s.store.DueRepairsInLane(peerURL, lane.large, limit)
+			if err != nil {
+				s.logger.Error("read repair queue failed", "peer", peerURL, "error", err)
+				paused = true
 				break
+			}
+			for _, item := range items {
+				if ctx.Err() != nil {
+					return
+				}
+				// A row that changed lanes while it ran is still that one name.
+				if active[item.Name] {
+					continue
+				}
+				active[item.Name] = true
+				lane.active++
+				workers.Add(1)
+				go func(item store.RepairItem, lane int) {
+					defer workers.Done()
+					err := s.repairOne(ctx, peerURL, item)
+					// Capacity equals the maximum worker count, so shutdown can
+					// wait for all workers without draining completions.
+					completed <- completion{name: item.Name, lane: lane, err: err}
+				}(item, i)
+				if lane.active == limit {
+					break
+				}
 			}
 		}
 	}
@@ -839,6 +910,16 @@ func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
 // A handled transfer failure returns nil after persisting its backoff; errors
 // report cancellation or failed queue bookkeeping to the scheduler.
 func (s *Syncer) repairOne(ctx context.Context, peerURL string, item store.RepairItem) error {
+	// Another peer may already have delivered this state while the row waited:
+	// several peers announce the same file, and the first to be applied wins.
+	// The peer's own newer state, if it has one, arrives through its stream or
+	// the next reconciliation, so the row is done without asking it.
+	if item.Meta != nil && !s.watcher.NeedsRepair(item.Name) {
+		if local, err := s.store.GetFile(item.Name); err == nil && store.CompareState(item.Meta, local) <= 0 {
+			s.settlePartial(item.Name)
+			return s.resolveRepair(peerURL, item)
+		}
+	}
 	meta, err := s.fetchMeta(ctx, peerURL, item.Name)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -866,7 +947,7 @@ func (s *Syncer) repairOne(ctx context.Context, peerURL string, item store.Repai
 		}
 		return s.deferRepair(peerURL, item, err.Error())
 	}
-
+	s.settlePartial(item.Name)
 	return s.resolveRepair(peerURL, item)
 }
 
@@ -1036,37 +1117,26 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) (completed b
 // reconcilePage diffs one manifest page against the local store.
 func (s *Syncer) reconcilePage(peerURL string, page []store.FileMeta) (int, error) {
 	usable := make([]store.FileMeta, 0, len(page))
-	names := make([]string, 0, len(page))
 	for _, entry := range page {
 		if s.validateChange(entry) == nil {
 			usable = append(usable, entry)
-			names = append(names, entry.Name)
 			continue
 		}
 		s.skipped.Add(1)
 	}
-	if len(names) == 0 {
-		return 0, nil
-	}
-
-	local, err := s.store.GetFilesBatch(names)
+	wanted, err := s.newerThanLocal(usable)
 	if err != nil {
 		return 0, fmt.Errorf("batch lookup during reconcile: %w", err)
 	}
-
-	queued := 0
-	for _, entry := range usable {
-		mine := local[entry.Name]
-		if !remoteWins(mine, entry) && !(s.watcher.NeedsRepair(entry.Name) && store.CompareState(&entry, mine) == 0) {
-			continue
-		}
-		s.logger.Info("reconciliation found divergence",
-			"name", entry.Name, "peer", peerURL,
-			"remote_deleted", entry.Deleted, "have_local", mine != nil)
-		if err := s.store.EnqueueChange(peerURL, entry, "reconcile"); err != nil {
-			return queued, fmt.Errorf("enqueue reconcile repair: %w", err)
-		}
-		queued++
+	// A new replica finds every name it has not fetched yet on every pass, so
+	// the per-name record is a debug one; reconcileOnce reports the count.
+	for _, entry := range wanted {
+		s.logger.Debug("reconciliation found divergence",
+			"name", entry.Name, "peer", peerURL, "remote_deleted", entry.Deleted)
+	}
+	queued, err := s.store.EnqueueChanges(peerURL, wanted, "reconcile")
+	if err != nil {
+		return queued, fmt.Errorf("enqueue reconcile repair: %w", err)
 	}
 	return queued, nil
 }
@@ -1153,11 +1223,27 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	if meta.Size < 0 || meta.Size == math.MaxInt64 || !isSHA256Hex(meta.Hash) {
 		return fmt.Errorf("invalid metadata for %s", meta.Name)
 	}
-	release, err := s.acquireDownload(ctx, peerURL)
+	release, err := s.acquireDownload(ctx, peerURL, meta.Size)
 	if err != nil {
 		return err
 	}
 	defer release()
+
+	// A transfer of the same content that stopped part-way is picked up where
+	// it stopped instead of starting again.
+	st, err := s.resumableStage(ctx, meta)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if st != nil {
+			st.release()
+		}
+	}()
+	resumeFrom := int64(0)
+	if st != nil {
+		resumeFrom = st.offset
+	}
 
 	// URL-encode each path segment to handle special characters and subdirectories.
 	reqURL := fmt.Sprintf("%s/files/%s", peerURL, encodePathSegments(meta.Name))
@@ -1173,6 +1259,13 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		return fmt.Errorf("create download request: %w", err)
 	}
 	s.setClusterHeaders(req)
+	etag := strconv.Quote(meta.Hash)
+	if resumeFrom > 0 {
+		// If-Range names the exact content: a peer that no longer serves those
+		// bytes answers with the whole file rather than a range of other bytes.
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
+		req.Header.Set("If-Range", etag)
+	}
 
 	// Use the download client (no global timeout) for file transfers.
 	resp, err := s.downloadClient.Do(req)
@@ -1184,61 +1277,96 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		return err
 	}
 
-	if resp.StatusCode == http.StatusNotFound {
+	switch resp.StatusCode {
+	case http.StatusOK:
+		if st != nil {
+			s.logger.Info("peer sent the whole file instead of the rest; downloading it again",
+				"name", meta.Name, "had", st.offset, "peer", peerURL)
+			if err := st.restart(); err != nil {
+				st.invalid = true
+				return fmt.Errorf("restart download of %s: %w", meta.Name, err)
+			}
+		}
+	case http.StatusPartialContent:
+		first, last, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		if st == nil || !ok || first != st.offset || last != meta.Size-1 || total != meta.Size {
+			if st != nil {
+				st.invalid = true
+			}
+			return fmt.Errorf("download %s: peer sent range %q for bytes %d-%d",
+				meta.Name, resp.Header.Get("Content-Range"), resumeFrom, meta.Size-1)
+		}
+		s.resumed.Add(1)
+		s.resumedBytes.Add(st.offset)
+		s.logger.Info("resuming download", "name", meta.Name, "from", st.offset, "size", meta.Size, "peer", peerURL)
+	case http.StatusRequestedRangeNotSatisfiable:
+		if st != nil {
+			st.invalid = true
+		}
+		return fmt.Errorf("%w: %s no longer extends past byte %d", errContentChanged, meta.Name, resumeFrom)
+	case http.StatusNotFound:
 		// The peer announced this file but cannot serve it right now — a
 		// half-finished write, or an ignore rule that differs from ours.
 		// This is retryable: silently skipping it is how a file goes missing
 		// on one node forever.
 		return fmt.Errorf("download %s: peer returned 404", meta.Name)
-	}
-	if resp.StatusCode != http.StatusOK {
+	default:
 		return fmt.Errorf("download %s: status %d", meta.Name, resp.StatusCode)
 	}
-
-	// Stage without changing a namespace that may be blocked by a file.
-	destDir := filepath.Dir(destPath)
-	tmpFile, err := s.replicaTemp(meta.Name)
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
+	// A peer that names its content and names something else has moved on;
+	// reading those bytes only to reject their checksum would waste the link.
+	if tag := resp.Header.Get("ETag"); tag != "" && tag != etag {
+		if st != nil {
+			st.invalid = true
+		}
+		return fmt.Errorf("%w: %s is now %s", errContentChanged, meta.Name, tag)
 	}
-	defer fileops.ReleaseTemp(tmpFile)
-	tmpPath := tmpFile.Name()
-	cleanup := func() {
-		tmpFile.Close()
-		os.Remove(tmpPath)
+	if st == nil {
+		// Stage without changing a namespace that may be blocked by a file.
+		if st, err = s.newStage(meta); err != nil {
+			return fmt.Errorf("create temp file: %w", err)
+		}
 	}
+	tmpPath := st.path
 
-	// Hash while writing, with stall detection.
-	hasher := sha256.New()
-	// Stop one byte beyond the advertised size. Without this bound a malicious
-	// peer could stream forever while continually avoiding the stall timeout.
-	src := &progressReader{r: io.LimitReader(resp.Body, meta.Size+1)}
-	stalled := watchStall(src, meta.Size, stallTimeout, cancelReq)
-	written, copyErr := io.CopyBuffer(io.MultiWriter(tmpFile, hasher), src, make([]byte, 256*1024))
+	// Hash while writing, with stall detection. Stop one byte beyond the
+	// advertised size: without this bound a malicious peer could stream
+	// forever while continually avoiding the stall timeout.
+	remaining := meta.Size - st.offset
+	src := &progressReader{r: io.LimitReader(resp.Body, remaining+1)}
+	stalled := watchStall(src, remaining, stallTimeout, cancelReq)
+	copyErr := receive(st, src)
 	stalled.stop()
 
+	if errors.Is(copyErr, errTooLong) {
+		st.invalid = true
+		return fmt.Errorf("%w: size mismatch for %s (expected %d, got more)",
+			errContentChanged, meta.Name, meta.Size)
+	}
 	if copyErr != nil {
-		cleanup()
+		// What arrived is kept for the next attempt (see stage.release).
 		if stalled.fired() {
 			return fmt.Errorf("write file %s: transfer below %d bytes per %v", meta.Name, minProgressBytes, stallTimeout)
 		}
 		return fmt.Errorf("write file %s: %w", meta.Name, copyErr)
 	}
-	if written != meta.Size {
-		cleanup()
+	if st.offset != meta.Size {
+		st.invalid = true
 		return fmt.Errorf("%w: size mismatch for %s (expected %d, got %d)",
-			errContentChanged, meta.Name, meta.Size, written)
+			errContentChanged, meta.Name, meta.Size, st.offset)
 	}
 
-	gotHash := hex.EncodeToString(hasher.Sum(nil))
+	gotHash := hex.EncodeToString(st.hasher.Sum(nil))
 	if gotHash != meta.Hash {
-		cleanup()
+		st.invalid = true
 		// The peer rewrote the file between announcing it and serving it. The
 		// newer version will arrive on its own; queueing a repair re-reads the
 		// peer's current metadata and converges.
 		return fmt.Errorf("%w: %s (expected %s, got %s)",
 			errContentChanged, meta.Name, meta.Hash[:12], gotHash[:12])
 	}
+	tmpFile := st.file
+	destDir := filepath.Dir(destPath)
 
 	// Reproduce the source's permissions. os.CreateTemp makes 0600 files, which
 	// would leave every replica unreadable to any other user or sidecar.
@@ -1251,7 +1379,6 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	// Set mod time to match the source.
 	modTime := time.Unix(0, meta.ModTime)
 	if err := os.Chtimes(tmpPath, modTime, modTime); err != nil {
-		cleanup()
 		return fmt.Errorf("set modtime for %s: %w", meta.Name, err)
 	}
 
@@ -1261,11 +1388,9 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	// then reads as "same age", so the good copy is never pulled back.
 	// Mode and mtime are set first so they are flushed with the data.
 	if err := tmpFile.Sync(); err != nil {
-		cleanup()
 		return fmt.Errorf("sync file %s: %w", meta.Name, err)
 	}
-	if err := tmpFile.Close(); err != nil {
-		os.Remove(tmpPath)
+	if err := st.closeFile(); err != nil {
 		return fmt.Errorf("close file %s: %w", meta.Name, err)
 	}
 	// These bytes were hashed on the way in and are now durable. The rename
@@ -1273,13 +1398,11 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	// file, and indexing it needs no second read under the lock.
 	staged, err := os.Stat(tmpPath)
 	if err != nil {
-		os.Remove(tmpPath)
 		return fmt.Errorf("stat file %s: %w", meta.Name, err)
 	}
 
 	// Downloading does not reserve the destination. Reinspect after the entire
 	// transfer, under the lock also used by gateways and the watcher.
-	defer os.Remove(tmpPath)
 	unlock := fileops.Lock(s.syncDir)
 	defer unlock()
 	if err := ctx.Err(); err != nil {
@@ -1318,9 +1441,9 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 	}
 	// Atomic rename — file appears on disk.
 	if err := os.Rename(tmpPath, destPath); err != nil {
-		os.Remove(tmpPath)
 		return fmt.Errorf("rename %s: %w", meta.Name, err)
 	}
+	st.published()
 	// Flush the directory entry before touching the store. This keeps the store
 	// behind the disk on a crash, never ahead: a store entry for a file whose
 	// rename was lost would make the next periodic scan see "indexed but
@@ -1584,12 +1707,16 @@ func watchStall(src *progressReader, total int64, timeout time.Duration, cancel 
 
 // --- small helpers ---
 
-func (s *Syncer) acquireDownload(ctx context.Context, peerURL string) (func(), error) {
+func (s *Syncer) acquireDownload(ctx context.Context, peerURL string, size int64) (func(), error) {
+	key := peerURL
+	if size >= store.LargeRepairBytes {
+		key += " large"
+	}
 	s.downloadsMu.Lock()
-	slots := s.downloads[peerURL]
+	slots := s.downloads[key]
 	if slots == nil {
 		slots = make(chan struct{}, s.opts.MaxConcurrentDownloads)
-		s.downloads[peerURL] = slots
+		s.downloads[key] = slots
 	}
 	s.downloadsMu.Unlock()
 	select {

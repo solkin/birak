@@ -13,18 +13,22 @@ import (
 
 var ErrNameCollision = errors.New("portable namespace collision")
 
+// ErrInvalidName marks a name that no node can store at all: not valid UTF-8,
+// or not in canonical slash-separated form.
+var ErrInvalidName = errors.New("invalid namespace name")
+
 // One spelling per Unicode-normalized, case-folded path component, including
 // deletion history. Otherwise a returning replica can overwrite another name
 // on APFS/NTFS. Reservations also cover directory components, not just leaves.
 func nameParts(name string) ([][2]string, error) {
 	if !utf8.ValidString(name) || name == "" {
-		return nil, fmt.Errorf("invalid namespace name")
+		return nil, fmt.Errorf("%w %q", ErrInvalidName, name)
 	}
 	var out [][2]string
 	var folded, original string
 	for _, part := range strings.Split(name, "/") {
 		if part == "" || part == "." || part == ".." {
-			return nil, fmt.Errorf("non-canonical namespace name %q", name)
+			return nil, fmt.Errorf("%w: %q is not canonical", ErrInvalidName, name)
 		}
 		key := norm.NFC.String(cases.Fold().String(norm.NFC.String(part)))
 		if original != "" {

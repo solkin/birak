@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,6 +74,14 @@ type Watcher struct {
 	// does not. Reported once, after the first sweep: see warnAboutRestamping.
 	restamped atomic.Int64
 
+	// Names that cannot be indexed are skipped, not treated as faults; see
+	// unindexable. lastSkipped is what the last complete sweep skipped, by
+	// reason; skipTotals counts every skip since start, events included.
+	// Guarded by statusMu.
+	lastSkipped     map[string]int
+	lastSkipSamples []string
+	skipTotals      map[string]int64
+
 	// rescan requests an out-of-band full scan. It is the recovery path for
 	// anything the event stream may have dropped.
 	rescan chan struct{}
@@ -79,6 +89,9 @@ type Watcher struct {
 	// ready is closed after the first complete, successful scan.
 	// Other components (e.g. syncer) should wait on this before starting.
 	ready chan struct{}
+
+	// scanTicks replaces the scan ticker in tests.
+	scanTicks <-chan time.Time
 }
 
 // workQueueDepth bounds the batches buffered between the event loop and the
@@ -111,6 +124,7 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 		ready:             make(chan struct{}),
 		work:              make(chan []string, workQueueDepth),
 		rescan:            make(chan struct{}, 1),
+		skipTotals:        make(map[string]int64),
 	}
 	w.scrubRate.Store(DefaultScrubRate)
 	fileops.SetNotifier(dir, w.requestRescan)
@@ -335,58 +349,135 @@ func (w *Watcher) requestRescan() {
 	}
 }
 
-// processLoop performs all expensive work: hashing batches, writing to the
-// store, and running periodic scans. Being a single goroutine, scans can never
-// overlap each other or a batch.
+// processLoop performs all expensive work: hashing event batches, writing to
+// the store, and running periodic scans. Being a single goroutine, scans can
+// never overlap each other or a batch.
+//
+// Batches are taken into one backlog and indexed a name at a time, so the loop
+// can stop between any two names. A sweep that comes due runs there too,
+// instead of after the backlog: indexing a bulk upload of tens of thousands of
+// files takes longer than the readiness window, and a node that is busy
+// indexing must not report itself unready for it. The sweep leaves backlog
+// names to the backlog, so it stays a stat walk rather than repeating the
+// same indexing work.
 func (w *Watcher) processLoop(ctx context.Context) {
 	// Initial scan picks up anything that changed while the daemon was down.
 	w.periodicScan(ctx)
 
 	scanTicker := time.NewTicker(w.scanInterval)
 	defer scanTicker.Stop()
+	ticks := scanTicker.C
+	if w.scanTicks != nil {
+		ticks = w.scanTicks
+	}
+	backlog := newBacklog()
+	sweep := func() {
+		w.sweep(ctx, backlog.has)
+		// Drain any ticks that accumulated while the scan was running.
+		// Without this, a slow scan would be immediately followed by
+		// another scan from the buffered tick.
+		drainTicks(ticks)
+	}
 
-	for {
+	for ctx.Err() == nil {
+		if backlog.len() == 0 {
+			select {
+			case names, ok := <-w.work:
+				if !ok {
+					return
+				}
+				backlog.add(names)
+			case <-w.rescan:
+				w.logger.Info("running requested full scan")
+				sweep()
+			case <-ticks:
+				sweep()
+			case <-ctx.Done():
+				// Whatever was handed over and not yet indexed is found by the
+				// next start's initial scan. Shutdown does not wait for it.
+				return
+			}
+			continue
+		}
+		// Take what else has been handed over without waiting, so a sweep
+		// knows every name that is already queued for indexing.
+		w.absorb(backlog)
+		select {
+		case <-ticks:
+			sweep()
+			continue
+		default:
+		}
+		w.processName(backlog.next())
+	}
+}
+
+// maxBacklog bounds the names taken off the work queue ahead of indexing.
+// Beyond it batches stay queued, and an overflowing queue falls back to a full
+// scan as it always has.
+const maxBacklog = 100_000
+
+func (w *Watcher) absorb(b *backlog) {
+	for b.len() < maxBacklog {
 		select {
 		case names, ok := <-w.work:
 			if !ok {
 				return
 			}
-			w.processBatch(names)
-
-		case <-w.rescan:
-			w.logger.Info("running requested full scan")
-			w.periodicScan(ctx)
-			drainTicker(scanTicker)
-
-		case <-scanTicker.C:
-			w.periodicScan(ctx)
-			// Drain any ticks that accumulated while the scan was running.
-			// Without this, a slow scan would be immediately followed by
-			// another scan from the buffered tick.
-			drainTicker(scanTicker)
-
-		case <-ctx.Done():
-			// Drain whatever the event loop already handed over, then stop.
-			for {
-				select {
-				case names, ok := <-w.work:
-					if !ok {
-						return
-					}
-					w.processBatch(names)
-				default:
-					return
-				}
-			}
+			b.add(names)
+		default:
+			return
 		}
 	}
 }
 
-// drainTicker discards any pending ticks on a ticker channel.
-func drainTicker(t *time.Ticker) {
+// backlog holds the names handed over by the event loop and not yet indexed,
+// in arrival order and each once: a file written twice is indexed once.
+type backlog struct {
+	order []string
+	head  int
+	set   map[string]struct{}
+}
+
+func newBacklog() *backlog { return &backlog{set: make(map[string]struct{})} }
+
+func (b *backlog) len() int { return len(b.order) - b.head }
+
+func (b *backlog) has(name string) bool {
+	_, ok := b.set[name]
+	return ok
+}
+
+func (b *backlog) add(names []string) {
+	for _, name := range names {
+		if _, ok := b.set[name]; ok {
+			continue
+		}
+		b.set[name] = struct{}{}
+		b.order = append(b.order, name)
+	}
+}
+
+func (b *backlog) next() string {
+	name := b.order[b.head]
+	b.order[b.head] = ""
+	b.head++
+	delete(b.set, name)
+	switch {
+	case b.head == len(b.order):
+		b.order, b.head = b.order[:0], 0
+	case b.head >= 4096 && 2*b.head >= len(b.order):
+		b.order = append(b.order[:0], b.order[b.head:]...)
+		b.head = 0
+	}
+	return name
+}
+
+// drainTicks discards any pending ticks.
+func drainTicks(ticks <-chan time.Time) {
 	for {
 		select {
-		case <-t.C:
+		case <-ticks:
 		default:
 			return
 		}
@@ -423,29 +514,100 @@ func (w *Watcher) addDirsRecursive(fsw *fsnotify.Watcher, root string) (failCoun
 	return failCount, err
 }
 
-// processBatch hashes outside the commit lock, then checks the generation and
-// current state under the same lock used by gateways and replication.
-func (w *Watcher) processBatch(names []string) {
+// processBatch indexes names handed over by the event loop, stopping between
+// any two names once ctx is cancelled.
+func (w *Watcher) processBatch(ctx context.Context, names []string) {
 	for _, name := range names {
-		err := w.scanFile(name)
-		if err == nil {
-			continue
+		if ctx.Err() != nil {
+			return
 		}
-		if errors.Is(err, fileops.ErrBusy) {
-			// The writer holding this name indexes it when it commits. Recording
-			// that as a local fault would fail readiness for a healthy node.
-			w.logger.Debug("deferred indexing a file being written", "name", name)
-			continue
-		}
-		if errors.Is(err, ErrIntegrity) {
-			// Already quarantined and queued for repair, and counted in status.
-			// One damaged name is not a reason to stop serving the rest.
-			w.logger.Error("file quarantined", "name", name, "error", err)
-			continue
-		}
-		w.setError(err)
-		w.logger.Error("inspect file failed", "name", name, "error", err)
+		w.processName(name)
 	}
+}
+
+// processName hashes outside the commit lock, then checks the generation and
+// current state under the same lock used by gateways and replication.
+func (w *Watcher) processName(name string) {
+	err := w.scanFile(name)
+	if err == nil {
+		return
+	}
+	if errors.Is(err, fileops.ErrBusy) {
+		// The writer holding this name indexes it when it commits. Recording
+		// that as a local fault would fail readiness for a healthy node.
+		w.logger.Debug("deferred indexing a file being written", "name", name)
+		return
+	}
+	if errors.Is(err, ErrIntegrity) {
+		// Already quarantined and queued for repair, and counted in status.
+		// One damaged name is not a reason to stop serving the rest.
+		w.logger.Error("file quarantined", "name", name, "error", err)
+		return
+	}
+	if reason := unindexable(err); reason != "" {
+		w.statusMu.Lock()
+		w.skipTotals[reason]++
+		w.statusMu.Unlock()
+		w.logger.Warn("file cannot be indexed and is left alone",
+			"name", strconv.Quote(name), "reason", reason, "error", err)
+		return
+	}
+	w.setError(err)
+	w.logger.Error("inspect file failed", "name", name, "error", err)
+}
+
+// Reasons a name is skipped rather than failing the sweep.
+const (
+	SkipNameCollision = "name_collision"
+	SkipInvalidName   = "invalid_name"
+	SkipVanished      = "vanished"
+)
+
+// unindexable classifies errors that belong to one name rather than to the
+// node: a spelling that collides with a reserved one, or a name no node can
+// store. Such a file can sit in the sync directory for weeks; failing every
+// sweep on it took the whole node out of rotation, and after a restart kept
+// replication from ever starting.
+func unindexable(err error) string {
+	switch {
+	case errors.Is(err, store.ErrNameCollision), errors.Is(err, fileops.ErrSpellingAlias):
+		return SkipNameCollision
+	case errors.Is(err, store.ErrInvalidName):
+		return SkipInvalidName
+	}
+	return ""
+}
+
+// vanished reports a walk error caused by an entry removed while the walk was
+// reading it, such as a directory deleted between listing and reading it.
+func vanished(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+}
+
+// skipTally collects what one sweep skipped.
+type skipTally struct {
+	counts  map[string]int
+	samples []string
+}
+
+const maxSkipSamples = 10
+
+func (t *skipTally) add(reason, name string) {
+	if t.counts == nil {
+		t.counts = make(map[string]int)
+	}
+	t.counts[reason]++
+	if len(t.samples) < maxSkipSamples {
+		t.samples = append(t.samples, reason+": "+strconv.Quote(name))
+	}
+}
+
+func (t *skipTally) total() int {
+	n := 0
+	for _, count := range t.counts {
+		n += count
+	}
+	return n
 }
 
 func (w *Watcher) Refresh(name string) error {
@@ -710,12 +872,34 @@ type ScanStatus struct {
 	// when no cycle has finished yet. Readiness does not depend on it: the scrub
 	// is a continuous background budget, not a deadline.
 	LastScrubAgoMS int64 `json:"last_scrub_ms_ago"`
+	// Skipped counts, by reason, what the last complete sweep found on disk
+	// and left alone instead of failing: names whose spelling collides with
+	// one already reserved (name_collision), names no node can store
+	// (invalid_name), and entries removed while it walked (vanished).
+	// SkippedSamples names a few of them; SkippedTotal counts every skip
+	// since start, event batches included.
+	Skipped        map[string]int   `json:"skipped,omitempty"`
+	SkippedSamples []string         `json:"skipped_samples,omitempty"`
+	SkippedTotal   map[string]int64 `json:"skipped_total,omitempty"`
 }
 
 func (w *Watcher) Status() ScanStatus {
 	w.statusMu.Lock()
 	defer w.statusMu.Unlock()
 	status := ScanStatus{LastError: w.lastError, LastScanAgoMS: -1, LastScrubAgoMS: -1, Quarantined: w.store.QuarantineCount(), ScrubBytesPerSecond: w.scrubRate.Load(), DirectorySyncBestEffort: runtime.GOOS == "windows"}
+	if len(w.lastSkipped) > 0 {
+		status.Skipped = make(map[string]int, len(w.lastSkipped))
+		for reason, count := range w.lastSkipped {
+			status.Skipped[reason] = count
+		}
+		status.SkippedSamples = append([]string(nil), w.lastSkipSamples...)
+	}
+	if len(w.skipTotals) > 0 {
+		status.SkippedTotal = make(map[string]int64, len(w.skipTotals))
+		for reason, count := range w.skipTotals {
+			status.SkippedTotal[reason] = count
+		}
+	}
 	if !w.lastScrub.IsZero() {
 		status.LastScrubAgoMS = time.Since(w.lastScrub).Milliseconds()
 	}
@@ -927,10 +1111,19 @@ func (w *Watcher) bindVolumeLocked() error {
 // periodicScan is a checksum scrub, not just an mtime/size comparison. Changes
 // are published one by one using fresh snapshots; memory holds only names.
 // Any traversal error suppresses the entire deletion pass.
-func (w *Watcher) periodicScan(ctx context.Context) (result error) {
+func (w *Watcher) periodicScan(ctx context.Context) error { return w.sweep(ctx, nil) }
+
+// sweep is periodicScan for a processing loop with a backlog: names for which
+// queued reports true are left to it, since it indexes them next anyway.
+//
+// A name that belongs to one file rather than to the node — see unindexable —
+// and an entry that vanished mid-walk are counted and skipped. Anything else
+// leaves the sweep incomplete, which keeps the node unready.
+func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result error) {
 	// complete distinguishes "the scan could not finish" from "the scan
 	// finished and found damaged files". Only the first is a storage fault.
 	complete := false
+	var skips skipTally
 	defer func() {
 		if !complete {
 			if result != nil {
@@ -943,7 +1136,20 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 		first := w.lastScan.IsZero()
 		w.lastScan = time.Now()
 		w.lastError = ""
+		w.lastSkipped, w.lastSkipSamples = skips.counts, skips.samples
+		for reason, count := range skips.counts {
+			w.skipTotals[reason] += int64(count)
+		}
 		w.statusMu.Unlock()
+		if n := skips.total(); n > 0 {
+			reasons := make([]string, 0, len(skips.counts))
+			for reason, count := range skips.counts {
+				reasons = append(reasons, fmt.Sprintf("%s=%d", reason, count))
+			}
+			sort.Strings(reasons)
+			w.logger.Warn("scan left files it cannot index alone",
+				"skipped", n, "reasons", strings.Join(reasons, ","), "examples", skips.samples)
+		}
 		if first {
 			w.warnAboutRestamping()
 		}
@@ -963,6 +1169,11 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 		case errors.Is(err, fileops.ErrBusy):
 			w.logger.Debug("scan skipped a file being written", "name", name)
 		default:
+			if reason := unindexable(err); reason != "" {
+				w.logger.Debug("scan skipped a file it cannot index", "name", strconv.Quote(name), "reason", reason, "error", err)
+				skips.add(reason, name)
+				return
+			}
 			scanErr = errors.Join(scanErr, err)
 		}
 	}
@@ -991,6 +1202,14 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 			return err
 		}
 		if walkErr != nil {
+			if path != w.dir && vanished(walkErr) {
+				// Removed between being listed and being read. The deletion
+				// pass below decides about anything indexed beneath it.
+				if rel, err := filepath.Rel(w.dir, path); err == nil {
+					skips.add(SkipVanished, filepath.ToSlash(rel))
+				}
+				return nil
+			}
 			scanErr = errors.Join(scanErr, walkErr)
 			return nil
 		}
@@ -1009,7 +1228,7 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 			}
 			return nil
 		}
-		if d.IsDir() {
+		if d.IsDir() || queued != nil && queued(name) {
 			return nil
 		}
 		batch = append(batch, name)
@@ -1037,8 +1256,11 @@ func (w *Watcher) periodicScan(ctx context.Context) (result error) {
 			break
 		}
 		for _, meta := range page {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			after = meta.Name
-			if w.shouldIgnore(meta.Name) {
+			if w.shouldIgnore(meta.Name) || queued != nil && queued(meta.Name) {
 				continue
 			}
 			// Names the walk already reconciled are answered by a single stat and

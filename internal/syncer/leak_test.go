@@ -137,20 +137,19 @@ func TestPeerStateDoesNotGrowWithTraffic(t *testing.T) {
 	}
 }
 
-// Download slots are per peer, not per transfer.
+// Download slots are per peer and lane, not per transfer.
 func TestDownloadSlotsAreBoundedByPeerCount(t *testing.T) {
 	s, _ := auditSyncer(t)
 	for i := range 200 {
-		release, err := s.acquireDownload(context.Background(), "http://peer")
+		release, err := s.acquireDownload(context.Background(), "http://peer", int64(i)<<20)
 		if err != nil {
 			t.Fatal(err)
 		}
 		release()
-		_ = i
 	}
 	s.downloadsMu.Lock()
 	defer s.downloadsMu.Unlock()
-	if len(s.downloads) != 1 {
-		t.Fatalf("%d download budgets for one peer", len(s.downloads))
+	if len(s.downloads) != 2 {
+		t.Fatalf("%d download budgets for one peer's two lanes", len(s.downloads))
 	}
 }
