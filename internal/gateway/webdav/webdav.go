@@ -56,7 +56,7 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 	mux.HandleFunc("/", g.route)
 
 	g.server = &http.Server{
-		Handler: gateway.LogMiddleware(g.logger, mux),
+		Handler: gateway.LogMiddleware("webdav", g.logger, mux),
 		// Bound header-read and idle-connection time to blunt Slowloris-style
 		// attacks. Read/Write timeouts are left unset so large file transfers are
 		// not cut off mid-stream.

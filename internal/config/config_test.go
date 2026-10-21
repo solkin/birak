@@ -39,6 +39,7 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("BIRAK_NODE_ID", "from-env")
 	t.Setenv("BIRAK_S3_ENABLED", "true")
 	t.Setenv("BIRAK_S3_ACCESS_KEY", "env-key")
+	t.Setenv("BIRAK_S3_SECRET_KEY", "env-secret")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -60,6 +61,7 @@ func TestLoad_S3Buckets(t *testing.T) {
 gateways:
   s3:
     enabled: true
+    allow_anonymous: true
     buckets: [files, backups]
 `)
 	cfg, err := Load(path)
@@ -112,20 +114,37 @@ func TestLoad_MaxUploadBytes_NegativeRejected(t *testing.T) {
 
 func TestSecurityWarnings(t *testing.T) {
 	open := Config{
-		Sync: SyncConfig{ReconcileInterval: time.Hour},
+		ListenAddr: ":9100",
+		Peers:      []string{"http://203.0.113.7:9100", "http://node-2:9100", "http://10.0.0.3:9100", "https://peer.example.com:9100"},
+		Sync:       SyncConfig{ReconcileInterval: time.Hour},
 		Gateways: GatewaysConfig{
-			S3:     S3GatewayConfig{Enabled: true},
-			WebDAV: WebDAVGatewayConfig{Enabled: true},
-			HTTP:   HTTPGatewayConfig{Enabled: true},
-			SFTP:   SFTPGatewayConfig{Enabled: true},
+			S3:     S3GatewayConfig{Enabled: true, AllowAnonymous: true},
+			WebDAV: WebDAVGatewayConfig{Enabled: true, AllowAnonymous: true},
+			HTTP:   HTTPGatewayConfig{Enabled: true, Username: "u", Password: "p", AllowAnonymous: true},
+			SFTP:   SFTPGatewayConfig{Enabled: false, AllowAnonymous: true},
 		},
 	}
-	if got := SecurityWarnings(open); len(got) != 4 {
-		t.Fatalf("expected 4 warnings for open gateways, got %d: %v", len(got), got)
+	got := strings.Join(SecurityWarnings(open), "\n")
+	for _, want := range []string{
+		"cluster_secret is empty",
+		"peer http://203.0.113.7:9100 uses plain HTTP",
+		"gateways.s3 allows anonymous access",
+		"gateways.webdav allows anonymous access",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing warning %q in:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{"node-2", "10.0.0.3", "peer.example.com", "gateways.http", "gateways.sftp"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("unexpected warning about %q in:\n%s", unwanted, got)
+		}
 	}
 
 	secured := Config{
-		Sync: SyncConfig{ReconcileInterval: time.Hour},
+		ListenAddr:    "127.0.0.1:9100",
+		ClusterSecret: "s",
+		Sync:          SyncConfig{ReconcileInterval: time.Hour},
 		Gateways: GatewaysConfig{
 			S3:     S3GatewayConfig{Enabled: true, AccessKey: "a", SecretKey: "b"},
 			WebDAV: WebDAVGatewayConfig{Enabled: true, Username: "u", Password: "p"},
@@ -135,6 +154,127 @@ func TestSecurityWarnings(t *testing.T) {
 	}
 	if got := SecurityWarnings(secured); len(got) != 0 {
 		t.Fatalf("expected no warnings for secured/disabled gateways, got %v", got)
+	}
+	if got := SecurityWarnings(Config{ListenAddr: "127.0.0.1:9100", Sync: SyncConfig{ReconcileInterval: time.Hour}}); len(got) != 0 {
+		t.Fatalf("a loopback-only peer API without a secret is not exposed, got %v", got)
+	}
+}
+
+// A gateway that is enabled must authenticate unless an operator explicitly
+// opts out. A missing compose variable, or one credential of a pair, used to
+// open the volume to anonymous writes behind the public reverse proxy.
+func TestGatewayCredentialsFailClosed(t *testing.T) {
+	gateways := []struct{ name, enabled, first, second, anonymous string }{
+		{"s3", "BIRAK_S3_ENABLED", "BIRAK_S3_ACCESS_KEY", "BIRAK_S3_SECRET_KEY", "BIRAK_S3_ALLOW_ANONYMOUS"},
+		{"webdav", "BIRAK_WEBDAV_ENABLED", "BIRAK_WEBDAV_USERNAME", "BIRAK_WEBDAV_PASSWORD", "BIRAK_WEBDAV_ALLOW_ANONYMOUS"},
+		{"http", "BIRAK_HTTP_ENABLED", "BIRAK_HTTP_USERNAME", "BIRAK_HTTP_PASSWORD", "BIRAK_HTTP_ALLOW_ANONYMOUS"},
+		{"sftp", "BIRAK_SFTP_ENABLED", "BIRAK_SFTP_USERNAME", "BIRAK_SFTP_PASSWORD", "BIRAK_SFTP_ALLOW_ANONYMOUS"},
+	}
+	cases := []struct {
+		name, first, second, anonymous, want string
+	}{
+		{name: "both set", first: "user", second: "pass"},
+		{name: "none", want: "allow_anonymous"},
+		{name: "none but explicitly anonymous", anonymous: "true"},
+		{name: "first only", first: "admin", want: "needs both"},
+		{name: "second only", second: "pass", want: "needs both"},
+		{name: "first only even if anonymous", first: "admin", anonymous: "true", want: "needs both"},
+		{name: "example placeholder", first: "admin", second: "changeme-password", want: "placeholder"},
+	}
+	for _, g := range gateways {
+		for _, tc := range cases {
+			t.Run(g.name+"/"+tc.name, func(t *testing.T) {
+				t.Setenv(g.enabled, "true")
+				t.Setenv(g.first, tc.first)
+				t.Setenv(g.second, tc.second)
+				t.Setenv(g.anonymous, tc.anonymous)
+				_, err := Load("")
+				switch {
+				case tc.want == "" && err != nil:
+					t.Fatalf("rejected: %v", err)
+				case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+					t.Fatalf("expected error containing %q, got %v", tc.want, err)
+				}
+			})
+		}
+	}
+	// Disabled gateways keep whatever they have; nothing is served.
+	t.Setenv("BIRAK_S3_ACCESS_KEY", "only-key")
+	if _, err := Load(""); err != nil {
+		t.Fatalf("a disabled gateway's credentials are not checked: %v", err)
+	}
+}
+
+func TestPeersRequireIdentityAndSecret(t *testing.T) {
+	t.Setenv("BIRAK_PEERS", "http://node-2:9100")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "node_id is required") {
+		t.Fatalf("a node with peers fell back to the shared default node_id: %v", err)
+	}
+	t.Setenv("BIRAK_NODE_ID", "node-1")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "cluster_secret is required") {
+		t.Fatalf("peers accepted without a cluster secret: %v", err)
+	}
+	t.Setenv("BIRAK_CLUSTER_SECRET", "changeme-cluster-secret")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "placeholder") {
+		t.Fatalf("example cluster secret accepted: %v", err)
+	}
+	t.Setenv("BIRAK_CLUSTER_SECRET", "a-real-secret")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.NodeID != "node-1" {
+		t.Fatalf("explicit node_id lost: %q", cfg.NodeID)
+	}
+	t.Setenv("BIRAK_NODE_ID", "node 1")
+	if _, err := Load(""); err == nil {
+		t.Fatal("node_id with a space accepted")
+	}
+}
+
+func TestPeerListIsValidated(t *testing.T) {
+	t.Setenv("BIRAK_NODE_ID", "node-1")
+	t.Setenv("BIRAK_CLUSTER_SECRET", "secret")
+	t.Setenv("BIRAK_PEERS", "http://node-2:9100, ,https://node-3:9100/,")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Peers, ","); got != "http://node-2:9100,https://node-3:9100" {
+		t.Fatalf("peers = %q; empty items must be dropped and the rest normalized", got)
+	}
+	for _, bad := range []string{"node-2:9100", "ftp://node-2", "http://", "http://user:pw@node-2:9100", "http://node-2:9100/?x=1"} {
+		t.Setenv("BIRAK_PEERS", bad)
+		if _, err := Load(""); err == nil {
+			t.Errorf("peer %q accepted", bad)
+		}
+	}
+	// A standalone node keeps the documented default identity.
+	t.Setenv("BIRAK_PEERS", "")
+	t.Setenv("BIRAK_NODE_ID", "")
+	if cfg, err := Load(""); err != nil || cfg.NodeID != "node-1" {
+		t.Fatalf("standalone default node_id = %q, %v", cfg.NodeID, err)
+	}
+}
+
+func TestPeerTLSAndMetricsSettings(t *testing.T) {
+	path := writeYAML(t, "tls_cert_file: peer.pem\ntls_key_file: peer.key\npeer_ca_file: ca.pem\nmetrics_token: scrape\naccess_log: false\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLSCertFile != "peer.pem" || cfg.TLSKeyFile != "peer.key" || cfg.PeerCAFile != "ca.pem" || cfg.MetricsToken != "scrape" || cfg.AccessLog {
+		t.Fatalf("settings not loaded: %+v", cfg)
+	}
+	if def, _ := Load(""); !def.AccessLog {
+		t.Fatal("access log must stay on by default")
+	}
+	if _, err := Load(writeYAML(t, "tls_cert_file: peer.pem\n")); err == nil {
+		t.Fatal("certificate without key accepted")
+	}
+	t.Setenv("BIRAK_IGNORE", " *.swp , .DS_Store")
+	if cfg, err := Load(""); err != nil || strings.Join(cfg.Ignore, "|") != "*.swp|.DS_Store" {
+		t.Fatalf("ignore patterns not trimmed: %q, %v", cfg.Ignore, err)
 	}
 }
 

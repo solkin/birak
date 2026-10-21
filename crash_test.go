@@ -169,6 +169,7 @@ sync:
 gateways:
   webdav:
     enabled: true
+    allow_anonymous: true
     listen_addr: %q
 `, n.id, n.syncDir, filepath.Join(root, "meta"), n.peerAddr, crashSecret, n.davAddr)
 	if err := os.WriteFile(n.configPath, []byte(config), 0o600); err != nil {

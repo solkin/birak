@@ -126,7 +126,12 @@ func TestSkipClassification(t *testing.T) {
 		{fmt.Errorf("x: %w", fileops.ErrSpellingAlias), SkipNameCollision},
 		{fmt.Errorf("x: %w", store.ErrInvalidName), SkipInvalidName},
 		{errors.New("indexed file was replaced by a non-regular file"), ""},
-		{&fs.PathError{Op: "open", Path: "x", Err: syscall.EACCES}, ""},
+		{&fs.PathError{Op: "open", Path: "x", Err: syscall.EACCES}, SkipUnreadable},
+		{&fs.PathError{Op: "lstat", Path: "x", Err: syscall.EPERM}, SkipUnreadable},
+		{fmt.Errorf("%w: %w", errUnreadable, syscall.EIO), SkipUnreadable},
+		// The volume failing is never one name's problem.
+		{&storageFault{&fs.PathError{Op: "open", Path: "x", Err: syscall.EACCES}}, ""},
+		{&fs.PathError{Op: "read", Path: "x", Err: syscall.EIO}, ""},
 	} {
 		if got := unindexable(tc.err); got != tc.want {
 			t.Errorf("unindexable(%v)=%q, want %q", tc.err, got, tc.want)

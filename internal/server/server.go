@@ -7,7 +7,11 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/gateway"
@@ -51,16 +55,20 @@ type localStatsProvider interface {
 // makes a stalled peer visible: without it, a halted stream is only detectable
 // by manually comparing file counts between nodes.
 type PeerStatus struct {
-	Peer            string `json:"peer"`
-	Cursor          int64  `json:"cursor"`
-	PeerMaxVersion  int64  `json:"peer_max_version"`
-	Lag             int64  `json:"lag"`
-	Epoch           string `json:"epoch"`
-	Healthy         bool   `json:"healthy"`
+	Peer           string `json:"peer"`
+	Cursor         int64  `json:"cursor"`
+	PeerMaxVersion int64  `json:"peer_max_version"`
+	Lag            int64  `json:"lag"`
+	Epoch          string `json:"epoch"`
+	Healthy        bool   `json:"healthy"`
+	// LastSuccessAgo is the age of the last successful poll, or -1 when the
+	// peer has never answered.
 	LastSuccessAgo  int64  `json:"last_success_ms_ago"`
 	LastError       string `json:"last_error,omitempty"`
 	ConsecutiveErrs int64  `json:"consecutive_errors"`
 	Pending         int64  `json:"pending_repairs"`
+	// DuplicateNodeID is set while the peer answers with this node's node_id.
+	DuplicateNodeID bool `json:"duplicate_node_id,omitempty"`
 	// LastReconcileMS is the age of the last *completed* manifest comparison,
 	// or -1 when none has finished yet.
 	LastReconcileMS int64 `json:"last_reconcile_ms_ago"`
@@ -73,9 +81,48 @@ type Server struct {
 	nodeID         string
 	ignorePatterns []string
 	secret         string
+	metricsToken   string
+	metaDir        string
+	version        string
 	stats          StatsProvider
 	logger         *slog.Logger
 	mux            *http.ServeMux
+	// pollers holds the node IDs that called this node's cluster API, with
+	// the time they last did.
+	pollers sync.Map
+}
+
+// peerIdentities is implemented by the syncer: the node IDs behind this
+// node's configured peers, and whether every one of them has answered.
+type peerIdentities interface {
+	PeerNodeIDs() (ids map[string]bool, complete bool)
+}
+
+// pollerWindow is how recently a node must have polled to count as a peer.
+const pollerWindow = 10 * time.Minute
+
+// unconfiguredPollers lists nodes that polled this node recently but are not
+// among the nodes it polls. Their peer lists disagree: changes flow from this
+// node to them and never back.
+func (s *Server) unconfiguredPollers() []string {
+	known, ok := s.stats.(peerIdentities)
+	if !ok {
+		return nil
+	}
+	peers, complete := known.PeerNodeIDs()
+	if !complete {
+		return nil
+	}
+	var out []string
+	s.pollers.Range(func(key, value any) bool {
+		id := key.(string)
+		if time.Since(value.(time.Time)) < pollerWindow && !peers[id] && id != s.nodeID {
+			out = append(out, id)
+		}
+		return true
+	})
+	sort.Strings(out)
+	return out
 }
 
 // Config holds the server's optional settings.
@@ -83,6 +130,13 @@ type Config struct {
 	// Secret, when set, is required in the X-Birak-Secret header of every
 	// cluster endpoint. Empty keeps the API open, matching earlier releases.
 	Secret string
+	// MetricsToken, when set, admits /metrics with "Authorization: Bearer
+	// <token>" as well, so a scraper does not hold the secret that reads files.
+	MetricsToken string
+	// MetaDir is reported alongside the data volume in disk space metrics.
+	MetaDir string
+	// Version is the daemon release, reported by /status and birak_build_info.
+	Version string
 	// Stats supplies live peer state for /status; may be nil.
 	Stats StatsProvider
 }
@@ -95,6 +149,9 @@ func New(s *store.Store, syncDir, nodeID string, ignorePatterns []string, cfg Co
 		nodeID:         nodeID,
 		ignorePatterns: ignorePatterns,
 		secret:         cfg.Secret,
+		metricsToken:   cfg.MetricsToken,
+		metaDir:        cfg.MetaDir,
+		version:        cfg.Version,
 		stats:          cfg.Stats,
 		logger:         logger,
 		mux:            http.NewServeMux(),
@@ -105,8 +162,8 @@ func New(s *store.Store, syncDir, nodeID string, ignorePatterns []string, cfg Co
 	srv.mux.HandleFunc("GET /files/{name...}", srv.guard(srv.handleFile))
 	srv.mux.HandleFunc("GET /status", srv.guard(srv.handleStatus))
 	// Metrics carry the same information as /status, so they carry the same
-	// protection. A scrape needs the cluster secret when one is configured.
-	srv.mux.HandleFunc("GET /metrics", srv.guard(srv.handleMetrics))
+	// protection: the cluster secret, or the narrower metrics token.
+	srv.mux.HandleFunc("GET /metrics", srv.metricsGuard(srv.guard(srv.handleMetrics), srv.handleMetrics))
 	// Liveness stays unauthenticated so a Kubernetes probe needs no secret.
 	srv.mux.HandleFunc("GET /healthz", srv.handleHealthz)
 	srv.mux.HandleFunc("GET /readyz", srv.handleReadyz)
@@ -119,9 +176,27 @@ func (s *Server) SetStats(p StatsProvider) {
 	s.stats = p
 }
 
-// Handler returns the HTTP handler.
+// Handler returns the HTTP handler. Transfers to a peer that stops reading,
+// or requests whose body stops arriving, give up after IdleTransferTimeout.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return gateway.BoundIdleTransfers(s.mux)
+}
+
+// metricsGuard admits a scrape that presents the metrics token and sends
+// everything else through the cluster guard. Prometheus sends a bearer token
+// natively; it would need the cluster secret in a custom header otherwise.
+func (s *Server) metricsGuard(guarded, metrics http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.metricsToken != "" {
+			if token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok &&
+				subtle.ConstantTimeCompare([]byte(token), []byte(s.metricsToken)) == 1 {
+				w.Header().Set("Cache-Control", "no-store")
+				metrics(w, r)
+				return
+			}
+		}
+		guarded(w, r)
+	}
 }
 
 // guard enforces the shared secret and stamps every cluster response with this
@@ -142,6 +217,9 @@ func (s *Server) guard(next http.HandlerFunc) http.HandlerFunc {
 		if r.Header.Get(HeaderNodeID) != "" && r.Header.Get(HeaderProtocol) != ProtocolVersion {
 			http.Error(w, "incompatible replication protocol; upgrade every node", http.StatusUpgradeRequired)
 			return
+		}
+		if id := r.Header.Get(HeaderNodeID); id != "" {
+			s.pollers.Store(id, time.Now())
 		}
 		w.Header().Set(HeaderEpoch, s.store.Incarnation())
 		w.Header().Set(HeaderNodeID, s.nodeID)
@@ -325,7 +403,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	// indexed with; otherwise If-Range fails and the whole file is sent, and
 	// the downloader's own checksum is the final word either way.
 	if meta, err := s.store.GetFile(cleaned); err == nil && meta != nil && !meta.Deleted &&
-		meta.Size == info.Size() && meta.ModTime == info.ModTime().UnixNano() {
+		meta.Size == info.Size() && fileops.SameModTime(s.syncDir, info.ModTime(), meta.ModTime) {
 		w.Header().Set("ETag", strconv.Quote(meta.Hash))
 	}
 	http.ServeContent(w, r, "", info.ModTime(), f)
@@ -334,15 +412,18 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 // StatusResponse is the response for /status.
 type StatusResponse struct {
 	NodeID     string `json:"node_id"`
+	Version    string `json:"version,omitempty"`
 	Epoch      string `json:"epoch"`
 	MaxVersion int64  `json:"max_version"`
 	FileCount  int64  `json:"file_count"`
 
 	// Repairs and Peers make replication health observable. A peer whose
 	// stream has stalled shows up here rather than only as a file-count drift.
-	Repairs store.RepairStats   `json:"repairs"`
-	Peers   []PeerStatus        `json:"peers"`
-	Local   *watcher.ScanStatus `json:"local,omitempty"`
+	Repairs store.RepairStats `json:"repairs"`
+	Peers   []PeerStatus      `json:"peers"`
+	// UnconfiguredPollers are nodes polling this one that it does not poll.
+	UnconfiguredPollers []string            `json:"unconfigured_pollers,omitempty"`
+	Local               *watcher.ScanStatus `json:"local,omitempty"`
 }
 
 // handleStatus returns daemon health and current state.
@@ -370,6 +451,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := StatusResponse{
 		NodeID:     s.nodeID,
+		Version:    s.version,
 		Epoch:      s.store.Incarnation(),
 		MaxVersion: maxVer,
 		FileCount:  count,
@@ -389,6 +471,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			resp.Peers = peers
 		}
 	}
+	resp.UnconfiguredPollers = s.unconfiguredPollers()
 
 	writeJSON(w, s.logger, resp)
 }

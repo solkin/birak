@@ -32,8 +32,14 @@ const nonceContextKey contextKey = "csp-nonce"
 const defaultMaxUploadBytes = 1 << 30 // 1 GiB
 
 // maxConcurrentUploads bounds simultaneous multipart uploads so a burst cannot
-// exhaust memory/disk with parallel spooled bodies.
+// exhaust disk with parallel staged bodies.
 const maxConcurrentUploads = 16
+
+// maxConcurrentLists bounds simultaneous directory listings. A listing reads
+// the whole directory, which for hundreds of thousands of names takes a few
+// hundred milliseconds and tens of MiB; more of them at once only multiplies
+// the memory held without finishing any sooner.
+const maxConcurrentLists = 4
 
 //go:embed index.html
 var indexHTML []byte
@@ -56,6 +62,7 @@ type Gateway struct {
 	logger         *slog.Logger
 	server         *http.Server
 	uploadSem      chan struct{}
+	listSem        chan struct{}
 }
 
 // New creates a new HTTP file server Gateway.
@@ -66,13 +73,14 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 		config:         cfg,
 		logger:         logger.With("gateway", "http"),
 		uploadSem:      make(chan struct{}, maxConcurrentUploads),
+		listSem:        make(chan struct{}, maxConcurrentLists),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", g.route)
 
 	g.server = &http.Server{
-		Handler: gateway.LogMiddleware(g.logger, securityHeaders(mux)),
+		Handler: gateway.LogMiddleware("http", g.logger, securityHeaders(mux)),
 		// Bound header-read and idle-connection time to blunt Slowloris-style
 		// attacks. Read/Write timeouts are left unset so large up/downloads are
 		// not cut off mid-stream.

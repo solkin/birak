@@ -22,9 +22,10 @@
 | [load-stand-and-crash-consistency](load-stand-and-crash-consistency.md) | Нагрузочный стенд, стоимость записи, сериализация, проверка аварийным завершением |
 | [integrity-read-fencing](integrity-read-fencing.md) | Персистентный карантин, защита чтения, fsync recovery, редиректы и паритет Windows/S3 |
 | [filesystem-production-hardening](filesystem-production-hardening.md) | Portable names, backup mtime, extended clock, initial admission и четыре Docker-инстанса |
-
 | [apk-read-production-load](apk-read-production-load.md) | 500000 файлов, APK 10–500 MiB, частые icons, индексированный LIST и TLS read workload |
 | [intermittent-peers-and-resume](intermittent-peers-and-resume.md) | Дешёвый replay после рестарта peer, докачка, readiness при неиндексируемых именах и длинных batch, быстрый SIGTERM |
+| [limited-production-readiness-20261022](limited-production-readiness-20261022.md) | Проверка перед ограниченной эксплуатацией v2.0.4: CopyObject, fail-open учётные данные, нечитаемые файлы, пропавшие поддеревья, поставка |
+| [limited-production-fixes-20261022](limited-production-fixes-20261022.md) | Их устранение в v2.1.0: копирование, fail-closed конфигурация, бюджет внешних удалений, TLS peers, поставка |
 
 Замысел, из которого выросли предыдущие заходы, — в
 [../sync-simplification-plan.md](../sync-simplification-plan.md): что именно

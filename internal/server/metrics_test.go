@@ -107,3 +107,90 @@ func TestMetricsRequireTheClusterSecret(t *testing.T) {
 		t.Fatalf("/metrics rejected a correct secret: %d", out.Code)
 	}
 }
+
+// A scraper can hold a token that opens /metrics and nothing else; the
+// cluster secret it replaces reads every file.
+func TestMetricsTokenOpensOnlyMetrics(t *testing.T) {
+	root := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := store.New(filepath.Join(t.TempDir(), "node.db"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	srv := New(st, root, "node", nil, Config{Secret: "secret", MetricsToken: "scrape"}, logger)
+
+	get := func(path, auth string) int {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		out := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(out, req)
+		return out.Code
+	}
+	if code := get("/metrics", "Bearer scrape"); code != http.StatusOK {
+		t.Fatalf("/metrics with the metrics token: %d", code)
+	}
+	if code := get("/metrics", "Bearer wrong"); code != http.StatusUnauthorized {
+		t.Fatalf("/metrics with a wrong token: %d", code)
+	}
+	for _, path := range []string{"/status", "/manifest", "/changes?since=0"} {
+		if code := get(path, "Bearer scrape"); code != http.StatusUnauthorized {
+			t.Fatalf("metrics token opened %s: %d", path, code)
+		}
+	}
+}
+
+// The text format requires one block per family. Per-peer loops used to
+// interleave families, which strict parsers reject.
+func TestMetricsAreGroupedAndAlwaysPresent(t *testing.T) {
+	root := t.TempDir()
+	meta := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := store.New(filepath.Join(meta, "node.db"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	w := watcher.New(root, st, logger, 0, 0, nil)
+	stats := metricsProvider{w: w, peers: []PeerStatus{
+		{Peer: "http://a:9100", LastSuccessAgo: -1, LastReconcileMS: -1},
+		{Peer: "http://b:9100", LastSuccessAgo: 2000, LastReconcileMS: -1},
+	}}
+	srv := New(st, root, "node", nil, Config{Stats: stats, MetaDir: meta, Version: "9.9.9"}, logger)
+	out := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(out, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := out.Body.String()
+
+	seen := map[string]bool{}
+	last := ""
+	for _, line := range strings.Split(strings.TrimSpace(body), "\n") {
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, _, _ := strings.Cut(line, " ")
+		name, _, _ = strings.Cut(name, "{")
+		if name != last && seen[name] {
+			t.Fatalf("family %s is split into several blocks:\n%s", name, body)
+		}
+		seen[name], last = true, name
+	}
+	for _, want := range []string{
+		`birak_disk_free_bytes{volume="sync"}`,
+		`birak_disk_free_bytes{volume="meta"}`,
+		`birak_disk_total_bytes{volume="sync"}`,
+		`birak_build_info{version="9.9.9"} 1`,
+		"birak_last_scan_seconds ",
+		`birak_peer_last_success_seconds{peer="http://b:9100"} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in:\n%s", want, body)
+		}
+	}
+	// A peer that never answered must not look like one that just did.
+	if strings.Contains(body, `birak_peer_last_success_seconds{peer="http://a:9100"} 0`+"\n") ||
+		strings.Contains(body, `birak_peer_last_success_seconds{peer="http://a:9100"} -`) {
+		t.Errorf("a peer that never answered reports a fresh or negative age:\n%s", body)
+	}
+}

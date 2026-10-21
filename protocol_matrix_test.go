@@ -62,7 +62,8 @@ func TestProtocolMatrix(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		cancel()
-		shutdown, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		// Longer than net/http's 5 s grace for dialed but unused connections.
+		shutdown, stop := context.WithTimeout(context.Background(), 15*time.Second)
 		defer stop()
 		for _, gw := range gateways {
 			if err := gw.Stop(shutdown); err != nil {

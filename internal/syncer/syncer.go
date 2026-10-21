@@ -3,6 +3,8 @@ package syncer
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -131,15 +133,21 @@ type Options struct {
 	ReconcilePageBudget int
 	// Secret is the optional cluster shared secret sent to peers.
 	Secret string
+	// RootCAs verifies https:// peers; nil uses the system roots.
+	RootCAs *x509.CertPool
 }
 
 // peerStat is the live replication state of one peer, surfaced by /status.
 type peerStat struct {
-	cursor          int64
-	peerMaxVersion  int64
-	epoch           string
-	lastSuccess     time.Time
-	lastReconcile   time.Time
+	cursor         int64
+	peerMaxVersion int64
+	epoch          string
+	lastSuccess    time.Time
+	lastReconcile  time.Time
+	// self marks a configured URL that reaches this node; duplicateNodeID a
+	// different node that answers with this node's identity.
+	self            bool
+	duplicateNodeID bool
 	lastError       string
 	consecutiveErrs int64
 }
@@ -157,6 +165,9 @@ type Syncer struct {
 
 	// client is used for metadata requests (/changes, /manifest, /meta).
 	// File downloads use a separate client without a global timeout.
+	// peerIDs holds the node IDs that answered this node's requests.
+	peerIDs sync.Map
+
 	client *http.Client
 
 	// downloadClient has no overall timeout — large file transfers are
@@ -215,6 +226,9 @@ func New(
 		MaxIdleConns:          20,
 		MaxIdleConnsPerHost:   5,
 		IdleConnTimeout:       90 * time.Second,
+	}
+	if opts.RootCAs != nil {
+		transport.TLSClientConfig = &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12}
 	}
 
 	if opts.MaxConcurrentDownloads <= 0 {
@@ -346,6 +360,28 @@ func (s *Syncer) CheckStorage() error { return s.watcher.ProbeStorage() }
 // SkippedEntries counts peer entries this node decided never to apply.
 func (s *Syncer) SkippedEntries() int64 { return s.skipped.Load() }
 
+// PeerNodeIDs lists the node IDs that answered this node's requests: the
+// identities behind its configured peer URLs. A node polling this one with an
+// ID outside this list replicates in one direction only. complete is false
+// until every configured peer has answered: before that — during the first
+// index, while deletions are held, while a peer is unreachable — a poller
+// missing from the list may simply not have been reached yet.
+func (s *Syncer) PeerNodeIDs() (ids map[string]bool, complete bool) {
+	ids = make(map[string]bool)
+	s.peerIDs.Range(func(key, _ any) bool {
+		ids[key.(string)] = true
+		return true
+	})
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	for _, peer := range s.peers {
+		if st := s.stats[peer]; st != nil && !st.self && st.lastSuccess.IsZero() {
+			return ids, false
+		}
+	}
+	return ids, true
+}
+
 // ResumedDownloads counts transfers continued from a partial download, and
 // the bytes that did not have to cross the link again.
 func (s *Syncer) ResumedDownloads() (count, bytes int64) {
@@ -360,7 +396,7 @@ func (s *Syncer) PeerStats() []server.PeerStatus {
 	out := make([]server.PeerStatus, 0, len(s.peers))
 	for _, peer := range s.peers {
 		st := s.stats[peer]
-		if st == nil {
+		if st == nil || st.self {
 			continue
 		}
 		pending, err := s.store.PendingRepairCount(peer)
@@ -376,17 +412,19 @@ func (s *Syncer) PeerStats() []server.PeerStatus {
 			LastError:       st.lastError,
 			ConsecutiveErrs: st.consecutiveErrs,
 			Pending:         pending,
+			DuplicateNodeID: st.duplicateNodeID,
 			// Healthy means "this peer's stream is moving": a recent successful
 			// poll and nothing waiting for repair.
 			Healthy: st.consecutiveErrs == 0 && pending == 0 &&
 				!st.lastSuccess.IsZero() &&
 				time.Since(st.lastSuccess) < 5*s.opts.PollInterval+time.Minute,
 		}
+		// -1, not 0, when nothing has succeeded yet: "never" and "a moment
+		// ago" are opposite answers and must not share a value.
+		status.LastSuccessAgo = -1
 		if !st.lastSuccess.IsZero() {
 			status.LastSuccessAgo = time.Since(st.lastSuccess).Milliseconds()
 		}
-		// -1, not 0, when no cycle has finished: "never compared" and "compared
-		// a moment ago" are opposite answers and must not share a value.
 		status.LastReconcileMS = -1
 		if !st.lastReconcile.IsZero() {
 			status.LastReconcileMS = time.Since(st.lastReconcile).Milliseconds()
@@ -443,10 +481,20 @@ func (s *Syncer) pollPeer(ctx context.Context, peerURL string) {
 				}
 				continue
 			}
-			s.logger.Warn("sync with peer failed", "peer", peerURL, "error", err)
+			if errors.Is(err, errSelfPeer) {
+				s.retireSelfPeer(peerURL)
+				return
+			}
+			duplicate := errors.Is(err, errDuplicateNodeID)
+			if duplicate {
+				s.logger.Error("sync with peer failed", "peer", peerURL, "error", err)
+			} else {
+				s.logger.Warn("sync with peer failed", "peer", peerURL, "error", err)
+			}
 			s.withStat(peerURL, func(st *peerStat) {
 				st.lastError = err.Error()
 				st.consecutiveErrs++
+				st.duplicateNodeID = duplicate
 			})
 			// Exponential backoff on error.
 			if !sleepCtx(ctx, backoff) {
@@ -462,6 +510,7 @@ func (s *Syncer) pollPeer(ctx context.Context, peerURL string) {
 			st.lastSuccess = time.Now()
 			st.lastError = ""
 			st.consecutiveErrs = 0
+			st.duplicateNodeID = false
 		})
 
 		if n > 0 {
@@ -837,6 +886,9 @@ func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
 	defer timer.Stop()
 	paused := false
 	for {
+		if s.isSelfPeer(peerURL) {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -996,6 +1048,12 @@ func (s *Syncer) reconcilePeer(ctx context.Context, peerURL string) {
 	for {
 		completed, err := s.reconcileOnce(ctx, peerURL)
 		switch {
+		case errors.Is(err, errSelfPeer):
+			s.retireSelfPeer(peerURL)
+			return
+		case errors.Is(err, store.ErrRepairQueueFull):
+			// Not a peer fault: this node has to work through what it queued.
+			s.logger.Debug("reconciliation paused until queued work drains", "peer", peerURL)
 		case err != nil:
 			if ctx.Err() != nil {
 				return
@@ -1033,6 +1091,15 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) (completed b
 		return false, err
 	}
 	queued, scanned, pages := 0, 0, 0
+	// An interrupted pass keeps the pages it finished. A full repair queue
+	// stops every pass of a catching-up replica; restarting each one from the
+	// beginning re-read the same pages over a slow link every second.
+	interrupted := func(cause error) (bool, error) {
+		if err := s.store.SetNodeValue(reconcilePositionKey(peerURL), after); err != nil {
+			return false, errors.Join(cause, err)
+		}
+		return false, cause
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -1052,7 +1119,7 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) (completed b
 			peerURL, url.QueryEscape(after), manifestPageSize)
 		resp, err := s.doRequest(ctx, reqURL)
 		if err != nil {
-			return false, err
+			return interrupted(err)
 		}
 		if resp.StatusCode == http.StatusNotFound {
 			// A peer running an older build has no /manifest. Reconciliation is
@@ -1063,14 +1130,14 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) (completed b
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			return false, fmt.Errorf("manifest from %s: status %d", peerURL, resp.StatusCode)
+			return interrupted(fmt.Errorf("manifest from %s: status %d", peerURL, resp.StatusCode))
 		}
 
 		var page []store.FileMeta
 		decErr := decodePage(resp.Body, manifestPageSize, &page)
 		resp.Body.Close()
 		if decErr != nil {
-			return false, fmt.Errorf("decode manifest from %s: %w", peerURL, decErr)
+			return interrupted(fmt.Errorf("decode manifest from %s: %w", peerURL, decErr))
 		}
 		if len(page) > manifestPageSize {
 			return false, fmt.Errorf("manifest from %s returned %d entries for a limit of %d", peerURL, len(page), manifestPageSize)
@@ -1096,7 +1163,7 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) (completed b
 
 		n, err := s.reconcilePage(peerURL, page)
 		if err != nil {
-			return false, err
+			return interrupted(err)
 		}
 		queued += n
 		scanned += len(page)
@@ -1191,14 +1258,49 @@ func (s *Syncer) doRequest(ctx context.Context, reqURL string) (*http.Response, 
 	return resp, nil
 }
 
+// errSelfPeer marks a peer URL that reaches this very process, as when every
+// node is given the same peer list. It is not a fault and is not polled.
+var errSelfPeer = errors.New("peer is this node itself")
+
+// errDuplicateNodeID marks another node using this node's identity. Neither
+// accepts the other's changes, while both keep accepting writes.
+var errDuplicateNodeID = errors.New("peer has duplicate node_id")
+
 func (s *Syncer) checkPeerIdentity(resp *http.Response) error {
 	if resp.Header.Get(server.HeaderProtocol) != server.ProtocolVersion {
 		return fmt.Errorf("incompatible replication protocol %q; require %s", resp.Header.Get(server.HeaderProtocol), server.ProtocolVersion)
 	}
-	if id := resp.Header.Get(server.HeaderNodeID); id != "" && id == s.nodeID {
-		return fmt.Errorf("peer has duplicate node_id %q", id)
+	id := resp.Header.Get(server.HeaderNodeID)
+	if id != "" && id == s.nodeID {
+		if resp.Header.Get(server.HeaderEpoch) == s.store.Incarnation() {
+			return errSelfPeer
+		}
+		return fmt.Errorf("%w %q; give one of the nodes another node_id, until then neither replicates from the other", errDuplicateNodeID, id)
+	}
+	if id != "" {
+		s.peerIDs.Store(id, struct{}{})
 	}
 	return nil
+}
+
+// retireSelfPeer stops treating a configured URL that reaches this node as a
+// peer. Its loops end, and it leaves /status and the peer metrics, where it
+// would otherwise be a peer that is never healthy.
+func (s *Syncer) retireSelfPeer(peerURL string) {
+	first := false
+	s.withStat(peerURL, func(st *peerStat) {
+		first = !st.self
+		st.self = true
+	})
+	if first {
+		s.logger.Info("configured peer is this node itself; it is not polled", "peer", peerURL)
+	}
+}
+
+func (s *Syncer) isSelfPeer(peerURL string) bool {
+	self := false
+	s.withStat(peerURL, func(st *peerStat) { self = st.self })
+	return self
 }
 
 func (s *Syncer) setClusterHeaders(req *http.Request) {

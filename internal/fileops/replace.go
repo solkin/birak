@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,6 +33,11 @@ func ReplaceLocked(root, src, dst string) error {
 
 // CopyReplaceLocked builds an unpublished copy before touching the destination.
 // copy must write and sync the supplied staging path, which does not yet exist.
+//
+// The caller holds the volume lock for all of it: the copy of every byte of a
+// tree, and the commit hooks indexing every file of the replaced and the new
+// tree. Like Rename of a tree, that cost is unbounded and is not split into
+// batches — a half-published copy is not a state clients or peers may see.
 func CopyReplaceLocked(root, dst string, copy func(string) error) error {
 	return replaceLocked(root, "", dst, copy, func(string) {})
 }
@@ -462,9 +468,17 @@ func ReplacementPendingLocked(root string) (bool, error) {
 
 // Old releases did not journal backup destinations. Refuse to index deletions
 // while an unmapped backup exists: guessing or sweeping it can destroy data.
+//
+// A directory below the root that this process may not read is passed over.
+// Nothing inside it can be listed, so nothing inside it is indexed or deleted
+// either, and refusing to start over one such directory put the node into a
+// restart loop. An unreadable root is still an error.
 func CheckOrphanedBackups(root string, ignore func(string) bool) error {
 	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			if path != root && errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
 			return err
 		}
 		if path != root && strings.HasPrefix(d.Name(), ".birak-bak-") {

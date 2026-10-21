@@ -49,7 +49,7 @@ func TestComponentListenFailureIsReturned(t *testing.T) {
 				if name == gateway {
 					addr = listener.Addr().String()
 				}
-				data += fmt.Sprintf("  %s:\n    enabled: true\n    listen_addr: %q\n", name, addr)
+				data += fmt.Sprintf("  %s:\n    enabled: true\n    allow_anonymous: true\n    listen_addr: %q\n", name, addr)
 			}
 			path := filepath.Join(dir, "config.yaml")
 			if err := os.WriteFile(path, []byte(data), 0600); err != nil {
@@ -59,5 +59,38 @@ func TestComponentListenFailureIsReturned(t *testing.T) {
 				t.Fatalf("listen failure must reach main: %v", err)
 			}
 		})
+	}
+}
+
+// Credentials are checked before any storage is opened: a gateway that would
+// have served anonymously because of a missing variable never starts.
+func TestGatewayWithoutCredentialsFailsBeforeOpeningStorage(t *testing.T) {
+	dir := t.TempDir()
+	syncDir, metaDir := filepath.Join(dir, "sync"), filepath.Join(dir, "meta")
+	path := filepath.Join(dir, "config.yaml")
+	data := fmt.Sprintf("sync_dir: %q\nmeta_dir: %q\ngateways:\n  s3:\n    enabled: true\n    access_key: only-the-key\n", syncDir, metaDir)
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(path); err == nil || !strings.Contains(err.Error(), "needs both") {
+		t.Fatalf("expected half-configured S3 to fail startup, got %v", err)
+	}
+	for _, path := range []string{syncDir, metaDir} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("startup touched storage %s: %v", path, err)
+		}
+	}
+}
+
+func TestPeerTLSMaterialIsCheckedAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	data := fmt.Sprintf("sync_dir: %q\nmeta_dir: %q\ntls_cert_file: %q\ntls_key_file: %q\n",
+		filepath.Join(dir, "sync"), filepath.Join(dir, "meta"), filepath.Join(dir, "missing.pem"), filepath.Join(dir, "missing.key"))
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(path); err == nil || !strings.Contains(err.Error(), "peer TLS certificate") {
+		t.Fatalf("expected unreadable peer certificate to fail startup, got %v", err)
 	}
 }

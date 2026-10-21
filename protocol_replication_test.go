@@ -191,7 +191,10 @@ func serveS3(t *testing.T, node *testNode, store *multipart.Store) string {
 	go func() { done <- gw.Start(ctx) }()
 	t.Cleanup(func() {
 		cancel()
-		ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		// net/http waits up to 5 s for a connection a client dialed but never
+		// used (its readiness probe can leave one) before treating it as
+		// idle. A 5 s budget here raced that rule on a loaded machine.
+		ctx, stop := context.WithTimeout(context.Background(), 15*time.Second)
 		defer stop()
 		if err := gw.Stop(ctx); err != nil {
 			t.Error(err)

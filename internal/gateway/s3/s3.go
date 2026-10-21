@@ -45,6 +45,9 @@ type Gateway struct {
 	logger         *slog.Logger
 	server         *http.Server
 	multipart      *multipart.Store
+	// sourceChecks remembers copy sources verified against the index, for the
+	// parts of a multipart copy (see verifySource).
+	sourceChecks sourceChecks
 }
 
 // New creates a new S3 Gateway.
@@ -61,7 +64,7 @@ func New(syncDir string, ignorePatterns []string, cfg Config, logger *slog.Logge
 	mux.HandleFunc("/", g.route)
 
 	g.server = &http.Server{
-		Handler: gateway.LogMiddleware(g.logger, mux),
+		Handler: gateway.LogMiddleware("s3", g.logger, mux),
 		// Bound the time spent reading request headers and idle keep-alive
 		// connections to blunt Slowloris-style attacks. Read/Write timeouts are
 		// intentionally left unset so large object transfers are not cut off.
@@ -155,6 +158,10 @@ func (g *Gateway) extractBucketFromHost(host string) string {
 //	Host: mybucket.endpoint / → bucket operations
 //	Host: mybucket.endpoint /{key} → object operations
 func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
+	// Objects are served with the media type of their name (see contentTypeFor);
+	// a browser must not second-guess it into something it would execute.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
 	// Authenticate.
 	if !g.authenticate(r) {
 		writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
@@ -198,14 +205,8 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 // routeBucketOrObject handles all bucket-level and object-level operations.
 // Used by both path-style and virtual-hosted-style routing.
 func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if gateway.IsScratchFile(bucket) {
-		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
-		return
-	}
-
-	// Check ignore patterns on bucket name.
-	if watcher.ShouldIgnore(bucket, g.ignorePatterns) {
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
+	if failure := g.bucketFailure(bucket); failure != nil {
+		writeS3Error(w, failure.status, failure.code, failure.message)
 		return
 	}
 
@@ -280,6 +281,37 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
+	// A PUT that names a copy source carries no data of its own: it is a
+	// CopyObject, or for a part an UploadPartCopy. Neither may fall through to a
+	// plain upload, which would store its empty body over the destination.
+	if r.Header.Get("X-Amz-Copy-Source") != "" && r.Method == http.MethodPut {
+		if uploadID != "" {
+			g.handleUploadPartCopy(w, r, bucket, key, uploadID)
+			return
+		}
+		g.handleCopyObject(w, r, bucket, key)
+		return
+	}
+
+	// A key ending in "/" is a folder marker, which is the folder itself here.
+	if isFolderKey(key) {
+		if initiating || uploadID != "" {
+			writeObjectFailure(w, errFolderHasNoData)
+			return
+		}
+		switch r.Method {
+		case http.MethodHead, http.MethodGet:
+			g.handleGetFolder(w, r, bucket, key)
+		case http.MethodPut:
+			g.handlePutFolder(w, r, bucket, key)
+		case http.MethodDelete:
+			g.handleDeleteFolder(w, r, bucket, key)
+		default:
+			writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "Method not allowed")
+		}
+		return
+	}
+
 	switch {
 	case initiating && r.Method == http.MethodPost:
 		g.handleCreateMultipartUpload(w, r, bucket, key)
@@ -313,10 +345,28 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 	}
 }
 
+// bucketFailure holds a bucket name to the namespace rules: a scratch name is
+// refused, and an ignored one does not exist. The route checks the bucket of
+// the URL; CopyObject checks its source's too.
+func (g *Gateway) bucketFailure(bucket string) *objectFailure {
+	if gateway.IsScratchFile(bucket) {
+		return &objectFailure{http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name"}
+	}
+	if watcher.ShouldIgnore(bucket, g.ignorePatterns) {
+		return errNoSuchBucket
+	}
+	return nil
+}
+
 // keyFailure holds a key to the namespace rules before any operation looks at
-// it: a scratch name is refused, and an ignored one does not exist. The route
-// checks the key of the URL; DeleteObjects checks each key of its body.
+// it: a key no filesystem can hold is refused (see keyShapeFailure), a scratch
+// name is refused, and an ignored one does not exist. The route checks the key
+// of the URL; DeleteObjects checks each key of its body, and CopyObject the key
+// of its source.
 func (g *Gateway) keyFailure(bucket, key string) *objectFailure {
+	if failure := keyShapeFailure(key); failure != nil {
+		return failure
+	}
 	for _, segment := range strings.Split(key, "/") {
 		if gateway.IsScratchFile(segment) {
 			return &objectFailure{http.StatusBadRequest, "InvalidArgument", "Invalid key"}
@@ -336,6 +386,12 @@ func (g *Gateway) keyFailure(bucket, key string) *objectFailure {
 func (g *Gateway) authenticate(r *http.Request) bool {
 	if g.config.AccessKey == "" && g.config.SecretKey == "" {
 		return true // no auth configured
+	}
+	// Half a key pair admits nobody: an empty secret is a key anyone can sign
+	// with. Configuration validation refuses it; this keeps the gateway closed
+	// regardless.
+	if g.config.AccessKey == "" || g.config.SecretKey == "" {
+		return false
 	}
 
 	if authHeader := r.Header.Get("Authorization"); authHeader != "" {

@@ -23,6 +23,7 @@ func TestUploadLimitContract(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("BIRAK_S3_ENABLED", "true")
+			t.Setenv("BIRAK_S3_ALLOW_ANONYMOUS", "true")
 			t.Setenv("BIRAK_MULTIPART_MAX_ACTIVE_UPLOADS", tc.activeEnv)
 			t.Setenv("BIRAK_MAX_UPLOAD_BYTES", tc.uploadEnv)
 			cfg, err := Load(writeYAML(t, tc.yaml))

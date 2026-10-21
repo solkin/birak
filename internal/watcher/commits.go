@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -67,6 +68,10 @@ type indexOptions struct {
 	// trustStat accepts an unchanged size and timestamp as proof that the file
 	// did not change. Bytes that changed underneath both is the scrub's job.
 	trustStat bool
+	// deferDeletion, when set, receives each indexed name found missing
+	// instead of a tombstone being published for it. Only callers that infer
+	// deletions from absence set it; see breaker.go.
+	deferDeletion func(string)
 }
 
 func (w *Watcher) checkSourcesLocked(paths []string) error {
@@ -140,12 +145,22 @@ func (w *Watcher) indexPathsLocked(paths []string, opts indexOptions) error {
 			continue
 		}
 		// Include previous children so overwriting/moving a tree emits deletions.
-		previous, err := w.store.ListSubtree(name)
+		// Only live ones can: a tombstone of a name not on disk has nothing to
+		// emit, and a directory removed in batches has one for every file it
+		// held, which would be read back one by one under the lock. A
+		// quarantined name is included either way, so its fence is dropped once
+		// the name is gone.
+		previous, err := w.store.ListLiveSubtree(name)
 		if err != nil {
 			return err
 		}
 		for _, meta := range previous {
 			names[meta.Name] = true
+		}
+		for _, damaged := range w.store.QuarantinedNames() {
+			if damaged == name || strings.HasPrefix(damaged, name+"/") {
+				names[damaged] = true
+			}
 		}
 		err = filepath.WalkDir(filepath.Join(w.dir, filepath.FromSlash(name)), func(path string, d fs.DirEntry, err error) error {
 			if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
@@ -344,7 +359,16 @@ func (q *quarantineIndex) rebuild(w *Watcher, gen uint64) *quarantineSnapshot {
 }
 
 func (w *Watcher) quarantine(meta *store.FileMeta) error {
+	return w.quarantineFor(meta, "local checksum mismatch", nil)
+}
+
+// quarantineFor fences meta's name and queues a repair from every peer. cause,
+// when set, is what made the local copy untrustworthy other than its checksum.
+func (w *Watcher) quarantineFor(meta *store.FileMeta, reason string, cause error) error {
 	err := fmt.Errorf("%w: %s", ErrIntegrity, meta.Name)
+	if cause != nil {
+		err = fmt.Errorf("%w: %s: %v", ErrIntegrity, meta.Name, cause)
+	}
 	// The name is recorded and repaired from a peer; it is reported as a count
 	// rather than as this node's last error, so one damaged file does not claim
 	// the whole node is faulty.
@@ -372,7 +396,7 @@ func (w *Watcher) quarantine(meta *store.FileMeta) error {
 		return err
 	}
 	for _, peer := range w.repairPeers {
-		if qerr := w.store.EnqueueChange(peer, *meta, "local checksum mismatch"); qerr != nil {
+		if qerr := w.store.EnqueueChange(peer, *meta, reason); qerr != nil {
 			return errors.Join(err, qerr)
 		}
 	}
@@ -394,7 +418,7 @@ func (w *Watcher) recoverReplicaLocked(name string) error {
 			return err
 		}
 		matches = hash == meta.Hash && info.Size() == meta.Size
-		if matches && info.ModTime().UnixNano() != meta.ModTime {
+		if matches && !fileops.SameModTime(w.dir, info.ModTime(), meta.ModTime) {
 			// A backup can lose timestamps between replica publication and its
 			// metadata commit. The durable intent still identifies these bytes;
 			// restore its timestamp instead of creating a newer local version.

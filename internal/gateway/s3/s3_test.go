@@ -414,6 +414,16 @@ func TestAuth_WrongSecret(t *testing.T) {
 	}
 }
 
+// An access key without its secret used to verify signatures made with an
+// empty secret: anyone who saw the key in a presigned URL had full access.
+func TestAuth_HalfConfiguredKeyPairAdmitsNobody(t *testing.T) {
+	g, _ := testGateway(t, Config{AccessKey: "admin"})
+	w := serveSignedHeaderRequest(g, http.MethodGet, "/", nil, "example.com", "admin", "")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a request signed with the empty secret, got %d", w.Code)
+	}
+}
+
 func TestAuth_LegacyV2Rejected(t *testing.T) {
 	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
 

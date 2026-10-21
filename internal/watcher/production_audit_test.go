@@ -184,18 +184,24 @@ func TestAuditSameContentNewMtimeKeepsRecordedRank(t *testing.T) {
 }
 
 func TestFailedInitialScanDoesNotOpenReadiness(t *testing.T) {
-	w := auditWatcher(t)
-	parent := filepath.Join(w.dir, "blocked")
+	// An unreadable directory used to be the fault here; it is now skipped
+	// (see unreadable_test.go). An indexed file replaced by a directory is
+	// still a fault, and a restarted node meets it in its initial scan.
+	previous := auditWatcher(t)
+	parent := filepath.Join(previous.dir, "blocked")
+	if err := os.WriteFile(parent, []byte("indexed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := previous.periodicScan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(parent); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(parent, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(parent, 0); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(parent, 0o700)
-	if _, err := os.ReadDir(parent); !errors.Is(err, os.ErrPermission) {
-		t.Skip("requires unprivileged user")
-	}
+	w := New(previous.dir, previous.store, previous.logger, time.Millisecond, time.Hour, nil)
 	if err := w.periodicScan(context.Background()); err == nil {
 		t.Fatal("incomplete scan succeeded")
 	}
@@ -207,7 +213,10 @@ func TestFailedInitialScanDoesNotOpenReadiness(t *testing.T) {
 	if w.Status().Ready || w.Status().LastError == "" {
 		t.Fatal("failed scan reported healthy")
 	}
-	if err := os.Chmod(parent, 0o700); err != nil {
+	if err := os.Remove(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(parent, []byte("indexed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.periodicScan(context.Background()); err != nil {

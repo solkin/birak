@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -82,6 +83,25 @@ type Watcher struct {
 	lastSkipSamples []string
 	skipTotals      map[string]int64
 
+	// maxExternalDeletions and deletions are the breaker for deletions
+	// inferred from absence; see breaker.go.
+	maxExternalDeletions atomic.Int64
+	deletions            deletionBudget
+
+	// readErrors counts I/O errors reading indexed files, each of which
+	// quarantined the file for repair from a peer.
+	readErrors atomic.Int64
+
+	// mtimeMeasured is set once the volume's timestamp granularity has been
+	// measured. Guarded by the commit lock.
+	mtimeMeasured bool
+
+	// progressInterval is how often a long sweep reports how far it got.
+	progressInterval time.Duration
+
+	// now is the clock the deletion budget runs on; tests move it.
+	now func() time.Time
+
 	// rescan requests an out-of-band full scan. It is the recovery path for
 	// anything the event stream may have dropped.
 	rescan chan struct{}
@@ -104,6 +124,19 @@ const workQueueDepth = 256
 // failing, to re-read everything every scan interval.
 const DefaultScrubRate = 8 << 20
 
+// sweepProgressInterval is how long a sweep runs before it says how far it
+// got, and how often it says so again. The first index of a million files takes
+// a long while, and it must not look like a hang.
+const sweepProgressInterval = 30 * time.Second
+
+// deviceOf reports the filesystem an entry is on. A variable so tests can
+// present a directory as a mount point without mounting anything.
+var deviceOf = func(_ string, info os.FileInfo) (uint64, bool) { return fileops.Device(info) }
+
+// snapshotFile reads and hashes a file. A variable so tests can make a read
+// fail the way a failing disk does.
+var snapshotFile = fileops.Snapshot
+
 // New creates a new Watcher.
 func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanInterval time.Duration, ignorePatterns []string) *Watcher {
 	dir, _ = filepath.Abs(dir)
@@ -125,8 +158,11 @@ func New(dir string, s *store.Store, logger *slog.Logger, debounceWindow, scanIn
 		work:              make(chan []string, workQueueDepth),
 		rescan:            make(chan struct{}, 1),
 		skipTotals:        make(map[string]int64),
+		progressInterval:  sweepProgressInterval,
+		now:               time.Now,
 	}
 	w.scrubRate.Store(DefaultScrubRate)
+	w.maxExternalDeletions.Store(DefaultMaxExternalDeletions)
 	fileops.SetNotifier(dir, w.requestRescan)
 	fileops.SetHooks(dir, fileops.Hooks{Validate: w.prepareStorageLocked, ValidateRead: w.validateRead, CheckSources: w.checkSourcesLocked, CheckRead: w.checkRead, Begin: w.beginCommitLocked, Finish: w.finishCommitLocked})
 	return w
@@ -381,6 +417,8 @@ func (w *Watcher) processLoop(ctx context.Context) {
 
 	for ctx.Err() == nil {
 		if backlog.len() == 0 {
+			// The burst is over: what it found missing is one group.
+			w.settleEventDeletions(ctx)
 			select {
 			case names, ok := <-w.work:
 				if !ok {
@@ -515,7 +553,8 @@ func (w *Watcher) addDirsRecursive(fsw *fsnotify.Watcher, root string) (failCoun
 }
 
 // processBatch indexes names handed over by the event loop, stopping between
-// any two names once ctx is cancelled.
+// any two names once ctx is cancelled, and then decides what it found missing
+// as one group.
 func (w *Watcher) processBatch(ctx context.Context, names []string) {
 	for _, name := range names {
 		if ctx.Err() != nil {
@@ -523,12 +562,18 @@ func (w *Watcher) processBatch(ctx context.Context, names []string) {
 		}
 		w.processName(name)
 	}
+	w.settleEventDeletions(ctx)
 }
 
 // processName hashes outside the commit lock, then checks the generation and
-// current state under the same lock used by gateways and replication.
+// current state under the same lock used by gateways and replication. A name
+// found missing is collected rather than published; see breaker.go.
 func (w *Watcher) processName(name string) {
-	err := w.scanFile(name)
+	var deferDeletion func(string)
+	if w.maxExternalDeletions.Load() > 0 {
+		deferDeletion = w.deferEventDeletion
+	}
+	err := w.scanFileWith(name, deferDeletion)
 	if err == nil {
 		return
 	}
@@ -561,21 +606,52 @@ const (
 	SkipNameCollision = "name_collision"
 	SkipInvalidName   = "invalid_name"
 	SkipVanished      = "vanished"
+	SkipUnreadable    = "unreadable"
 )
 
+// SkipReasons lists every reason, for reporting a series per reason.
+var SkipReasons = []string{SkipNameCollision, SkipInvalidName, SkipVanished, SkipUnreadable}
+
+// errUnreadable marks a file this node cannot read, and has no indexed version
+// of to repair.
+var errUnreadable = errors.New("file cannot be read")
+
+// storageFault marks a failure of the volume as a whole, found while indexing
+// one name. It is never mistaken for that name's own problem.
+type storageFault struct{ err error }
+
+func (e *storageFault) Error() string { return e.err.Error() }
+func (e *storageFault) Unwrap() error { return e.err }
+
 // unindexable classifies errors that belong to one name rather than to the
-// node: a spelling that collides with a reserved one, or a name no node can
-// store. Such a file can sit in the sync directory for weeks; failing every
-// sweep on it took the whole node out of rotation, and after a restart kept
-// replication from ever starting.
+// node: a spelling that collides with a reserved one, a name no node can
+// store, or an entry this process is not permitted to read. Such a file can sit
+// in the sync directory for weeks; failing every sweep on it took the whole
+// node out of rotation, and after a restart kept replication from ever
+// starting.
+//
+// An unreadable name is never evidence of a deletion: a file below a directory
+// that lost its search permission cannot even be stat'ed, and must not become
+// a tombstone on every peer because of it.
 func unindexable(err error) string {
+	var fault *storageFault
 	switch {
+	case errors.As(err, &fault):
+		return ""
 	case errors.Is(err, store.ErrNameCollision), errors.Is(err, fileops.ErrSpellingAlias):
 		return SkipNameCollision
 	case errors.Is(err, store.ErrInvalidName):
 		return SkipInvalidName
+	case errors.Is(err, errUnreadable), errors.Is(err, fs.ErrPermission):
+		return SkipUnreadable
 	}
 	return ""
+}
+
+// unreadableEntry reports a walk error for one entry below the root that this
+// process may not read.
+func unreadableEntry(err error) bool {
+	return errors.Is(err, fs.ErrPermission)
 }
 
 // vanished reports a walk error caused by an entry removed while the walk was
@@ -584,17 +660,31 @@ func vanished(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
-// skipTally collects what one sweep skipped.
+// skipTally collects what one sweep skipped, each name once: the walk and the
+// deletion pass may both meet the same unreadable file. Past maxSkipDedupe
+// names a repeat is counted again rather than remembered, so a directory of a
+// million files that lost its search permission costs no gigabyte of names.
 type skipTally struct {
 	counts  map[string]int
 	samples []string
+	seen    map[string]bool
 }
 
-const maxSkipSamples = 10
+const (
+	maxSkipSamples = 10
+	maxSkipDedupe  = 100_000
+)
 
 func (t *skipTally) add(reason, name string) {
 	if t.counts == nil {
 		t.counts = make(map[string]int)
+		t.seen = make(map[string]bool)
+	}
+	if t.seen[name] {
+		return
+	}
+	if len(t.seen) < maxSkipDedupe {
+		t.seen[name] = true
 	}
 	t.counts[reason]++
 	if len(t.samples) < maxSkipSamples {
@@ -657,20 +747,27 @@ type hashed struct {
 // scanFile indexes one name, reading and hashing it *before* taking the commit
 // lock. Hashing under that lock made every gateway write wait for the largest
 // file in the tree; a file rewritten mid-read is detected and simply re-read.
-func (w *Watcher) scanFile(name string) error {
+func (w *Watcher) scanFile(name string) error { return w.scanFileWith(name, nil) }
+
+// scanFileWith is scanFile for a caller that collects deletions instead of
+// publishing them: a name found missing is handed to deferDeletion. A failure
+// to validate the volume is returned as a storageFault, so it is never
+// counted against the one name being indexed.
+func (w *Watcher) scanFileWith(name string, deferDeletion func(string)) error {
+	opts := indexOptions{deferDeletion: deferDeletion}
 	path := filepath.Join(w.dir, filepath.FromSlash(name))
-	info, hash, err := fileops.Snapshot(path)
-	if err != nil {
-		// Not a stable regular file right now — missing, replaced, a directory,
-		// a symlink, or held by a writer. The locked path classifies all of that.
-		return w.Refresh(name)
+	// A file that is not a stable regular file right now — missing, replaced,
+	// a directory, a symlink, unreadable, or held by a writer — is read again
+	// by the locked path, which classifies all of that.
+	if info, hash, err := snapshotFile(path); err == nil {
+		opts.published = map[string]*hashed{name: {info: info, hash: hash}}
 	}
 	unlock := fileops.Lock(w.dir)
 	defer unlock()
 	if err := w.prepareStorageLocked(); err != nil {
-		return err
+		return &storageFault{err}
 	}
-	return w.refreshFileLocked(name, indexOptions{published: map[string]*hashed{name: {info: info, hash: hash}}})
+	return w.refreshFileLocked(name, opts)
 }
 
 func (w *Watcher) refreshFileLocked(name string, opts indexOptions) error {
@@ -689,7 +786,7 @@ func (w *Watcher) refreshFileLocked(name string, opts indexOptions) error {
 	if opts.trustStat && w.unchangedByStat(name) {
 		return nil
 	}
-	ev, err := w.inspectFile(name, opts.published[name])
+	ev, err := w.inspectFile(name, opts)
 	if err != nil || ev == nil {
 		return err
 	}
@@ -719,10 +816,11 @@ func (w *Watcher) refreshFileLocked(name string, opts indexOptions) error {
 	return err
 }
 
-func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, error) {
+func (w *Watcher) inspectFile(name string, opts indexOptions) (*FileEvent, error) {
 	if isOutsideSyncDir(name) || w.shouldIgnore(name) {
 		return nil, nil
 	}
+	precomputed := opts.published[name]
 	fullPath := filepath.Join(w.dir, filepath.FromSlash(name))
 	if fileops.BusyLocked(w.dir, fullPath) {
 		return nil, fileops.ErrBusy
@@ -735,6 +833,12 @@ func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, err
 	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
 		if existing == nil || existing.Deleted {
 			return nil, w.clearIntegrity(name)
+		}
+		if opts.deferDeletion != nil {
+			// Absence is evidence here, not yet a decision: the caller weighs
+			// it together with every other name it found missing.
+			opts.deferDeletion(name)
+			return nil, nil
 		}
 		if err := w.clearIntegrity(name); err != nil {
 			return nil, err
@@ -785,7 +889,7 @@ func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, err
 	}
 	info, hash, err := w.snapshot(fullPath, precomputed)
 	if err != nil {
-		return nil, err
+		return nil, w.readFailed(name, existing, err)
 	}
 	trusted, err := w.store.HasLocalIntent(name)
 	if err != nil {
@@ -801,7 +905,8 @@ func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, err
 		}
 		return nil, w.quarantine(existing)
 	}
-	if existing != nil && !existing.Deleted && existing.Hash != hash && existing.ModTime == info.ModTime().UnixNano() && existing.Size == info.Size() && !trusted {
+	sameStamp := existing != nil && fileops.SameModTime(w.dir, info.ModTime(), existing.ModTime)
+	if existing != nil && !existing.Deleted && existing.Hash != hash && sameStamp && existing.Size == info.Size() && !trusted {
 		return nil, w.quarantine(existing)
 	}
 	if w.NeedsRepair(name) || w.store.IsDamagedObject(key) {
@@ -821,7 +926,7 @@ func (w *Watcher) inspectFile(name string, precomputed *hashed) (*FileEvent, err
 			return nil, err
 		}
 	}
-	if existing != nil && !existing.Deleted && existing.Hash == hash && existing.ModTime == info.ModTime().UnixNano() && existing.Size == info.Size() {
+	if existing != nil && !existing.Deleted && existing.Hash == hash && sameStamp && existing.Size == info.Size() {
 		return nil, nil
 	}
 	if !trusted && existing != nil && !existing.Deleted && existing.Hash == hash && existing.Size == info.Size() {
@@ -853,7 +958,24 @@ func (w *Watcher) snapshot(path string, precomputed *hashed) (os.FileInfo, strin
 			return precomputed.info, precomputed.hash, nil
 		}
 	}
-	return fileops.Snapshot(path)
+	return snapshotFile(path)
+}
+
+// readFailed classifies a failure to read a regular file. An I/O error on an
+// indexed file is a damaged copy like a checksum mismatch, and is handled the
+// same way: the name is quarantined and repaired from a peer. Logging it and
+// carrying on left the node serving whatever the disk returned next time. A
+// file this node may not read, or has no version of to repair, is skipped.
+func (w *Watcher) readFailed(name string, existing *store.FileMeta, err error) error {
+	if errors.Is(err, syscall.EIO) {
+		w.readErrors.Add(1)
+		if existing != nil && !existing.Deleted {
+			w.logger.Error("indexed file cannot be read; quarantined until a peer repairs it", "name", strconv.Quote(name), "error", err)
+			return w.quarantineFor(existing, "local read error", err)
+		}
+		return fmt.Errorf("%w: %w", errUnreadable, err)
+	}
+	return err
 }
 
 // ScanStatus describes the last complete checksum scan, independent of peers.
@@ -875,18 +997,31 @@ type ScanStatus struct {
 	// Skipped counts, by reason, what the last complete sweep found on disk
 	// and left alone instead of failing: names whose spelling collides with
 	// one already reserved (name_collision), names no node can store
-	// (invalid_name), and entries removed while it walked (vanished).
-	// SkippedSamples names a few of them; SkippedTotal counts every skip
-	// since start, event batches included.
+	// (invalid_name), entries removed while it walked (vanished), and files or
+	// directories this process may not read (unreadable). SkippedSamples names
+	// a few of them; SkippedTotal counts every skip since start, event batches
+	// included.
 	Skipped        map[string]int   `json:"skipped,omitempty"`
 	SkippedSamples []string         `json:"skipped_samples,omitempty"`
 	SkippedTotal   map[string]int64 `json:"skipped_total,omitempty"`
+	// HeldExternalDeletions counts indexed files missing from disk that are
+	// not published as deletions because there are more of them than
+	// sync.max_external_deletions allows. Nonzero is a fault: see LastError.
+	HeldExternalDeletions int `json:"held_external_deletions"`
+	// ReadErrors counts I/O errors reading indexed files since start. Each
+	// quarantined the file until a peer repairs it.
+	ReadErrors int64 `json:"read_errors_total"`
 }
 
 func (w *Watcher) Status() ScanStatus {
+	held, heldError := w.heldDeletions()
 	w.statusMu.Lock()
 	defer w.statusMu.Unlock()
 	status := ScanStatus{LastError: w.lastError, LastScanAgoMS: -1, LastScrubAgoMS: -1, Quarantined: w.store.QuarantineCount(), ScrubBytesPerSecond: w.scrubRate.Load(), DirectorySyncBestEffort: runtime.GOOS == "windows"}
+	status.HeldExternalDeletions, status.ReadErrors = held, w.readErrors.Load()
+	if status.LastError == "" {
+		status.LastError = heldError
+	}
 	if len(w.lastSkipped) > 0 {
 		status.Skipped = make(map[string]int, len(w.lastSkipped))
 		for reason, count := range w.lastSkipped {
@@ -910,7 +1045,7 @@ func (w *Watcher) Status() ScanStatus {
 		// by name and counted in Quarantined; it does not take the other million
 		// files out of rotation, and — when no peer holds a healthy copy — it
 		// used to take them out permanently.
-		status.Ready = w.lastError == "" && time.Since(w.lastScan) < 2*w.scanInterval+time.Minute
+		status.Ready = status.LastError == "" && time.Since(w.lastScan) < 2*w.scanInterval+time.Minute
 	}
 	return status
 }
@@ -995,7 +1130,33 @@ func (w *Watcher) checkBoundVolume() error {
 
 // A persisted sentinel binds this metadata database to its data volume. A
 // missing/remounted root after restart must fail closed, not delete the cluster.
+//
+// The first successful check also measures how finely the volume keeps
+// modification times; see fileops.SameModTime.
 func (w *Watcher) checkStorageLocked() error {
+	err := w.checkBindingLocked()
+	if err == nil && !w.mtimeMeasured {
+		w.mtimeMeasured = true
+		w.measureModTimeGranularityLocked()
+	}
+	return err
+}
+
+// measureModTimeGranularityLocked probes the volume with a scratch file in its
+// private state directory. A probe that fails leaves comparisons exact, which
+// costs a re-read now and then but never trusts a timestamp too far.
+func (w *Watcher) measureModTimeGranularityLocked() {
+	granularity, err := fileops.DetectModTimeGranularity(filepath.Join(w.dir, ".birak", "mtime-probe"))
+	if err != nil {
+		w.logger.Warn("could not measure how precisely the volume keeps modification times", "assumed", granularity, "error", err)
+	}
+	fileops.SetModTimeGranularity(w.dir, granularity)
+	if granularity > time.Nanosecond {
+		w.logger.Info("volume keeps coarse modification times; comparing them at its resolution", "granularity", granularity)
+	}
+}
+
+func (w *Watcher) checkBindingLocked() error {
 	if id := w.storageID.Load(); id != nil {
 		return w.checkVolume(*id)
 	}
@@ -1063,6 +1224,16 @@ func (w *Watcher) bindVolumeLocked() error {
 		return err
 	}
 	id := string(data)
+	if id != "" {
+		// The volume was bound before, to a database this one is not: the
+		// metadata volume was lost or replaced. Adopting the volume is safe —
+		// every file on it is indexed again from scratch — but what lived only
+		// in the old database is gone, and an operator has to hear that.
+		w.logger.Warn("metadata database is new but the data volume was bound to an earlier one; starting a full re-index",
+			"volume", id,
+			"lost", "tombstones of files deleted before the loss and the queued repairs of the old database",
+			"consequence", "deletions the old database had not replicated yet never reach peers, and peers re-read this node's changes from the start")
+	}
 	if id == "" {
 		// Migration from pre-sentinel releases: an empty data root alongside live
 		// metadata could be an absent mount. Require an operator to restore it.
@@ -1119,11 +1290,19 @@ func (w *Watcher) periodicScan(ctx context.Context) error { return w.sweep(ctx, 
 // A name that belongs to one file rather than to the node — see unindexable —
 // and an entry that vanished mid-walk are counted and skipped. Anything else
 // leaves the sweep incomplete, which keeps the node unready.
+//
+// Indexed names missing from disk are not published as they are found. They
+// are collected over the whole pass and decided together once it is complete;
+// see breaker.go.
 func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result error) {
 	// complete distinguishes "the scan could not finish" from "the scan
 	// finished and found damaged files". Only the first is a storage fault.
 	complete := false
+	// held is a complete scan that found more files missing than it may
+	// publish as deleted. That is a fault, reported by the breaker.
+	held := false
 	var skips skipTally
+	progress := w.newSweepProgress()
 	defer func() {
 		if !complete {
 			if result != nil {
@@ -1150,13 +1329,23 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 			w.logger.Warn("scan left files it cannot index alone",
 				"skipped", n, "reasons", strings.Join(reasons, ","), "examples", skips.samples)
 		}
+		progress.finish()
 		if first {
 			w.warnAboutRestamping()
 		}
-		w.readyOnce.Do(func() { close(w.ready) })
+		// Like any scan that could not be trusted, a held group keeps a
+		// starting node's replication from starting.
+		if !held {
+			w.readyOnce.Do(func() { close(w.ready) })
+		}
 	}()
 	if err := w.CheckStorage(); err != nil {
 		return err
+	}
+	deletions := w.sweepDeletions()
+	var deferDeletion func(string)
+	if deletions != nil {
+		deferDeletion = deletions.add
 	}
 	var scanErr, integrityErr error
 	inspectError := func(name string, err error) {
@@ -1192,28 +1381,47 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			inspectError(name, w.sweepKnownFile(name, known[name]))
+			scanned, err := w.sweepKnown(name, known[name], deferDeletion)
+			if scanned {
+				progress.indexed++
+			}
+			inspectError(name, err)
+			progress.tick()
 		}
 		batch = batch[:0]
 		return nil
 	}
+	var rootDevice uint64
+	haveRootDevice := false
 	err := filepath.WalkDir(w.dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if walkErr != nil {
-			if path != w.dir && vanished(walkErr) {
-				// Removed between being listed and being read. The deletion
-				// pass below decides about anything indexed beneath it.
-				if rel, err := filepath.Rel(w.dir, path); err == nil {
+			if path != w.dir {
+				rel, _ := filepath.Rel(w.dir, path)
+				switch {
+				case vanished(walkErr):
+					// Removed between being listed and being read. The deletion
+					// pass below decides about anything indexed beneath it.
 					skips.add(SkipVanished, filepath.ToSlash(rel))
+					return nil
+				case unreadableEntry(walkErr):
+					// This process may not list it. What is indexed beneath it
+					// is checked name by name in the deletion pass, where a name
+					// that cannot even be stat'ed is skipped as well — never
+					// taken for deleted.
+					skips.add(SkipUnreadable, filepath.ToSlash(rel))
+					return nil
 				}
-				return nil
 			}
 			scanErr = errors.Join(scanErr, walkErr)
 			return nil
 		}
 		if path == w.dir {
+			if info, err := d.Info(); err == nil {
+				rootDevice, haveRootDevice = deviceOf(path, info)
+			}
 			return nil
 		}
 		rel, err := filepath.Rel(w.dir, path)
@@ -1228,7 +1436,15 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 			}
 			return nil
 		}
-		if d.IsDir() || queued != nil && queued(name) {
+		progress.tick()
+		if d.IsDir() {
+			if !haveRootDevice {
+				return nil
+			}
+			return checkSameFilesystem(path, name, d, rootDevice, &skips, &scanErr)
+		}
+		progress.seen++
+		if queued != nil && queued(name) {
 			return nil
 		}
 		batch = append(batch, name)
@@ -1243,6 +1459,7 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 	if err := flush(); err != nil || scanErr != nil {
 		return errors.Join(err, scanErr)
 	}
+	progress.phase = "deletion check"
 	var after string
 	for {
 		if err := ctx.Err(); err != nil {
@@ -1263,6 +1480,8 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 			if w.shouldIgnore(meta.Name) || queued != nil && queued(meta.Name) {
 				continue
 			}
+			progress.checked++
+			progress.tick()
 			// Names the walk already reconciled are answered by a single stat and
 			// cost nothing more. Remembering which ones those were would mean
 			// holding every name in memory at once — a gigabyte on a tree of ten
@@ -1272,7 +1491,12 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 			// A file may also have appeared since the walk. Both paths recheck
 			// disk and store under the commit lock, so neither can publish a
 			// stale deletion.
-			if err := w.sweepKnownFile(meta.Name, &meta); err != nil && !errors.Is(err, fileops.ErrBusy) && !errors.Is(err, ErrIntegrity) {
+			_, err := w.sweepKnown(meta.Name, &meta, deferDeletion)
+			switch {
+			case err == nil, errors.Is(err, fileops.ErrBusy), errors.Is(err, ErrIntegrity):
+			case unindexable(err) != "":
+				skips.add(unindexable(err), meta.Name)
+			default:
 				return err
 			}
 		}
@@ -1280,11 +1504,85 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 	if err := w.CheckStorage(); err != nil {
 		return err
 	}
+	// Every indexed name has been looked at, so what is missing now is the
+	// whole of what is missing, including what the event path is waiting on.
+	var heldErr error
+	if deletions != nil {
+		deletions.merge(w.takeEventDeletions())
+		if err := w.settleDeletions(ctx, deletions, true); err != nil {
+			if !errors.Is(err, errHeldDeletions) {
+				return err
+			}
+			held, heldErr = true, err
+		}
+	} else {
+		w.setHeldDeletions(0, "")
+	}
 	complete = true
 	if integrityErr != nil {
 		w.logger.Error("scan found damaged files awaiting repair", "error", integrityErr)
 	}
-	return integrityErr
+	return errors.Join(integrityErr, heldErr)
+}
+
+// checkSameFilesystem refuses a directory on another filesystem than the root.
+// A separate mount below the root can disappear on its own — an unmount, a
+// pool that fails to import — and leave an empty directory behind, and every
+// file it held would then look deleted. Only the root is guarded against that,
+// so a second filesystem fails the scan, loudly, before anything below it is
+// indexed. A failed scan also skips the deletion pass.
+func checkSameFilesystem(path, name string, d fs.DirEntry, rootDevice uint64, skips *skipTally, scanErr *error) error {
+	info, err := d.Info()
+	switch {
+	case err != nil && vanished(err):
+		skips.add(SkipVanished, name)
+		return fs.SkipDir
+	case err != nil && unreadableEntry(err):
+		skips.add(SkipUnreadable, name)
+		return fs.SkipDir
+	case err != nil:
+		*scanErr = errors.Join(*scanErr, err)
+		return fs.SkipDir
+	}
+	if device, ok := deviceOf(path, info); ok && device != rootDevice {
+		*scanErr = errors.Join(*scanErr, fmt.Errorf("sync_dir contains another filesystem at %q; Birak requires a single filesystem under sync_dir", name))
+		return fs.SkipDir
+	}
+	return nil
+}
+
+// sweepProgress reports a sweep that runs long, so the first index of a large
+// tree is visibly working rather than silent for an hour.
+type sweepProgress struct {
+	w                      *Watcher
+	phase                  string
+	started, last          time.Time
+	seen, indexed, checked int
+	reported               bool
+}
+
+func (w *Watcher) newSweepProgress() *sweepProgress {
+	now := time.Now()
+	return &sweepProgress{w: w, phase: "walk", started: now, last: now}
+}
+
+func (p *sweepProgress) tick() {
+	now := time.Now()
+	if now.Sub(p.last) < p.w.progressInterval {
+		return
+	}
+	p.last, p.reported = now, true
+	p.w.logger.Info("scan in progress", "phase", p.phase, "files_seen", p.seen, "indexed", p.indexed,
+		"checked", p.checked, "elapsed", now.Sub(p.started).Round(time.Millisecond))
+}
+
+// finish closes a sweep that reported progress with its totals.
+func (p *sweepProgress) finish() {
+	if !p.reported {
+		return
+	}
+	p.w.logger.Info("scan finished", "files_seen", p.seen, "indexed", p.indexed, "checked", p.checked,
+		"elapsed", time.Since(p.started).Round(time.Millisecond))
 }
 
 // restampThreshold is where "somebody touched a few files" becomes "somebody
@@ -1368,11 +1666,18 @@ func CleanEmptyParentsLocked(filePath, rootDir string, ignorePatterns []string, 
 		if absDir == absRoot || !strings.HasPrefix(absDir, absRoot+string(filepath.Separator)) {
 			break
 		}
+		rel, err := filepath.Rel(absRoot, absDir)
+		// Emptiness first: it ends the climb at the first directory that still
+		// holds anything, at the cost of reading one entry. Checking for writers
+		// first walked that directory instead — every remaining file of it,
+		// for every file a tree removal deleted.
+		if err != nil || !emptyDirectory(r, rel) || mountPoint(absDir) {
+			break
+		}
 		if fileops.BusyTreeLocked(rootDir, dir) {
 			break
 		}
-		rel, err := filepath.Rel(absRoot, absDir)
-		if err != nil || !removeEmptyDirectory(r, rel) {
+		if !removeEmptyDirectory(r, rel) {
 			break
 		}
 		logger.Debug("removed empty directory", "path", dir)
@@ -1389,6 +1694,37 @@ func CleanEmptyParentsLocked(filePath, rootDir string, ignorePatterns []string, 
 func removeEmptyDirectory(root *os.Root, dir string) bool {
 	info, err := root.Lstat(dir)
 	return err == nil && info.IsDir() && root.Remove(dir) == nil
+}
+
+// emptyDirectory reports a directory with no entries at all. It is only a fast
+// way to stop early; removeEmptyDirectory still relies on the OS to refuse a
+// directory that gained an entry since.
+func emptyDirectory(root *os.Root, dir string) bool {
+	f, err := root.Open(dir)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	entries, err := f.ReadDir(1)
+	return len(entries) == 0 && errors.Is(err, io.EOF)
+}
+
+// mountPoint reports a directory on another filesystem than its parent: the
+// root of something mounted there. Emptied of Birak's files it is still not
+// Birak's to remove — taking it away would leave whatever mounted it without
+// its mount point, and the next mount failing or landing elsewhere.
+func mountPoint(dir string) bool {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return false
+	}
+	parentInfo, err := os.Lstat(filepath.Dir(dir))
+	if err != nil {
+		return false
+	}
+	device, ok := deviceOf(dir, info)
+	parent, parentOK := deviceOf(filepath.Dir(dir), parentInfo)
+	return ok && parentOK && device != parent
 }
 
 // isOutsideSyncDir returns true if a relative path escapes the sync directory

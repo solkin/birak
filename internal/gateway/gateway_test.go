@@ -231,7 +231,7 @@ func TestLogMiddleware(t *testing.T) {
 		w.Write([]byte("hello"))
 	})
 
-	wrapped := LogMiddleware(logger, handler)
+	wrapped := LogMiddleware("test", logger, handler)
 	req := httptest.NewRequest("GET", "/test", nil)
 	w := httptest.NewRecorder()
 	wrapped.ServeHTTP(w, req)

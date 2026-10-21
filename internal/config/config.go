@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,6 +21,14 @@ const defaultMaxRepairQueue = 100_000
 // defaultScrubBytesPerSecond mirrors watcher.DefaultScrubRate, duplicated so
 // that config stays free of the indexing layer.
 const defaultScrubBytesPerSecond = 8 << 20
+
+// defaultNodeID names a standalone node that did not choose a name. A node with
+// peers must choose one: two nodes that both fell back to it reject each other
+// as duplicates while each keeps accepting writes, so the cluster splits.
+const defaultNodeID = "node-1"
+
+// defaultMaxExternalDeletions mirrors watcher.DefaultMaxExternalDeletions.
+const defaultMaxExternalDeletions = 1000
 
 // Config holds all daemon configuration.
 type Config struct {
@@ -37,9 +47,24 @@ type Config struct {
 	// throughput cost and a stalled log consumer is a replication outage.
 	LogLevel string `yaml:"log_level"`
 	// ClusterSecret, when set, is required in the X-Birak-Secret header of
-	// every peer-to-peer request. Empty leaves the sync API open, which is only
-	// safe when the listen address is unreachable from outside the cluster.
+	// every peer-to-peer request. It is mandatory once peers are configured.
+	// Empty leaves the sync API of a standalone node open, which is only safe
+	// when the listen address is unreachable from outside the host.
 	ClusterSecret string `yaml:"cluster_secret"`
+	// TLSCertFile and TLSKeyFile serve the peer API over HTTPS. Peers then use
+	// https:// URLs; the secret and file bytes no longer cross the network in
+	// clear text.
+	TLSCertFile string `yaml:"tls_cert_file"`
+	TLSKeyFile  string `yaml:"tls_key_file"`
+	// PeerCAFile adds a PEM bundle to the system roots used to verify https://
+	// peers, for clusters that sign peer certificates with a private CA.
+	PeerCAFile string `yaml:"peer_ca_file"`
+	// MetricsToken, when set, also admits /metrics requests that carry
+	// "Authorization: Bearer <token>", so a scraper does not need the cluster
+	// secret, which would let it read every file.
+	MetricsToken string `yaml:"metrics_token"`
+	// AccessLog writes one line per gateway request at info level.
+	AccessLog bool `yaml:"access_log"`
 	// MaxUploadBytes caps the size of a single uploaded object/file across all
 	// gateways (S3, WebDAV, HTTP UI, SFTP). 0 means unlimited.
 	MaxUploadBytes int64           `yaml:"max_upload_bytes"`
@@ -81,38 +106,46 @@ type GatewaysConfig struct {
 	SFTP   SFTPGatewayConfig   `yaml:"sftp"`
 }
 
+// AllowAnonymous on a gateway is the only way to run it without credentials.
+// Without it an enabled gateway must have both credentials: a missing
+// environment variable used to open the whole volume for anonymous writes.
+
 // SFTPGatewayConfig holds configuration for the SFTP gateway.
 type SFTPGatewayConfig struct {
-	Enabled     bool   `yaml:"enabled"`
-	ListenAddr  string `yaml:"listen_addr"`
-	Username    string `yaml:"username"`
-	Password    string `yaml:"password"`
-	HostKeyPath string `yaml:"host_key_path"`
+	Enabled        bool   `yaml:"enabled"`
+	ListenAddr     string `yaml:"listen_addr"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	AllowAnonymous bool   `yaml:"allow_anonymous"`
+	HostKeyPath    string `yaml:"host_key_path"`
 }
 
 // HTTPGatewayConfig holds configuration for the HTTP file server gateway.
 type HTTPGatewayConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	ListenAddr string `yaml:"listen_addr"`
-	Username   string `yaml:"username"`
-	Password   string `yaml:"password"`
+	Enabled        bool   `yaml:"enabled"`
+	ListenAddr     string `yaml:"listen_addr"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	AllowAnonymous bool   `yaml:"allow_anonymous"`
 }
 
 // WebDAVGatewayConfig holds configuration for the WebDAV gateway.
 type WebDAVGatewayConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	ListenAddr string `yaml:"listen_addr"`
-	Username   string `yaml:"username"`
-	Password   string `yaml:"password"`
+	Enabled        bool   `yaml:"enabled"`
+	ListenAddr     string `yaml:"listen_addr"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	AllowAnonymous bool   `yaml:"allow_anonymous"`
 }
 
 // S3GatewayConfig holds configuration for the S3 gateway.
 type S3GatewayConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	ListenAddr string `yaml:"listen_addr"`
-	AccessKey  string `yaml:"access_key"`
-	SecretKey  string `yaml:"secret_key"`
-	Domain     string `yaml:"domain"`
+	Enabled        bool   `yaml:"enabled"`
+	ListenAddr     string `yaml:"listen_addr"`
+	AccessKey      string `yaml:"access_key"`
+	SecretKey      string `yaml:"secret_key"`
+	AllowAnonymous bool   `yaml:"allow_anonymous"`
+	Domain         string `yaml:"domain"`
 	// Buckets are created at startup when missing, so that they exist before a
 	// client that cannot create them, or should not, first asks for them.
 	Buckets     []string `yaml:"buckets"`
@@ -151,18 +184,24 @@ type SyncConfig struct {
 	// tree is compared continuously instead of in a burst. 0 compares it all
 	// in one pass.
 	ReconcilePageBudget int `yaml:"reconcile_page_budget"`
+	// MaxExternalDeletions caps the deletions this node infers from files
+	// missing on disk — not deleted through a gateway or by a peer — and
+	// publishes within ten minutes. A larger group is held whole and the node
+	// reports a fault until the files return or the cap is raised. 0 disables
+	// the cap.
+	MaxExternalDeletions int `yaml:"max_external_deletions"`
 }
 
 // DefaultConfig returns a config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
 		StorageMode: "filesystem",
-		NodeID:      "node-1",
 		SyncDir:     "./sync",
 		MetaDir:     "./meta",
 		ListenAddr:  ":9100",
 		Ignore:      []string{},
 		LogLevel:    "info",
+		AccessLog:   true,
 		// Unlike the other multipart limits, zero means unlimited for the active
 		// upload cap. Seed its documented default here so an omitted setting is
 		// distinguishable from an explicit max_active_uploads: 0 in YAML.
@@ -193,6 +232,7 @@ func DefaultConfig() Config {
 			TombstoneTTL:           168 * time.Hour, // 7 days
 			ScanInterval:           5 * time.Minute,
 			ScrubBytesPerSecond:    defaultScrubBytesPerSecond,
+			MaxExternalDeletions:   defaultMaxExternalDeletions,
 			DebounceWindow:         300 * time.Millisecond,
 			RepairInterval:         30 * time.Second,
 			ReconcileInterval:      time.Hour,
@@ -237,6 +277,10 @@ func applyEnv(c *Config) error {
 		"BIRAK_META_DIR":           &c.MetaDir,
 		"BIRAK_LISTEN_ADDR":        &c.ListenAddr,
 		"BIRAK_CLUSTER_SECRET":     &c.ClusterSecret,
+		"BIRAK_TLS_CERT_FILE":      &c.TLSCertFile,
+		"BIRAK_TLS_KEY_FILE":       &c.TLSKeyFile,
+		"BIRAK_PEER_CA_FILE":       &c.PeerCAFile,
+		"BIRAK_METRICS_TOKEN":      &c.MetricsToken,
 		"BIRAK_LOG_LEVEL":          &c.LogLevel,
 		"BIRAK_S3_LISTEN_ADDR":     &c.Gateways.S3.ListenAddr,
 		"BIRAK_S3_ACCESS_KEY":      &c.Gateways.S3.AccessKey,
@@ -260,10 +304,10 @@ func applyEnv(c *Config) error {
 		}
 	}
 	if raw := os.Getenv("BIRAK_PEERS"); raw != "" {
-		c.Peers = strings.Split(raw, ",")
+		c.Peers = splitList(raw)
 	}
 	if raw := os.Getenv("BIRAK_IGNORE"); raw != "" {
-		c.Ignore = strings.Split(raw, ",")
+		c.Ignore = splitList(raw)
 	}
 	if raw := os.Getenv("BIRAK_S3_BUCKETS"); raw != "" {
 		c.Gateways.S3.Buckets = splitList(raw)
@@ -287,6 +331,7 @@ func applyEnv(c *Config) error {
 		"BIRAK_SYNC_BATCH_LIMIT":                      &c.Sync.BatchLimit,
 		"BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS":         &c.Sync.MaxConcurrentDownloads,
 		"BIRAK_SYNC_RECONCILE_PAGE_BUDGET":            &c.Sync.ReconcilePageBudget,
+		"BIRAK_SYNC_MAX_EXTERNAL_DELETIONS":           &c.Sync.MaxExternalDeletions,
 		"BIRAK_MULTIPART_MAX_PARTS":                   &c.Multipart.MaxParts,
 		"BIRAK_MULTIPART_MAX_ACTIVE_UPLOADS":          &c.Multipart.MaxActiveUploads,
 		"BIRAK_MULTIPART_MAX_CONCURRENT_PART_UPLOADS": &c.Multipart.MaxConcurrentPartUploads,
@@ -319,10 +364,15 @@ func applyEnv(c *Config) error {
 		}
 	}
 	for key, target := range map[string]*bool{
-		"BIRAK_S3_ENABLED":     &c.Gateways.S3.Enabled,
-		"BIRAK_WEBDAV_ENABLED": &c.Gateways.WebDAV.Enabled,
-		"BIRAK_HTTP_ENABLED":   &c.Gateways.HTTP.Enabled,
-		"BIRAK_SFTP_ENABLED":   &c.Gateways.SFTP.Enabled,
+		"BIRAK_ACCESS_LOG":             &c.AccessLog,
+		"BIRAK_S3_ENABLED":             &c.Gateways.S3.Enabled,
+		"BIRAK_S3_ALLOW_ANONYMOUS":     &c.Gateways.S3.AllowAnonymous,
+		"BIRAK_WEBDAV_ENABLED":         &c.Gateways.WebDAV.Enabled,
+		"BIRAK_WEBDAV_ALLOW_ANONYMOUS": &c.Gateways.WebDAV.AllowAnonymous,
+		"BIRAK_HTTP_ENABLED":           &c.Gateways.HTTP.Enabled,
+		"BIRAK_HTTP_ALLOW_ANONYMOUS":   &c.Gateways.HTTP.AllowAnonymous,
+		"BIRAK_SFTP_ENABLED":           &c.Gateways.SFTP.Enabled,
+		"BIRAK_SFTP_ALLOW_ANONYMOUS":   &c.Gateways.SFTP.AllowAnonymous,
 	} {
 		if raw := os.Getenv(key); raw != "" {
 			value, err := parseBool(raw)
@@ -382,21 +432,47 @@ func (c *Config) validate() error {
 	if (c.Gateways.S3.TLSCertFile == "") != (c.Gateways.S3.TLSKeyFile == "") {
 		return fmt.Errorf("S3 TLS certificate and key must be configured together")
 	}
+	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
+		return fmt.Errorf("tls_cert_file and tls_key_file must be configured together")
+	}
 	if _, ok := logLevels[strings.ToLower(strings.TrimSpace(c.LogLevel))]; !ok && c.LogLevel != "" {
 		return fmt.Errorf("log_level must be one of debug, info, warn, error (got %q)", c.LogLevel)
 	}
+	// A trailing comma in BIRAK_PEERS or an empty YAML item is a typo, not a
+	// peer: polling "" fails forever and shows as a permanently broken peer.
+	peers := c.Peers[:0]
 	seen := make(map[string]bool)
-	for i, peer := range c.Peers {
+	for _, peer := range c.Peers {
 		key := strings.TrimRight(strings.TrimSpace(peer), "/")
+		if key == "" {
+			continue
+		}
+		if err := checkPeerURL(key); err != nil {
+			return err
+		}
 		if seen[key] {
 			return fmt.Errorf("duplicate peer %q", peer)
 		}
 		seen[key] = true
-		c.Peers[i] = key
+		peers = append(peers, key)
 	}
+	c.Peers = peers
 
+	c.NodeID = strings.TrimSpace(c.NodeID)
 	if c.NodeID == "" {
-		return fmt.Errorf("node_id is required")
+		if len(c.Peers) > 0 {
+			return fmt.Errorf("node_id is required when peers are configured; give every node its own, e.g. node_id: %s on the node that used the default", defaultNodeID)
+		}
+		c.NodeID = defaultNodeID
+	}
+	if strings.ContainsFunc(c.NodeID, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
+		return fmt.Errorf("node_id must not contain spaces or control characters (got %q)", c.NodeID)
+	}
+	if len(c.Peers) > 0 && c.ClusterSecret == "" {
+		return fmt.Errorf("cluster_secret is required when peers are configured: without it anyone who reaches listen_addr reads every file")
+	}
+	if err := c.checkCredentials(); err != nil {
+		return err
 	}
 	if c.SyncDir == "" {
 		return fmt.Errorf("sync_dir is required")
@@ -430,6 +506,9 @@ func (c *Config) validate() error {
 	}
 	if c.Sync.ScrubBytesPerSecond < 0 {
 		return fmt.Errorf("sync.scrub_bytes_per_second must not be negative")
+	}
+	if c.Sync.MaxExternalDeletions < 0 {
+		return fmt.Errorf("sync.max_external_deletions must not be negative")
 	}
 	if c.Sync.RepairInterval < 0 {
 		return fmt.Errorf("sync.repair_interval must not be negative")
@@ -481,30 +560,120 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// SecurityWarnings returns messages for enabled gateways that run without any
-// credentials configured. Such gateways accept unauthenticated access, which is
-// easy to enable by accident — e.g. a default container run — so the operator is
-// warned at startup rather than silently exposing the filesystem.
+// checkPeerURL accepts an absolute http(s) URL naming a host. Anything else
+// starts a node that polls nothing and reports a peer that never recovers.
+func checkPeerURL(peer string) error {
+	u, err := url.Parse(peer)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("peer %q must be an http:// or https:// URL with a host, e.g. https://node-2:9100", peer)
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("peer %q must not carry credentials, a query or a fragment", peer)
+	}
+	return nil
+}
+
+// credentialPair is one gateway's authentication settings, named for errors.
+type credentialPair struct {
+	gateway, first, second string
+	a, b                   string
+	enabled, anonymous     bool
+}
+
+func (c *Config) credentialPairs() []credentialPair {
+	g := c.Gateways
+	return []credentialPair{
+		{"gateways.s3", "access_key", "secret_key", g.S3.AccessKey, g.S3.SecretKey, g.S3.Enabled, g.S3.AllowAnonymous},
+		{"gateways.webdav", "username", "password", g.WebDAV.Username, g.WebDAV.Password, g.WebDAV.Enabled, g.WebDAV.AllowAnonymous},
+		{"gateways.http", "username", "password", g.HTTP.Username, g.HTTP.Password, g.HTTP.Enabled, g.HTTP.AllowAnonymous},
+		{"gateways.sftp", "username", "password", g.SFTP.Username, g.SFTP.Password, g.SFTP.Enabled, g.SFTP.AllowAnonymous},
+	}
+}
+
+// checkCredentials fails closed. An enabled gateway needs both credentials,
+// unless it explicitly allows anonymous access with neither. One credential
+// alone used to be worse than none: an empty secret key or password is a
+// value anyone can sign or log in with.
+func (c *Config) checkCredentials() error {
+	for _, p := range c.credentialPairs() {
+		if !p.enabled {
+			continue
+		}
+		switch {
+		case p.a == "" && p.b == "" && !p.anonymous:
+			return fmt.Errorf("%s is enabled without %s/%s; set both, or set %s.allow_anonymous: true to serve without authentication", p.gateway, p.first, p.second, p.gateway)
+		case (p.a == "") != (p.b == ""):
+			return fmt.Errorf("%s needs both %s and %s; one alone lets anyone in with an empty value", p.gateway, p.first, p.second)
+		case isPlaceholder(p.a) || isPlaceholder(p.b):
+			return fmt.Errorf("%s credentials still contain an example placeholder (changeme); set real values", p.gateway)
+		}
+	}
+	for name, value := range map[string]string{"cluster_secret": c.ClusterSecret, "metrics_token": c.MetricsToken} {
+		if isPlaceholder(value) {
+			return fmt.Errorf("%s still contains an example placeholder (changeme); set a real value", name)
+		}
+	}
+	return nil
+}
+
+// isPlaceholder recognizes the example values shipped in .env.example, which
+// are public and therefore not credentials.
+func isPlaceholder(value string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(value)), "changeme")
+}
+
+// SecurityWarnings returns messages for settings that are allowed but expose
+// data: an explicitly anonymous gateway, an open peer API, and peer traffic in
+// clear text over a network that may not be private.
 func SecurityWarnings(c Config) []string {
 	var warnings []string
-	if len(c.Peers) > 0 && c.ClusterSecret == "" {
-		warnings = append(warnings, "peers are configured without cluster_secret; the sync API serves every file to anyone who can reach listen_addr")
+	if c.ClusterSecret == "" && !loopbackListener(c.ListenAddr) {
+		warnings = append(warnings, "cluster_secret is empty; the peer API on "+c.ListenAddr+" serves every file to anyone who can reach it")
+	}
+	for _, peer := range c.Peers {
+		if u, err := url.Parse(peer); err == nil && u.Scheme == "http" && !privateHost(u.Hostname()) {
+			warnings = append(warnings, "peer "+peer+" uses plain HTTP over a network that may not be private; the cluster secret and file bytes travel unencrypted — use https:// (tls_cert_file on that node) or a VPN")
+		}
 	}
 	if c.Sync.ReconcileInterval == 0 {
 		warnings = append(warnings, "sync.reconcile_interval is 0: full reconciliation is disabled, so anything the change stream misses will never be repaired")
 	}
-	g := c.Gateways
-	if g.S3.Enabled && g.S3.AccessKey == "" && g.S3.SecretKey == "" {
-		warnings = append(warnings, "S3 gateway is enabled without access_key/secret_key; it accepts unauthenticated requests")
-	}
-	if g.WebDAV.Enabled && g.WebDAV.Username == "" && g.WebDAV.Password == "" {
-		warnings = append(warnings, "WebDAV gateway is enabled without username/password; it accepts unauthenticated requests")
-	}
-	if g.HTTP.Enabled && g.HTTP.Username == "" && g.HTTP.Password == "" {
-		warnings = append(warnings, "HTTP UI gateway is enabled without username/password; it accepts unauthenticated requests")
-	}
-	if g.SFTP.Enabled && g.SFTP.Username == "" && g.SFTP.Password == "" {
-		warnings = append(warnings, "SFTP gateway is enabled without username/password; it accepts unauthenticated connections")
+	for _, p := range c.credentialPairs() {
+		if p.enabled && p.anonymous && p.a == "" && p.b == "" {
+			warnings = append(warnings, p.gateway+" allows anonymous access; anyone who reaches it can read, write and delete")
+		}
 	}
 	return warnings
+}
+
+// loopbackListener reports whether addr only accepts local connections.
+func loopbackListener(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// privateHost reports whether a peer host is on a network an operator
+// controls: a loopback or private address, or a name that public DNS cannot
+// resolve, such as a Docker service name.
+func privateHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if !strings.Contains(host, ".") {
+		return true
+	}
+	for _, suffix := range []string{".local", ".internal", ".lan", ".home.arpa", ".localhost"} {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
 }

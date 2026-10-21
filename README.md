@@ -14,6 +14,7 @@ Birak is a distributed file server with built-in replication. Each node stores a
 - **Recoverable replication** — durable repairs retain failed operations, periodic manifest reconciliation checks divergence, and checksum scans detect changes missed by filesystem events.
 - **Conflict resolution** — a per-path logical clock with deterministic tie-breaks, shared by polling, repairs, and reconciliation.
 - **No single point of failure** — every node is equal; any node can accept reads and writes.
+- **Fails closed** — gateways refuse to start without credentials, peers require a cluster secret and can talk over TLS, and a node that would replicate a mass deletion it did not perform holds it back.
 - **Zero external dependencies** — single Go binary, embedded SQLite for metadata.
 
 ## How It Works
@@ -45,8 +46,9 @@ Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browse
 
 ## Quick Start
 
-Current release: **v2.0.4**. Read the [release and upgrade notes](docs/releases/v2.0.4.md)
-before upgrading an existing cluster.
+Current release: **v2.1.0**. Read the [release and upgrade notes](docs/releases/v2.1.0.md)
+before upgrading an existing cluster: v2.1.0 refuses configurations that earlier
+releases accepted with only a warning.
 
 ### Docker
 
@@ -55,14 +57,24 @@ The fastest way to try Birak — no config file needed:
 ```bash
 docker run -d \
   -e BIRAK_HTTP_ENABLED=true \
+  -e BIRAK_HTTP_USERNAME=admin \
+  -e BIRAK_HTTP_PASSWORD=choose-a-password \
   -v ./sync:/data/sync \
   -v ./meta:/data/meta \
-  -p 9100:9100 \
-  -p 9400:9400 \
-  solkin/birak:latest
+  -p 127.0.0.1:9400:9400 \
+  solkin/birak:2.1.0
 ```
 
-Open `http://localhost:9400` — you'll see the file browser. Upload a file, and it will appear in the `./sync` directory on your host machine.
+Open `http://localhost:9400` and sign in — you'll see the file browser. Upload a file, and it will appear in the `./sync` directory on your host machine.
+
+An enabled gateway needs both of its credentials; Birak refuses to start
+otherwise. To serve a gateway without authentication on purpose, set its
+`allow_anonymous: true` (`BIRAK_HTTP_ALLOW_ANONYMOUS=true` here).
+
+For a production node use the repository's [`docker-compose.yml`](docker-compose.yml)
+with an `.env` built from [`.env.example`](.env.example), and a reverse proxy from
+[`deploy/`](deploy/): nginx for one node, HAProxy for several nodes behind one
+address (it keeps a node out of rotation until `/readyz` answers).
 
 ### Docker Compose (2-node cluster)
 
@@ -70,32 +82,38 @@ To see replication in action, run two nodes:
 
 ```yaml
 # docker-compose.yaml
+x-common: &common
+  BIRAK_CLUSTER_SECRET: "demo-cluster-secret"
+  BIRAK_HTTP_ENABLED: "true"
+  BIRAK_HTTP_USERNAME: "admin"
+  BIRAK_HTTP_PASSWORD: "demo-password"
+
 services:
   node1:
-    image: solkin/birak:latest
+    image: solkin/birak:2.1.0
     environment:
+      <<: *common
       BIRAK_NODE_ID: "node-1"
       BIRAK_PEERS: "http://node2:9100"
-      BIRAK_HTTP_ENABLED: "true"
     volumes:
       - node1-sync:/data/sync
       - node1-meta:/data/meta
     ports:
-      - "9101:9100"
-      - "9401:9400"
+      - "127.0.0.1:9101:9100"
+      - "127.0.0.1:9401:9400"
 
   node2:
-    image: solkin/birak:latest
+    image: solkin/birak:2.1.0
     environment:
+      <<: *common
       BIRAK_NODE_ID: "node-2"
       BIRAK_PEERS: "http://node1:9100"
-      BIRAK_HTTP_ENABLED: "true"
     volumes:
       - node2-sync:/data/sync
       - node2-meta:/data/meta
     ports:
-      - "9102:9100"
-      - "9402:9400"
+      - "127.0.0.1:9102:9100"
+      - "127.0.0.1:9402:9400"
 
 volumes:
   node1-sync:
@@ -108,7 +126,11 @@ volumes:
 docker compose up -d
 ```
 
-Open `http://localhost:9401` and `http://localhost:9402` — upload a file on one node and watch it appear on the other.
+Open `http://localhost:9401` and `http://localhost:9402` (user `admin`) — upload a file on one node and watch it appear on the other.
+
+Every node with peers needs its own `node_id` and the shared `cluster_secret`;
+Birak refuses to start without them. The same peer list may be given to every
+node: a URL that turns out to be the node itself is recognized and skipped.
 
 ### Build from Source
 
@@ -119,7 +141,11 @@ go build -o birakd ./cmd/birakd
 
 The daemon will create `sync_dir` and `meta_dir` if they don't exist, open a SQLite database at `meta_dir/birak.db`, and start synchronizing.
 
-To stop — send `SIGINT` or `SIGTERM` (Ctrl+C). The daemon will gracefully finish all in-progress operations.
+To stop — send `SIGINT` or `SIGTERM` (Ctrl+C). Open transfers get 8 seconds to
+finish, then the daemon exits; give a container runtime more than that before
+it sends SIGKILL (`stop_grace_period: 30s` in compose). An interrupted upload is
+never published, and a replica resumes an interrupted download. `birakd -version`
+prints the release.
 
 ## Configuration
 
@@ -139,6 +165,7 @@ including occupied listen ports, stop the daemon with a nonzero exit code.
 **Minimal:**
 ```yaml
 node_id: "node-1"
+cluster_secret: "a-long-random-secret"
 peers:
   - "http://192.168.1.2:9100"
 ```
@@ -150,9 +177,14 @@ sync_dir: "/data/sync"
 meta_dir: "/data/meta"
 listen_addr: ":9100"
 log_level: "info"           # debug | info | warn | error
+access_log: true            # one line per gateway request
+tls_cert_file: "/tls/node.pem"     # serve the peer API over HTTPS (with tls_key_file)
+tls_key_file: "/tls/node.key"
+peer_ca_file: "/tls/cluster-ca.pem"  # extra CA for verifying https:// peers
+metrics_token: "scrape-token"      # bearer token that opens /metrics only
 peers:
-  - "http://192.168.1.2:9100"
-  - "http://192.168.1.3:9100"
+  - "https://192.168.1.2:9100"
+  - "https://192.168.1.3:9100"
 ignore:
   - ".DS_Store"
   - "Thumbs.db"
@@ -167,7 +199,7 @@ multipart:                    # S3 multipart upload limits and retention
   upload_ttl: 168h            # discard an untouched incomplete upload after this
   cleanup_interval: 1h        # how often the janitor sweeps
   temp_file_max_age: 24h      # age at which an orphaned scratch file is removed
-cluster_secret: "shared-secret"  # required on every peer-to-peer request; omit to leave the sync API open
+cluster_secret: "shared-secret"  # required on every peer-to-peer request; mandatory with peers
 sync:
   poll_interval: 3s
   batch_limit: 1000
@@ -176,6 +208,7 @@ sync:
   scan_interval: 5m           # stat-only sweep; no longer re-reads file bytes
   scrub_bytes_per_second: 8388608  # continuous checksum verification budget; 0 disables
   max_repair_queue: 100000    # queued entries per peer; 0 = unlimited
+  max_external_deletions: 1000  # deletions found on disk per 10 min before they are held; 0 = no limit
   reconcile_page_budget: 64   # manifest pages per pass; 0 = the whole manifest at once
   debounce_window: 300ms
   repair_interval: 30s      # how often failed changes are retried
@@ -186,6 +219,7 @@ gateways:
     listen_addr: ":9200"
     access_key: "admin"
     secret_key: "secret123"
+    # allow_anonymous: true    # the only way to run an enabled gateway without credentials
     buckets: ["backups"]       # created at startup when missing
   webdav:
     enabled: true
@@ -204,7 +238,24 @@ gateways:
     password: "secret123"
 ```
 
-The `ignore`, `multipart`, and `sync` sections are optional — defaults will be used if omitted. Internal state (`.birak/`) and scratch files (`.birak-tmp-*`, `.birak-bak-*`) are always ignored regardless of configuration. Ignore rules only exclude files from replication; directory cleanup never deletes their contents. A directory containing ignored files is retained.
+The `ignore`, `multipart`, and `sync` sections are optional — defaults will be used if omitted.
+
+Startup fails closed on settings that would expose data or split a cluster:
+
+- An enabled gateway needs both credentials (`access_key`/`secret_key`,
+  `username`/`password`). With neither, it starts only with
+  `allow_anonymous: true`; one credential alone is always an error, because an
+  empty secret or password is a value anyone can use.
+- Credentials and secrets that still start with `changeme` (the values in
+  `.env.example`) are rejected.
+- With `peers` configured, `node_id` and `cluster_secret` are required. A node
+  without peers keeps the default `node_id: node-1`.
+- Peer URLs must be `http://` or `https://` URLs with a host; empty items, such
+  as a trailing comma in `BIRAK_PEERS`, are dropped.
+
+Startup warnings remain for allowed but exposed setups: an anonymous gateway, an
+empty `cluster_secret` on a non-loopback `listen_addr`, and `http://` peers whose
+host is not on a private network. Internal state (`.birak/`) and scratch files (`.birak-tmp-*`, `.birak-bak-*`) are always ignored regardless of configuration. Ignore rules only exclude files from replication; directory cleanup never deletes their contents. A directory containing ignored files is retained.
 
 ### Environment variables
 
@@ -212,8 +263,11 @@ Every setting has a corresponding `BIRAK_*` environment variable. Useful for Doc
 
 ```bash
 export BIRAK_NODE_ID="node-1"
+export BIRAK_CLUSTER_SECRET="a-long-random-secret"
 export BIRAK_PEERS="http://192.168.1.2:9100,http://192.168.1.3:9100"
 export BIRAK_HTTP_ENABLED=true
+export BIRAK_HTTP_USERNAME=admin
+export BIRAK_HTTP_PASSWORD=choose-a-password
 ./birakd
 ```
 
@@ -221,14 +275,20 @@ export BIRAK_HTTP_ENABLED=true
 
 | YAML | Env var | Default | Description |
 |------|---------|---------|-------------|
-| `node_id` | `BIRAK_NODE_ID` | `node-1` | Unique node ID |
+| `storage_mode` | `BIRAK_STORAGE_MODE` | `filesystem` | Only `filesystem` is supported; another value fails startup |
+| `node_id` | `BIRAK_NODE_ID` | `node-1` | Unique node ID; required when `peers` is set |
 | `sync_dir` | `BIRAK_SYNC_DIR` | `./sync` | Directory to synchronize |
 | `meta_dir` | `BIRAK_META_DIR` | `./meta` | Directory for SQLite database |
 | `listen_addr` | `BIRAK_LISTEN_ADDR` | `:9100` | Peer-to-peer HTTP server address |
-| `peers` | `BIRAK_PEERS` | `[]` | Peer URLs (comma-separated in env) |
+| `peers` | `BIRAK_PEERS` | `[]` | Peer `http(s)://` URLs (comma-separated in env) |
 | `ignore` | `BIRAK_IGNORE` | `[]` | Ignore patterns (comma-separated in env) |
-| `cluster_secret` | `BIRAK_CLUSTER_SECRET` | _(empty)_ | Shared secret required on peer-to-peer requests; empty leaves the sync API open |
+| `cluster_secret` | `BIRAK_CLUSTER_SECRET` | _(empty)_ | Shared secret required on peer-to-peer requests; mandatory with `peers`; empty leaves a standalone node's sync API open |
+| `tls_cert_file` | `BIRAK_TLS_CERT_FILE` | _(empty)_ | PEM certificate chain for serving the peer API over HTTPS; configure with the key |
+| `tls_key_file` | `BIRAK_TLS_KEY_FILE` | _(empty)_ | PEM private key for the peer API |
+| `peer_ca_file` | `BIRAK_PEER_CA_FILE` | _(empty)_ | PEM bundle added to the system roots for verifying `https://` peers |
+| `metrics_token` | `BIRAK_METRICS_TOKEN` | _(empty)_ | Bearer token accepted by `/metrics` in addition to the cluster secret |
 | `log_level` | `BIRAK_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+| `access_log` | `BIRAK_ACCESS_LOG` | `true` | One info line per gateway request; request counters are kept either way |
 | `max_upload_bytes` | `BIRAK_MAX_UPLOAD_BYTES` | `0` | Max upload bytes; 0 = unlimited for S3/WebDAV/SFTP, 1 GiB default for HTTP UI |
 | `multipart.min_part_bytes` | `BIRAK_MULTIPART_MIN_PART_BYTES` | `5242880` | Minimum size of every multipart part but the last |
 | `multipart.max_part_bytes` | `BIRAK_MULTIPART_MAX_PART_BYTES` | `5368709120` | Maximum size of a single multipart part |
@@ -245,6 +305,7 @@ export BIRAK_HTTP_ENABLED=true
 | `sync.scan_interval` | `BIRAK_SYNC_SCAN_INTERVAL` | `5m` | Stat-only sweep interval; indexes anything whose size or timestamp moved |
 | `sync.scrub_bytes_per_second` | `BIRAK_SYNC_SCRUB_BYTES_PER_SECOND` | `8388608` | Continuous checksum verification budget; 0 disables verification |
 | `sync.max_repair_queue` | `BIRAK_SYNC_MAX_REPAIR_QUEUE` | `100000` | Queued repair entries per peer; 0 = unlimited |
+| `sync.max_external_deletions` | `BIRAK_SYNC_MAX_EXTERNAL_DELETIONS` | `1000` | Deletions found on disk (not made through Birak) published per 10 minutes; a larger group is held and the node turns unready. 0 = no limit |
 | `sync.reconcile_page_budget` | `BIRAK_SYNC_RECONCILE_PAGE_BUDGET` | `64` | Manifest pages per comparison pass; 0 compares the whole manifest at once |
 | `sync.debounce_window` | `BIRAK_SYNC_DEBOUNCE_WINDOW` | `300ms` | Delay before processing file events |
 | `sync.repair_interval` | `BIRAK_SYNC_REPAIR_INTERVAL` | `30s` | Rescan interval for new or due repairs; free workers also refill on completion |
@@ -253,6 +314,8 @@ export BIRAK_HTTP_ENABLED=true
 | `gateways.s3.listen_addr` | `BIRAK_S3_LISTEN_ADDR` | `:9200` | S3 Gateway address |
 | `gateways.s3.access_key` | `BIRAK_S3_ACCESS_KEY` | _(empty)_ | S3 access key |
 | `gateways.s3.secret_key` | `BIRAK_S3_SECRET_KEY` | _(empty)_ | S3 secret key |
+| `gateways.s3.allow_anonymous` | `BIRAK_S3_ALLOW_ANONYMOUS` | `false` | Serve without credentials; required to enable S3 with neither key |
+| `gateways.s3.domain` | `BIRAK_S3_DOMAIN` | _(empty)_ | Base domain for virtual-hosted-style requests (`bucket.domain`) |
 | `gateways.s3.tls_cert_file` | `BIRAK_S3_TLS_CERT_FILE` | _(empty)_ | PEM server certificate chain for HTTPS; configure with the key |
 | `gateways.s3.tls_key_file` | `BIRAK_S3_TLS_KEY_FILE` | _(empty)_ | PEM server private key for HTTPS |
 | `gateways.s3.buckets` | `BIRAK_S3_BUCKETS` | `[]` | Buckets to create at startup when missing (comma-separated in env) |
@@ -260,14 +323,17 @@ export BIRAK_HTTP_ENABLED=true
 | `gateways.webdav.listen_addr` | `BIRAK_WEBDAV_LISTEN_ADDR` | `:9300` | WebDAV Gateway address |
 | `gateways.webdav.username` | `BIRAK_WEBDAV_USERNAME` | _(empty)_ | WebDAV username |
 | `gateways.webdav.password` | `BIRAK_WEBDAV_PASSWORD` | _(empty)_ | WebDAV password |
+| `gateways.webdav.allow_anonymous` | `BIRAK_WEBDAV_ALLOW_ANONYMOUS` | `false` | Serve WebDAV without credentials |
 | `gateways.http.enabled` | `BIRAK_HTTP_ENABLED` | `false` | Enable HTTP file browser |
 | `gateways.http.listen_addr` | `BIRAK_HTTP_LISTEN_ADDR` | `:9400` | HTTP file browser address |
 | `gateways.http.username` | `BIRAK_HTTP_USERNAME` | _(empty)_ | HTTP username |
 | `gateways.http.password` | `BIRAK_HTTP_PASSWORD` | _(empty)_ | HTTP password |
+| `gateways.http.allow_anonymous` | `BIRAK_HTTP_ALLOW_ANONYMOUS` | `false` | Serve the file browser without credentials |
 | `gateways.sftp.enabled` | `BIRAK_SFTP_ENABLED` | `false` | Enable SFTP Gateway |
 | `gateways.sftp.listen_addr` | `BIRAK_SFTP_LISTEN_ADDR` | `:9500` | SFTP Gateway address |
 | `gateways.sftp.username` | `BIRAK_SFTP_USERNAME` | _(empty)_ | SFTP username |
 | `gateways.sftp.password` | `BIRAK_SFTP_PASSWORD` | _(empty)_ | SFTP password |
+| `gateways.sftp.allow_anonymous` | `BIRAK_SFTP_ALLOW_ANONYMOUS` | `false` | Accept SFTP connections without a password |
 | `gateways.sftp.host_key_path` | `BIRAK_SFTP_HOST_KEY_PATH` | _(auto)_ | Path to SSH host key (auto-generated if empty) |
 
 ### Upload limit defaults
@@ -292,7 +358,7 @@ A built-in web-based file manager with Material 3 Expressive UI. No client softw
 - Download, rename, delete files
 - Create and delete folders
 
-Open `http://localhost:9400` in any browser. If `username` and `password` are configured, the browser shows a native login prompt.
+Open `http://localhost:9400` in any browser. The browser shows a native login prompt for the configured `username` and `password`.
 
 ### S3 Gateway
 
@@ -312,13 +378,15 @@ serves HTTP, which can be placed behind a TLS proxy.
 | `DeleteBucket` | Delete empty bucket (DELETE /{bucket}) |
 | `HeadBucket` | Check bucket existence (HEAD /{bucket}) |
 | `ListObjectsV2` | List objects with prefix/delimiter (GET /{bucket}) |
-| `PutObject` | Upload file (PUT /{bucket}/{key}) |
+| `PutObject` | Upload file (PUT /{bucket}/{key}); `If-None-Match: *` and `If-Match` make it conditional |
+| `CopyObject` | Copy an object (PUT /{bucket}/{key} with `x-amz-copy-source`) |
 | `GetObject` | Download file (GET /{bucket}/{key}) |
 | `DeleteObject` | Delete file (DELETE /{bucket}/{key}) |
 | `DeleteObjects` | Delete up to 1000 files (POST /{bucket}?delete) |
 | `HeadObject` | File metadata (HEAD /{bucket}/{key}) |
 | `CreateMultipartUpload` | Start multipart upload (POST /{bucket}/{key}?uploads) |
 | `UploadPart` | Upload a part (PUT /{bucket}/{key}?partNumber={n}&uploadId={id}) |
+| `UploadPartCopy` | Copy a byte range of an object into a part (`x-amz-copy-source`, optional `x-amz-copy-source-range`) |
 | `CompleteMultipartUpload` | Assemble and publish an upload (POST /{bucket}/{key}?uploadId={id}) |
 | `AbortMultipartUpload` | Discard an upload (DELETE /{bucket}/{key}?uploadId={id}) |
 | `ListParts` | List staged parts (GET /{bucket}/{key}?uploadId={id}) |
@@ -424,8 +492,7 @@ object is replicated.
 - Completion requires strictly ascending parts, matching ETags, and the configured
   minimum size for every part except the last.
 - Assembly re-hashes every part and checks final size before publishing the object
-  with a single atomic rename in the destination directory, so it also works when
-  a bucket is a separate mount.
+  with a single atomic rename in the destination directory.
 - Atomic-write scratch files (`.birak-tmp-*`, `.birak-bak-*`) are a reserved
   namespace: they are never reported by `ListObjects`, and no gateway accepts a
   client path using one of those prefixes.
@@ -433,11 +500,53 @@ object is replicated.
   scratch files older than `temp_file_max_age`. A bucket with active uploads cannot
   be deleted.
 
-`CompleteMultipartUpload` returns the standard composite ETag (the MD5 of the
-concatenated part digests plus `-{partCount}`). Later `GET`/`HEAD`/`LIST` requests
-return Birak's usual ETag, which is derived from size and modification time rather
-than content (the same as for objects written with a plain `PUT`). The values
-differ; standard S3 SDK upload and download paths do not depend on their equality.
+- `Content-MD5` and a concrete `x-amz-content-sha256` on the Complete request
+  body are enforced, as for DeleteObjects.
+- Repeating `CompleteMultipartUpload` with the same part list — a client retry
+  after a timeout — returns the original result for as long as the object is
+  unchanged and within `upload_ttl`, instead of `NoSuchUpload`.
+
+Object ETags are derived from size and modification time rather than content.
+PutObject, CopyObject and CompleteMultipartUpload return the same ETag that a
+later `GET`, `HEAD` or `LIST` reports for that object; part ETags in
+UploadPart, UploadPartCopy, ListParts and Complete are the parts' MD5.
+
+#### S3 Copies, Folders and Conditional Requests
+
+- **CopyObject** copies the source through the read fence into a scratch file
+  next to the destination and publishes it like a PUT, so other writes are not
+  held up by a large copy. The bytes must match the source's recorded checksum;
+  a source replaced during the copy answers `503 SlowDown` (SDKs retry), a
+  damaged or quarantined source is never copied. Copying an object onto itself
+  (`--metadata-directive REPLACE`) changes nothing, as metadata is not stored.
+  `x-amz-copy-source-if-*` conditions are honoured. `versionId` is not supported
+  (`501`).
+- **UploadPartCopy** streams the requested range of the source into a part, so
+  `aws s3 cp`/`mv` between keys works for objects of any size. The source is
+  verified against its checksum once per generation.
+- **Folder markers**: `PUT bucket/prefix/` with an empty body (AWS console,
+  Cyberduck, rclone) creates the directory; `HEAD`/`GET` of `prefix/` answer
+  `200` while it exists; `DELETE prefix/` removes it only when empty. An empty
+  directory is not replicated and does not appear in listings.
+- **Conditional requests**: `GET` and `HEAD` evaluate `If-Match`,
+  `If-Unmodified-Since` (`412 PreconditionFailed`), `If-None-Match` and
+  `If-Modified-Since` (`304`) in RFC 9110 order; an unsatisfiable `Range` answers
+  `416 InvalidRange`. `PUT` and Complete with `If-None-Match: *` or `If-Match` are
+  checked atomically at publication.
+- **Errors** keep S3 codes: a key below an existing object reads as
+  `NoSuchKey` and cannot be written (`409 ParentIsObject`); a key naming a
+  directory cannot be overwritten (`409 ObjectExistsAsDirectory`); spellings that
+  collide case- or Unicode-insensitively answer `409 NameCollision`; segments over
+  255 bytes or keys over 1024 bytes answer `400 KeyTooLongError`; objects in a
+  missing bucket answer `NoSuchBucket`; a file being written answers
+  `503 SlowDown`.
+- **Content-Type** is derived from the extension for a safe set — `.apk`
+  (`application/vnd.android.package-archive`), common images, `.json`, `.txt`,
+  `.pdf`, `.zip` — and is `application/octet-stream` for everything else,
+  including HTML, SVG and scripts. Every response carries
+  `X-Content-Type-Options: nosniff`. Content-Type sent with a PUT is not stored.
+- Presigned URLs live at most 7 days (`X-Amz-Expires` ≤ 604800), and the
+  credential scope date must match `X-Amz-Date`.
 
 ### WebDAV Gateway
 
@@ -547,7 +656,47 @@ Two separate jobs, with separate costs. The **sweep** runs every `scan_interval`
 
 The **scrub** re-reads and re-hashes stored files continuously at `scrub_bytes_per_second`, cycling through the tree in name order and persisting its position, so it resumes where it stopped after a restart. It is what detects a rewrite that preserved size and timestamp, and bit rot. Set the budget from the storage you have: at the 8 MiB/s default a 100 GB node completes a cycle in about three hours. `0` disables verification entirely, which leaves silent corruption to be found by a peer or not at all. Hashing happens outside the shared commit lock; only the short index update holds it.
 
-A name the node cannot index is that name's problem, not the node's: a spelling that collides with one already reserved (for example `0.PNG` next to an indexed `0.png`), or a name that is not valid UTF-8. The sweep leaves such files alone, counts them in `/status.local.skipped` and `birak_scan_skipped_files`, names a few in `/status.local.skipped_samples`, and completes; so does an entry removed while the sweep was reading it. The node stays ready and, after a restart, replication starts. Rename or remove the stray file to have it indexed.
+A name the node cannot index is that name's problem, not the node's: a spelling that collides with one already reserved (for example `0.PNG` next to an indexed `0.png`), a name that is not valid UTF-8, or a file or directory the daemon has no permission to read (`unreadable` — typically something copied in as root with mode 0600). The sweep leaves such entries alone, counts them in `/status.local.skipped` and `birak_scan_skipped_files`, names a few in `/status.local.skipped_samples`, and completes; so does an entry removed while the sweep was reading it. A file that cannot be read is never treated as deleted. The node stays ready and, after a restart, replication starts. Rename, remove or `chown` the stray entry to have it indexed. Only an unreadable `sync_dir` itself is a node fault.
+
+`sync_dir` must be a single filesystem. A directory below it on another device —
+a separate disk mounted inside, a Docker volume mounted over a subdirectory, a
+btrfs subvolume or ZFS dataset — fails the sweep with an explicit error, and the
+node stays unready until it is removed or `sync_dir` is moved. Bind mounts of the
+same filesystem are fine. The reason: a nested disk that is not mounted looks
+exactly like its files having been deleted, and those deletions would replicate
+to every node. Combine disks below the filesystem instead (LVM, RAID, ZFS pool).
+
+Files that disappear from disk without going through Birak — `rm` on the host,
+an `rsync --delete`, a restore that left part of the tree out — are deletions
+Birak infers, and they are budgeted. At most `sync.max_external_deletions`
+(default 1000) are published per 10 minutes. A larger group is held as a whole:
+nothing of it is replicated, the node turns unready, and `/status.local.last_error`,
+`/status.local.held_external_deletions` and `birak_external_deletions_held` report
+it with sample names. Restore the files and the next sweep clears the fault; to
+accept the deletions, restart once with a higher limit (or `0`) and then put the
+limit back. Deletions through any gateway or from peers are not budgeted.
+
+An I/O error reading an indexed file (a bad sector) quarantines the file and
+queues its repair from peers, like a checksum mismatch; it is counted in
+`birak_read_errors_total`.
+
+Timestamps are compared at the precision the volume stores. A replica whose
+filesystem keeps coarser modification times than its source (NTFS, HFS+, SMB,
+FAT) no longer re-reads every file on every sweep. The precision is measured
+once per start at `sync_dir/.birak/mtime-probe`.
+
+When the metadata database is new but `sync_dir` was bound to an earlier one
+(the meta volume was lost or replaced), the node logs a warning and re-indexes
+everything; deletion history and queued repairs of the lost database are gone.
+A sweep that runs longer than 30 seconds logs its progress every 30 seconds, so a
+first index of millions of names is visible.
+
+On Linux every directory under `sync_dir` takes one inotify watch. When the
+host limit is reached the daemon logs how many directories it could not watch;
+changes in those directories are then found only by the sweep, up to
+`scan_interval` later. Raise the limit for trees with many directories, for
+example `sysctl -w fs.inotify.max_user_watches=1048576` (persist it in
+`/etc/sysctl.d/`); in Docker it is the host's setting.
 
 Changes reported by the filesystem are indexed one name at a time from a backlog. A sweep that comes due runs between two names rather than after the whole backlog, and leaves the backlog's names to it, so indexing a bulk import that takes longer than the readiness window does not make the node unready. Shutdown stops between two names; what was not indexed yet is found by the next start's initial sweep.
 
@@ -575,7 +724,7 @@ A write is staged, fsynced and hashed before the shared commit lock is taken, an
 
 ### Deletions
 
-A deletion creates a **tombstone** (`deleted=true`), including when a receiving node has never held that file. Tombstones are retained indefinitely. The old `sync.tombstone_ttl` setting remains accepted for configuration compatibility but does not trigger cleanup.
+A deletion creates a **tombstone** (`deleted=true`), including when a receiving node has never held that file. Deleting a directory tree through the HTTP browser or WebDAV removes it in batches of up to a few hundred files, each its own short commit, so other writes on the node proceed meanwhile; a file written into the tree during that time, or held open by a writer, is kept and the delete reports a conflict (WebDAV `409`/`423`, HTTP browser `409`). WebDAV MOVE and COPY of a large tree still index it under one commit. Tombstones are retained indefinitely. The old `sync.tombstone_ttl` setting remains accepted for configuration compatibility but does not trigger cleanup.
 
 A file tombstone does not delete a directory or its children. A regular-file ancestor also means the deleted descendant is already absent. Both cases preserve the tombstone and its clock, including recovery after restart, regardless of whether live files or deletions arrive first.
 
@@ -583,14 +732,28 @@ A polling cursor acknowledges receipt, not successful application. It cannot saf
 
 ### Node Identity and Recovery
 
-Run one daemon per data volume and metadata directory; OS-held leases reject a second process and are released automatically on exit. Assign a unique `node_id` to each node. Replication rejects a peer advertising the same ID as the local node. Each database has a persistent identity, while every daemon start generates a fresh **process incarnation**, returned as `X-Birak-Epoch`. Peers reset their cursors on an incarnation change and replay current metadata. This also covers a restored backup whose version counter has already caught up with an old cursor. For a replayed entry it already holds, the replaying node pays its share of one index query per page: no queue row, no `/meta` request and no download, which `birak_repairs_enqueued_total` lets you confirm.
+Run one daemon per data volume and metadata directory; OS-held leases reject a second process and are released automatically on exit. Assign a unique `node_id` to each node; a node with peers must set one explicitly. Replication rejects another node advertising the same ID: it is logged as an error and shown as `peers[].duplicate_node_id` and `birak_peer_duplicate_node_id`, because the two nodes keep accepting writes without exchanging them until one is renamed (they then converge). A configured peer URL that reaches the node itself — the same ID and the same incarnation — is skipped and left out of `/status`. A node that polls this one without being in its peer list appears in `/status.unconfigured_pollers` and `birak_unconfigured_pollers`: the two peer lists disagree, and changes flow in one direction only. Each database has a persistent identity, while every daemon start generates a fresh **process incarnation**, returned as `X-Birak-Epoch`. Peers reset their cursors on an incarnation change and replay current metadata. This also covers a restored backup whose version counter has already caught up with an old cursor. For a replayed entry it already holds, the replaying node pays its share of one index query per page: no queue row, no `/meta` request and no download, which `birak_repairs_enqueued_total` lets you confirm.
 
 **Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 4`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds the extended clock, namespace reservations, and admission marker automatically. Release builds pin Go 1.26.10; use a patched supported Go toolchain when building from source. Keep a pre-upgrade metadata backup if a binary rollback is required.
+
+An upgrade, node by node:
+
+1. Read the release notes; check `birakd -version` of the new image or binary.
+2. Stop the node (`docker compose stop`), take the backup described below.
+3. Start the new version. Confirm `/status.version`, `/readyz` returning 200,
+   and `birak_peer_healthy` 1 for every peer before moving to the next node.
+
+Rolling back within one protocol version restarts the previous binary on the
+same directories; restore the pre-upgrade metadata only when the release notes
+say a migration cannot be read by the older version.
 
 The version high-water mark survives deletion of file records. Both `meta_dir` and `sync_dir`, including `.birak/storage-id`, should use persistent storage and be included in a consistent backup. Losing the metadata also loses deletion history, cursors, and repair work that might have no other surviving copy.
 
 Stop the node before copying, so `meta_dir` and `sync_dir` come from the same
-moment, and restore both together. Preserve modification times where possible
+moment, and restore both together. For terabytes of data, stop the node only
+for a filesystem snapshot (LVM, ZFS, btrfs) of both directories and copy the
+snapshot while the node runs again; a snapshot of a running node is a crash
+image, which Birak recovers from, but a stopped one needs no recovery. Preserve modification times where possible
 (`cp -a`, `rsync -a`, or an equivalent backup tool). If timestamps were lost,
 Birak hashes unchanged indexed files, restores their recorded timestamps, and
 keeps their original logical clocks. Such files do not become new writes or
@@ -602,6 +765,13 @@ original metadata Birak cannot distinguish an old backup from a deliberate new
 write. Keep deletion history and `.birak/storage-id` with the backup. Do not
 restore a pending filesystem transaction onto new objects without following
 its explicit recovery procedure.
+
+**Rebuilding a node from its peers** needs no backup: start it with an empty
+`sync_dir` and `meta_dir`, a new `node_id` (never reuse the ID of a node whose
+data is gone), the cluster secret and the peer list. It stays unready until it
+has applied a peer's state; then it serves like any other node. Expect the
+initial copy to take as long as the slowest link needs for the whole data set,
+and the first index of the received files to read them once.
 
 Removing a peer from configuration clears its polling cursor but retains its
 unfinished repairs in SQLite and in `/status.repairs`. Its queue is paused while
@@ -666,6 +836,7 @@ curl 'http://localhost:9100/status'
 ```json
 {
   "node_id": "node-1",
+  "version": "2.1.0",
   "epoch": "5f3c1a9e8b2d4f60a7c1e9d3b5a7f218",
   "max_version": 42,
   "file_count": 1500,
@@ -690,12 +861,22 @@ curl 'http://localhost:9100/status'
 
 Watch `local.ready`, `local.last_scan_ms_ago`, `peers[].lag`, `peers[].healthy` and `repairs.total` to spot a stalled peer: a stream that has stopped moving shows up here rather than only as a file-count drift between nodes.
 
-`last_reconcile_ms_ago` is the age of the last *completed* manifest comparison, or `-1` when none has finished yet; a paced pass that stopped on its page budget does not count. `local.quarantined` counts files awaiting repair from a peer, and `local.last_scrub_ms_ago` is the age of the last finished verification cycle (`-1` before the first one). `local.skipped` counts, by reason, the files the last sweep found but could not index (`name_collision`, `invalid_name`, `vanished`), with a few named in `local.skipped_samples`; `local.skipped_total` counts every skip since start.
+`last_success_ms_ago` is `-1` for a peer that has never answered. `duplicate_node_id` appears while a peer answers with this node's `node_id`. `last_reconcile_ms_ago` is the age of the last *completed* manifest comparison, or `-1` when none has finished yet; a paced pass that stopped on its page budget does not count. `local.quarantined` counts files awaiting repair from a peer, and `local.last_scrub_ms_ago` is the age of the last finished verification cycle (`-1` before the first one). `local.skipped` counts, by reason, the files the last sweep found but could not index (`name_collision`, `invalid_name`, `unreadable`, `vanished`), with a few named in `local.skipped_samples`; `local.skipped_total` counts every skip since start. `local.held_external_deletions` is nonzero while a mass deletion found on disk is held back, and `local.read_errors_total` counts I/O errors on indexed files.
 
 ### GET /metrics
 
 Prometheus text format, carrying the same information as `/status` and behind
-the same `cluster_secret`. Scrape it instead of parsing JSON.
+the same `cluster_secret`. Scrape it instead of parsing JSON. With
+`metrics_token` set, `Authorization: Bearer <token>` also opens `/metrics` (and
+nothing else), so Prometheus needs neither a custom header nor the secret that
+reads every file:
+
+```yaml
+scrape_configs:
+  - job_name: birak
+    authorization: { credentials: "<metrics_token>" }
+    static_configs: [{ targets: ["node-1:9100", "node-2:9100", "node-3:9100"] }]
+```
 
 ```
 birak_repairs_queued 0
@@ -717,10 +898,30 @@ birak_commit_lock_worst_seconds 0.098
 birak_active_readers 12
 birak_file_read_bytes_total 104857600
 birak_reader_revocations_total 0
+birak_disk_free_bytes{volume="sync"} 4.2e+12
+birak_disk_free_bytes{volume="meta"} 8.1e+10
+birak_gateway_requests_total{code="2xx",gateway="s3"} 918263
+birak_peer_duplicate_node_id{peer="http://192.168.1.2:9100"} 0
+birak_external_deletions_held 0
+birak_read_errors_total 0
+birak_build_info{version="2.1.0"} 1
 ```
 
-Alert on `birak_peer_healthy`, `birak_repair_oldest_seconds`,
-`birak_quarantined_files` and `birak_last_scan_seconds`. The commit-lock
+Alert on:
+
+| Condition | Meaning |
+| --- | --- |
+| `birak_local_ready == 0` or `birak_storage_ok == 0` | The node cannot serve: storage fault, unfinished sweep, held mass deletion |
+| `birak_peer_healthy == 0` for minutes | A peer's stream is not moving or its queue does not drain |
+| `birak_peer_duplicate_node_id == 1` | Two nodes share a `node_id` and do not exchange changes |
+| `birak_repair_oldest_seconds` growing | Repairs that do not complete |
+| `birak_quarantined_files > 0` | Damaged files waiting for a healthy copy |
+| `birak_last_scan_seconds > 2 × scan_interval` | Sweeps do not complete (also counts from start before the first) |
+| `birak_disk_free_bytes` low, or a fall of `birak_files` | Writes about to fail; data disappearing |
+| `rate(birak_gateway_requests_total{code="5xx"}[5m])` | Server errors seen by clients |
+| `birak_scan_skipped_files > 0` | Files on disk that are not indexed or replicated |
+| `birak_unconfigured_pollers > 0` | Peer lists disagree; replication runs one way |
+ The commit-lock
 counters answer the question a latency graph cannot: every write on a volume
 queues behind one lock, so `rate(birak_commit_lock_held_seconds_total[5m])`
 approaching 1 means the node is serialized rather than slow — a difference that
@@ -751,7 +952,12 @@ livenessProbe:
 
 ### GET /readyz
 
-Unauthenticated readiness probe. Returns 200 only after a complete successful checksum scan, while the expected storage marker is available and the scan is fresh. Returns 503 on a local scan or storage fault. It does not certify that all peers have converged.
+Unauthenticated readiness probe. Returns 200 while the expected storage marker is available, no local fault is recorded and the last complete sweep is fresh: younger than `2 × scan_interval + 1m`. A new empty replica also waits for initial admission (see above). Returns 503 on a local sweep or storage fault, including held external deletions. It does not certify that all peers have converged.
+
+Route client traffic by `/readyz`: Kubernetes readiness probes do, and
+[`deploy/haproxy.birak.cfg.example`](deploy/haproxy.birak.cfg.example) checks it
+on the peer port while sending traffic to the gateways. Open-source nginx cannot
+check it actively.
 
 ```yaml
 readinessProbe:
@@ -759,6 +965,19 @@ readinessProbe:
 ```
 
 ### Authentication
+
+Set `cluster_secret` and every endpoint above except `/healthz` and `/readyz` requires the `X-Birak-Secret` header (`/metrics` also accepts the `metrics_token`). Peers send it automatically. A node with peers must have a secret. Without one, a standalone node's sync API serves every file to anyone who can reach `listen_addr`, so keep that port off any untrusted network.
+
+```bash
+curl -H "X-Birak-Secret: shared-secret" 'http://localhost:9100/status'
+```
+
+The secret travels in a header and file bytes travel in the clear unless the
+peer API uses TLS. Between sites, or over any network you do not control, set
+`tls_cert_file` and `tls_key_file` on every node and use `https://` peer URLs;
+`peer_ca_file` adds a private CA that signed the peer certificates. A VPN such as
+WireGuard is the alternative. Birak warns at startup about `http://` peers whose
+host is not on a private network. Peer requests never follow redirects.
 
 ### Logging
 
@@ -769,11 +988,15 @@ daemon drop records and count them rather than stall. Dropped records are
 reported in the log and on exit. That makes `debug` safe to turn on for
 diagnosis, though it still costs throughput on a busy node.
 
-Set `cluster_secret` and every endpoint above except `/healthz` and `/readyz` requires the `X-Birak-Secret` header. Peers send it automatically. Without it the sync API serves every file to anyone who can reach `listen_addr`, so either set the secret or keep the port off any untrusted network.
+With `access_log: true` (the default) each gateway request is one info record
+with the gateway, method, URL without credentials, status, size, duration,
+client address and `X-Forwarded-For`. At a thousand requests a second that is
+tens of gigabytes a day: rotate the container log (the shipped compose file does)
+or set `access_log: false`; `birak_gateway_requests_total` keeps counting.
 
-```bash
-curl -H "X-Birak-Secret: shared-secret" 'http://localhost:9100/status'
-```
+Gateways and the peer API give up on a transfer that makes no progress for five
+minutes in either direction — a client that stops sending its upload or stops
+reading its download. A slow transfer that keeps moving is never cut off.
 
 ## Development
 

@@ -126,7 +126,19 @@ func (s *Store) ClearReplicaIntent(name string) error {
 }
 
 func (s *Store) ListSubtree(path string) ([]FileMeta, error) {
-	rows, err := s.db.Query("SELECT "+fileColumns+" FROM files WHERE name=? OR (name>=? AND name<?)", path, path+"/", path+"0")
+	return s.listSubtree("SELECT "+fileColumns+" FROM files WHERE name=? OR (name>=? AND name<?)", path)
+}
+
+// ListLiveSubtree is ListSubtree without tombstones. A commit on a directory
+// needs the files it may delete, not the history of ones already gone: a tree
+// removed in batches has a tombstone for every file it held by the time its
+// last commit runs.
+func (s *Store) ListLiveSubtree(path string) ([]FileMeta, error) {
+	return s.listSubtree("SELECT "+fileColumns+" FROM files WHERE deleted=0 AND (name=? OR (name>=? AND name<?))", path)
+}
+
+func (s *Store) listSubtree(query, path string) ([]FileMeta, error) {
+	rows, err := s.db.Query(query, path, path+"/", path+"0")
 	if err != nil {
 		return nil, err
 	}

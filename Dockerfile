@@ -8,8 +8,11 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /birakd ./cmd/birakd
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates tzdata
+# Upgrade the base packages at build time, so a release carries the security
+# fixes published since the base image tag was cut.
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates tzdata
 COPY --from=build /birakd /usr/local/bin/birakd
+COPY scripts/find-aws-chunked.sh /usr/local/bin/find-aws-chunked
 
 # Run as a non-root user that owns the data directories. The SFTP host key is
 # stored under /data/meta (a volume), so it persists across restarts instead of

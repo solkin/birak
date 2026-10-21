@@ -1,34 +1,54 @@
 services:
   birak:
-    # Image published by the GH Actions "Docker" workflow (Docker Hub).
-    # Override/pin via BIRAK_IMAGE in .env (e.g. solkin/birak:1.2.3).
-    image: ${BIRAK_IMAGE:-solkin/birak:latest}
+    # Image published by the GH Actions "Docker" workflow (Docker Hub). Pin a
+    # release: every node of a cluster must run the same replication protocol,
+    # and ":latest" moves on every release.
+    image: ${BIRAK_IMAGE:-solkin/birak:2.1.0}
     container_name: birak
     restart: unless-stopped
+    # After SIGTERM open transfers get 8 s to finish. Docker's default 10 s
+    # leaves almost no margin before SIGKILL.
+    stop_grace_period: 30s
 
     # The container runs as a non-root user (uid 1000). A bind-mounted host
     # data directory must be owned by this uid:gid (see README).
     user: "1000:1000"
 
+    # Every variable marked ":?" must be set in .env; compose refuses to start
+    # otherwise. Birak itself refuses empty, half-set or example credentials.
     environment:
-      BIRAK_NODE_ID: "${BIRAK_NODE_ID:-node-1}"
+      BIRAK_NODE_ID: "${BIRAK_NODE_ID:?set BIRAK_NODE_ID, unique per node}"
       BIRAK_SYNC_DIR: /data/sync
       BIRAK_META_DIR: /data/meta
+      BIRAK_LOG_LEVEL: "${BIRAK_LOG_LEVEL:-info}"
+      # One line per gateway request; set false to keep only counters.
+      BIRAK_ACCESS_LOG: "${BIRAK_ACCESS_LOG:-true}"
 
       # Cap a single upload across all gateways (bytes). 0 = unlimited.
-      BIRAK_MAX_UPLOAD_BYTES: "1073741824"
+      BIRAK_MAX_UPLOAD_BYTES: "${BIRAK_MAX_UPLOAD_BYTES:-1073741824}"
+
+      # --- Peer API (:9100): replication, /status, /metrics ---
+      BIRAK_CLUSTER_SECRET: "${BIRAK_CLUSTER_SECRET:?set BIRAK_CLUSTER_SECRET}"
+      # Comma-separated peer URLs; empty for a standalone node.
+      BIRAK_PEERS: "${BIRAK_PEERS:-}"
+      # Serve the peer API over HTTPS (mount the files, see volumes below).
+      BIRAK_TLS_CERT_FILE: "${BIRAK_TLS_CERT_FILE:-}"
+      BIRAK_TLS_KEY_FILE: "${BIRAK_TLS_KEY_FILE:-}"
+      BIRAK_PEER_CA_FILE: "${BIRAK_PEER_CA_FILE:-}"
+      # Lets Prometheus scrape /metrics without the cluster secret.
+      BIRAK_METRICS_TOKEN: "${BIRAK_METRICS_TOKEN:-}"
 
       # --- S3 gateway ---
       BIRAK_S3_ENABLED: "true"
       BIRAK_S3_LISTEN_ADDR: ":9200"
-      BIRAK_S3_ACCESS_KEY: "${S3_ACCESS_KEY}"
-      BIRAK_S3_SECRET_KEY: "${S3_SECRET_KEY}"
+      BIRAK_S3_ACCESS_KEY: "${S3_ACCESS_KEY:?set S3_ACCESS_KEY}"
+      BIRAK_S3_SECRET_KEY: "${S3_SECRET_KEY:?set S3_SECRET_KEY}"
 
       # --- HTTP UI gateway ---
       BIRAK_HTTP_ENABLED: "true"
       BIRAK_HTTP_LISTEN_ADDR: ":9400"
-      BIRAK_HTTP_USERNAME: "${HTTP_USERNAME}"
-      BIRAK_HTTP_PASSWORD: "${HTTP_PASSWORD}"
+      BIRAK_HTTP_USERNAME: "${HTTP_USERNAME:?set HTTP_USERNAME}"
+      BIRAK_HTTP_PASSWORD: "${HTTP_PASSWORD:?set HTTP_PASSWORD}"
 
       # --- Unused gateways, kept explicitly off ---
       BIRAK_WEBDAV_ENABLED: "false"
@@ -36,16 +56,37 @@ services:
 
     volumes:
       # Host files live under /srv/storage/birak; each first-level subdirectory
-      # there is an S3 bucket. Must be owned by uid:gid 1000:1000 on the host.
+      # there is an S3 bucket. Must be owned by uid:gid 1000:1000 on the host
+      # and be ONE filesystem: Birak refuses another filesystem mounted below.
       - /srv/storage/birak:/data/sync
       # Store (SQLite) + SFTP host key — keep on a named volume so they persist.
       - birak-meta:/data/meta
+      # Peer TLS material, when BIRAK_TLS_CERT_FILE etc. point into /tls.
+      # - ./tls:/tls:ro
 
     ports:
       - "127.0.0.1:9200:9200"
       - "127.0.0.1:9400:9400"
-      # Peer-sync HTTP API — publish only when forming a multi-node cluster:
+      # Peer API for a multi-node cluster. Docker publishes ports past host
+      # firewalls such as ufw: publish only with peer TLS or on a VPN address,
+      # e.g. "10.8.0.1:9100:9100".
       # - "9100:9100"
+
+    healthcheck:
+      # Liveness only; route client traffic by /readyz (see deploy/).
+      # With peer TLS enabled, probe https://127.0.0.1:9100/healthz instead.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9100/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    logging:
+      # The default json-file driver never rotates; the access log alone is
+      # tens of gigabytes a day at a thousand requests a second.
+      driver: local
+      options:
+        max-size: "100m"
+        max-file: "5"
 
     networks:
       - reverseproxy

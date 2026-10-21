@@ -4,6 +4,7 @@ import "testing"
 
 func TestReviewDuplicatePeerMustNotStartDuplicateWorkers(t *testing.T) {
 	c := DefaultConfig()
+	c.NodeID, c.ClusterSecret = "node-1", "secret"
 	c.Peers = []string{"http://node-b:9100", "http://node-b:9100"}
 	if err := c.validate(); err == nil && len(c.Peers) != 1 {
 		t.Fatal("duplicate peer URL accepted without normalization; Run starts duplicate poll/repair/reconcile workers")
@@ -12,6 +13,7 @@ func TestReviewDuplicatePeerMustNotStartDuplicateWorkers(t *testing.T) {
 
 func TestPeerNormalizationMatchesPersistentQueueKeys(t *testing.T) {
 	c := DefaultConfig()
+	c.NodeID, c.ClusterSecret = "node-1", "secret"
 	c.Peers = []string{" http://peer:9000/ "}
 	if err := c.validate(); err != nil {
 		t.Fatal(err)

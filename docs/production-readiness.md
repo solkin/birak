@@ -1,6 +1,15 @@
 # Готовность filesystem-репликации к production
 
-Состояние на 2026-10-13, выпуск [v2.0.3](releases/v2.0.3.md).
+Состояние на 2026-10-22, выпуск [v2.1.0](releases/v2.1.0.md). Проверка перед
+ограниченной эксплуатацией и её исправления — в
+[отчёте проверки](audits/limited-production-readiness-20261022.md) и
+[отчёте исправлений](audits/limited-production-fixes-20261022.md).
+
+v2.1.0 отказывается стартовать с открытыми или половинчатыми учётными данными,
+без `node_id` и `cluster_secret` при peers; не публикует удаления, выведенные
+из отсутствия файлов, сверх `sync.max_external_deletions` и не индексирует
+другую ФС ниже `sync_dir`; поддерживает TLS для peer API. Ниже — состояние
+на v2.0.3, которое эти изменения дополняют.
 Подробности изменений и воспроизводимые проверки — в
 [отчёте приёмки](audits/filesystem-production-hardening.md) и
 [отчёте APK/иконок](audits/apk-read-production-load.md).
@@ -167,15 +176,23 @@ BIRAK_BENCH_DIR=/path/to/disposable/test-volume go test -run TestBenchSyncUnderL
 3. Восстановление согласованной копии вашим backup-инструментом.
 4. Scrub budget под требуемый срок обнаружения: 10 TB при 8 MiB/s — примерно
    14 дней на один цикл без учёта конкуренции за I/O. `0` отключает scrub.
-5. Все реплики обновляются до protocol 4; release toolchain закреплён на Go 1.26.9.
+5. Все реплики обновляются до protocol 4; release toolchain закреплён на Go 1.26.10.
    Сохранить pre-upgrade metadata для отката. Legacy aliases могут остановить
    миграцию с явной ошибкой; разрешить их до запуска новой версии.
 
+6. `sync_dir` — одна ФС; peer-трафик между площадками — по TLS или VPN;
+   балансировка по `/readyz` (пример HAProxy в `deploy/`).
+
 ## Мониторинг
 
-Следить за `birak_peer_healthy`, `birak_repair_oldest_seconds`,
-`birak_quarantined_files`, `birak_last_scan_seconds`,
-`birak_last_scrub_seconds`, `birak_skipped_entries_total`.
+Следить за `birak_local_ready`, `birak_storage_ok`, `birak_peer_healthy`,
+`birak_peer_duplicate_node_id`, `birak_repair_oldest_seconds`,
+`birak_quarantined_files`, `birak_external_deletions_held`,
+`birak_last_scan_seconds`, `birak_last_scrub_seconds`,
+`birak_skipped_entries_total`, `birak_scan_skipped_files`,
+`birak_disk_free_bytes`, падением `birak_files`, долей 5xx в
+`birak_gateway_requests_total` и `birak_unconfigured_pollers`. Prometheus
+может читать `/metrics` с `metrics_token` вместо `cluster_secret`.
 `birak_replica_initialized` показывает admission новой реплики,
 `birak_scrub_bytes_per_second` — заданный бюджет,
 `birak_directory_sync_best_effort` — ослабленную гарантию fsync каталога.

@@ -21,3 +21,8 @@ func objectIdentity(path string, _ os.FileInfo) (uint64, uint64, error) {
 	}
 	return uint64(info.VolumeSerialNumber), uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow), nil
 }
+
+// Device is unknown from a Windows stat result, which carries no volume. Mount
+// detection is a no-op there: a nested volume is a junction, and the watcher
+// does not follow those.
+func Device(os.FileInfo) (uint64, bool) { return 0, false }

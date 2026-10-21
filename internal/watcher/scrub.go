@@ -41,13 +41,20 @@ func (w *Watcher) sweepFile(name string) error {
 // sweepKnownFile uses an index page already read by the sweep. A changed or
 // missing file is still rechecked under the commit lock against current state.
 func (w *Watcher) sweepKnownFile(name string, meta *store.FileMeta) error {
+	_, err := w.sweepKnown(name, meta, nil)
+	return err
+}
+
+// sweepKnown is sweepKnownFile for a sweep that collects what it finds
+// missing; it also reports whether the file had to be indexed again.
+func (w *Watcher) sweepKnown(name string, meta *store.FileMeta, deferDeletion func(string)) (bool, error) {
 	if !w.NeedsRepair(name) && meta != nil && !meta.Deleted {
 		info, err := os.Lstat(filepath.Join(w.dir, filepath.FromSlash(name)))
-		if err == nil && info.Mode().IsRegular() && info.Size() == meta.Size && info.ModTime().UnixNano() == meta.ModTime {
-			return nil
+		if err == nil && info.Mode().IsRegular() && info.Size() == meta.Size && fileops.SameModTime(w.dir, info.ModTime(), meta.ModTime) {
+			return false, nil
 		}
 	}
-	return w.scanFile(name)
+	return true, w.scanFileWith(name, deferDeletion)
 }
 
 func (w *Watcher) unchangedByStat(name string) bool {
@@ -62,8 +69,13 @@ func (w *Watcher) unchangedByStat(name string) bool {
 	if err != nil || !info.Mode().IsRegular() {
 		return false
 	}
-	return info.Size() == meta.Size && info.ModTime().UnixNano() == meta.ModTime
+	return info.Size() == meta.Size && fileops.SameModTime(w.dir, info.ModTime(), meta.ModTime)
 }
+
+// ignoreDeletion is the scrub's answer to a file it finds missing: nothing.
+// The scrub reads bytes; deciding that a file is gone is for the sweep and the
+// event path, which weigh it against everything else that is missing.
+func ignoreDeletion(string) {}
 
 // scrubLoop verifies stored bytes forever at the configured rate. It is a
 // background budget, not a deadline: it never fails readiness and never blocks
@@ -112,10 +124,12 @@ func (w *Watcher) scrubLoop(ctx context.Context) {
 				return
 			}
 			started := time.Now()
-			err := w.scanFile(meta.Name)
+			err := w.scanFileWith(meta.Name, ignoreDeletion)
 			switch {
 			case err == nil, errors.Is(err, fileops.ErrBusy), errors.Is(err, ErrIntegrity):
 				// Busy is transient and integrity is already recorded and queued.
+			case unindexable(err) != "":
+				w.logger.Debug("scrub skipped a file it cannot read", "name", meta.Name, "reason", unindexable(err), "error", err)
 			default:
 				w.logger.Warn("scrub could not verify a file", "name", meta.Name, "error", err)
 			}

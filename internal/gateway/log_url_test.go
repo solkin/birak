@@ -18,7 +18,7 @@ func TestAccessLogRedactsPresignedCredentialsWithoutChangingRequest(t *testing.T
 			logger := slog.New(slog.NewJSONHandler(&log, nil))
 			req := httptest.NewRequest("GET", "https://user:password@example.com/bucket/file?X-Amz-Credential=private-access&X-Amz-Signature=private-signature&x-aMz-sIgNaTuRe=second-signature&X-Amz-Security-Token=private-session&AWSAccessKeyId=legacy-access&Signature=legacy-signature&SecurityToken=legacy-session&uploadId=visible&partNumber=3", nil)
 			original := req.URL.String()
-			handler := LogMiddleware(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+			handler := LogMiddleware("s3", logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
 			handler.ServeHTTP(httptest.NewRecorder(), req)
 			var record map[string]any
 			if err := json.Unmarshal(log.Bytes(), &record); err != nil {

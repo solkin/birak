@@ -1,6 +1,7 @@
 package syncer
 
 import (
+	"errors"
 	"io/fs"
 	"path/filepath"
 
@@ -27,6 +28,11 @@ func (s *Syncer) initializeAdmission() {
 		// from such a seed on its next restart, even after some files arrive.
 		err := filepath.WalkDir(s.syncDir, func(path string, entry fs.DirEntry, err error) error {
 			if err != nil {
+				// An unreadable subdirectory is the sweep's to report; it
+				// says nothing about whether this node was seeded.
+				if path != s.syncDir && errors.Is(err, fs.ErrPermission) {
+					return filepath.SkipDir
+				}
 				return err
 			}
 			rel, err := filepath.Rel(s.syncDir, path)

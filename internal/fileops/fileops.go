@@ -41,6 +41,10 @@ type rootState struct {
 	readerCount       atomic.Int64
 	readBytes         atomic.Int64
 	readerRevocations atomic.Int64
+
+	// mtimeGranularity is the timestamp resolution measured for this volume,
+	// in nanoseconds; zero until measured. See SameModTime.
+	mtimeGranularity atomic.Int64
 }
 
 // LockLoad reports how much time commits have spent holding a volume's lock.
@@ -309,6 +313,12 @@ func BusyTreeLocked(dir, path string) bool {
 	return busy
 }
 
+// Rename is one commit however large src is. Moving a directory tree indexes
+// every file of it under the volume lock — tombstones for the old names, and a
+// full read and hash of each file under its new name — so the lock is held in
+// proportion to the tree's bytes. Unlike Remove it cannot be split: a half-moved
+// tree is visible to clients and peers as neither the old tree nor the new one.
+// CopyReplaceLocked (WebDAV COPY) has the same cost, plus the copy itself.
 func Rename(dir, src, dest string) error {
 	return CommitFrom(dir, []string{src}, []string{src, dest}, func() error {
 		if BusyTreeLocked(dir, src) || BusyTreeLocked(dir, dest) {
@@ -321,7 +331,14 @@ func Rename(dir, src, dest string) error {
 	})
 }
 
+// Remove deletes path. A recursive removal of a directory runs as a series of
+// bounded commits rather than one; see removeTree.
 func Remove(dir, path string, recursive bool) error {
+	if recursive {
+		if info, err := os.Lstat(path); err == nil && info.IsDir() {
+			return removeTree(dir, path)
+		}
+	}
 	return Commit(dir, []string{path}, func() error {
 		if BusyTreeLocked(dir, path) {
 			return ErrBusy
@@ -335,20 +352,26 @@ func Remove(dir, path string, recursive bool) error {
 		if err != nil {
 			return err
 		}
-		parent := filepath.Dir(path)
-		for {
-			if _, err := os.Stat(parent); err == nil {
-				break
-			} else if !os.IsNotExist(err) {
-				return err
-			}
-			if parent == filepath.Dir(parent) {
-				return os.ErrNotExist
-			}
-			parent = filepath.Dir(parent)
-		}
-		return SyncParents(parent, dir)
+		return syncRemovedParent(dir, path)
 	})
+}
+
+// syncRemovedParent persists the removal of path in its nearest surviving
+// ancestor.
+func syncRemovedParent(dir, path string) error {
+	parent := filepath.Dir(path)
+	for {
+		if _, err := os.Stat(parent); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if parent == filepath.Dir(parent) {
+			return os.ErrNotExist
+		}
+		parent = filepath.Dir(parent)
+	}
+	return SyncParents(parent, dir)
 }
 
 func Mkdir(dir, path string, mode os.FileMode, parents bool) error {

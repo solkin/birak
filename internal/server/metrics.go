@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/birak/birak/internal/fileops"
+	"github.com/birak/birak/internal/gateway"
 	"github.com/birak/birak/internal/watcher"
 )
 
@@ -25,7 +27,7 @@ var started = time.Now()
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	out := &exposition{declared: make(map[string]bool)}
+	out := &exposition{}
 
 	if maxVer, err := s.store.MaxVersion(); err == nil {
 		out.gauge("birak_max_version", "Highest version assigned by this node.", nil, float64(maxVer))
@@ -55,15 +57,40 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		if status.LastScrubAgoMS >= 0 {
 			out.gauge("birak_last_scrub_seconds", "Age of the last completed checksum verification cycle.", nil, float64(status.LastScrubAgoMS)/1000)
 		}
+		// Always present: before the first sweep completes the age counts from
+		// process start, so an alert on a sweep that never finishes fires
+		// instead of watching a series that does not exist yet.
+		lastScan := time.Since(started).Seconds()
 		if status.LastScanAgoMS >= 0 {
-			out.gauge("birak_last_scan_seconds", "Age of the last complete checksum scan.", nil, float64(status.LastScanAgoMS)/1000)
+			lastScan = float64(status.LastScanAgoMS) / 1000
 		}
+		out.gauge("birak_last_scan_seconds", "Age of the last complete sweep; time since start before the first one.", nil, lastScan)
 		// Always present, so an alert on a name collision has a series to
 		// watch before the first one happens.
-		for _, reason := range []string{watcher.SkipNameCollision, watcher.SkipInvalidName, watcher.SkipVanished} {
+		for _, reason := range watcher.SkipReasons {
 			labels := map[string]string{"reason": reason}
 			out.gauge("birak_scan_skipped_files", "Files the last complete scan found but could not index, by reason.", labels, float64(status.Skipped[reason]))
 			out.labeledCounter("birak_scan_skipped_total", "Files left unindexed since start, by reason, event batches included.", labels, float64(status.SkippedTotal[reason]))
+		}
+		out.gauge("birak_external_deletions_held", "Files missing from disk held back from being published as deletions; nonzero is a fault.", nil, float64(status.HeldExternalDeletions))
+		out.counter("birak_read_errors_total", "I/O errors reading indexed files; each quarantined the file for repair.", float64(status.ReadErrors))
+	}
+	// A full disk keeps the node ready and fails every write, so free space
+	// must be visible here and not only in a host agent somebody forgot.
+	for volume, path := range map[string]string{"sync": s.syncDir, "meta": s.metaDir} {
+		if path == "" {
+			continue
+		}
+		if free, total, err := diskSpace(path); err == nil {
+			labels := map[string]string{"volume": volume}
+			out.gauge("birak_disk_free_bytes", "Bytes available to the daemon on a volume.", labels, float64(free))
+			out.gauge("birak_disk_total_bytes", "Size of a volume.", labels, float64(total))
+		}
+	}
+	for name, classes := range gateway.RequestCounts() {
+		for class, count := range classes {
+			out.labeledCounter("birak_gateway_requests_total", "Gateway requests by status class.",
+				map[string]string{"gateway": name, "code": class}, float64(count))
 		}
 	}
 	if counter, ok := s.stats.(skipCounter); ok {
@@ -77,6 +104,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		out.counter("birak_download_resumed_bytes_total", "Bytes a resumed download did not have to transfer again.", float64(bytes))
 	}
 
+	if _, ok := s.stats.(peerIdentities); ok {
+		out.gauge("birak_unconfigured_pollers", "Nodes polling this one that it does not poll; their peer lists disagree.", nil, float64(len(s.unconfiguredPollers())))
+	}
 	if s.stats != nil {
 		for _, peer := range s.stats.PeerStats() {
 			labels := map[string]string{"peer": peer.Peer}
@@ -84,7 +114,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			out.gauge("birak_peer_healthy", "1 when a peer's stream is moving and its queue is empty.", labels, boolValue(peer.Healthy))
 			out.gauge("birak_peer_consecutive_errors", "Consecutive failed polls of a peer.", labels, float64(peer.ConsecutiveErrs))
 			out.gauge("birak_peer_pending_repairs", "Repair entries queued for a peer.", labels, float64(peer.Pending))
-			out.gauge("birak_peer_last_success_seconds", "Time since the last successful poll of a peer.", labels, float64(peer.LastSuccessAgo)/1000)
+			out.gauge("birak_peer_duplicate_node_id", "1 while a peer answers with this node's node_id; neither replicates from the other.", labels, boolValue(peer.DuplicateNodeID))
+			// A peer that never answered is as old as this process, not fresh.
+			lastSuccess := time.Since(started).Seconds()
+			if peer.LastSuccessAgo >= 0 {
+				lastSuccess = float64(peer.LastSuccessAgo) / 1000
+			}
+			out.gauge("birak_peer_last_success_seconds", "Time since the last successful poll of a peer; time since start if none.", labels, lastSuccess)
 			if peer.LastReconcileMS >= 0 {
 				out.gauge("birak_peer_last_reconcile_seconds", "Time since the last completed manifest comparison with a peer.", labels, float64(peer.LastReconcileMS)/1000)
 			}
@@ -106,14 +142,34 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	out.counter("birak_reader_revocations_total", "Open readers revoked after integrity detection.", float64(reads.Revocations))
 
 	out.gauge("birak_uptime_seconds", "Time since this process started serving.", nil, time.Since(started).Seconds())
+	if s.version != "" {
+		out.gauge("birak_build_info", "Daemon release; the value is always 1.", map[string]string{"version": s.version}, 1)
+	}
 
-	io.WriteString(w, out.body.String())
+	io.WriteString(w, out.String())
 }
 
-// exposition emits the text format, declaring each metric's HELP/TYPE once.
+// exposition emits the text format. Samples are grouped per metric whatever
+// order they were added in: the format requires one block per family, and
+// per-peer and per-reason loops naturally interleave families.
 type exposition struct {
-	body     strings.Builder
-	declared map[string]bool
+	order    []string
+	families map[string]*family
+}
+
+type family struct {
+	header  string
+	samples strings.Builder
+}
+
+func (e *exposition) String() string {
+	var b strings.Builder
+	for _, name := range e.order {
+		f := e.families[name]
+		b.WriteString(f.header)
+		b.WriteString(f.samples.String())
+	}
+	return b.String()
 }
 
 func (e *exposition) gauge(name, help string, labels map[string]string, value float64) {
@@ -129,11 +185,16 @@ func (e *exposition) labeledCounter(name, help string, labels map[string]string,
 }
 
 func (e *exposition) write(name, kind, help string, labels map[string]string, value float64) {
-	if !e.declared[name] {
-		e.declared[name] = true
-		fmt.Fprintf(&e.body, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
+	f := e.families[name]
+	if f == nil {
+		if e.families == nil {
+			e.families = make(map[string]*family)
+		}
+		f = &family{header: fmt.Sprintf("# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)}
+		e.families[name] = f
+		e.order = append(e.order, name)
 	}
-	fmt.Fprintf(&e.body, "%s%s %g\n", name, formatLabels(labels), value)
+	fmt.Fprintf(&f.samples, "%s%s %g\n", name, formatLabels(labels), value)
 }
 
 func formatLabels(labels map[string]string) string {
@@ -146,6 +207,8 @@ func formatLabels(labels map[string]string) string {
 		// for the exposition format, and %q would escape the escapes.
 		parts = append(parts, key+`="`+escapeLabel(value)+`"`)
 	}
+	// Map order is random; a stable order keeps scrapes diffable.
+	sort.Strings(parts)
 	return "{" + strings.Join(parts, ",") + "}"
 }
 

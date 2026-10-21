@@ -1,0 +1,53 @@
+# Example HAProxy front for several Birak nodes (HAProxy 2.4 or newer).
+#
+# Client traffic goes to the S3 and HTTP UI ports, but readiness lives on the
+# peer API port: a node that is still catching up, has lost its storage, or
+# holds back a mass deletion answers /readyz with 503 and leaves rotation
+# until it recovers. /readyz needs no secret.
+#
+# TLS for clients terminates here; the certificate file holds the full chain
+# and the private key. Replace the addresses with your nodes' private ones.
+
+global
+    log stdout format raw local0
+    maxconn 20000
+
+defaults
+    log global
+    mode http
+    option httplog
+    option forwardfor
+    timeout connect 5s
+    timeout client  1h
+    timeout server  1h
+    timeout http-request 30s
+    # HAProxy streams bodies in both directions; nothing is spooled to disk.
+
+frontend s3
+    bind :443 ssl crt /etc/haproxy/certs/s3.example.com.pem alpn h2,http/1.1
+    # SigV4 signs the Host header: HAProxy forwards it unchanged.
+    default_backend birak_s3
+
+frontend ui
+    bind :8443 ssl crt /etc/haproxy/certs/files.example.com.pem alpn h2,http/1.1
+    default_backend birak_ui
+
+backend birak_s3
+    balance leastconn
+    option httpchk GET /readyz
+    http-check expect status 200
+    # The check goes to the peer port. With peer TLS enabled add:
+    #   check-ssl verify required ca-file /etc/haproxy/cluster-ca.pem
+    default-server check port 9100 inter 2s fall 2 rise 3
+    server node-1 10.0.0.1:9200
+    server node-2 10.0.0.2:9200
+    server node-3 10.0.0.3:9200
+
+backend birak_ui
+    balance source
+    option httpchk GET /readyz
+    http-check expect status 200
+    default-server check port 9100 inter 2s fall 2 rise 3
+    server node-1 10.0.0.1:9400
+    server node-2 10.0.0.2:9400
+    server node-3 10.0.0.3:9400

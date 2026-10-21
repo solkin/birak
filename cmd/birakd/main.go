@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -28,10 +31,23 @@ import (
 	"github.com/birak/birak/internal/watcher"
 )
 
+// version is the release this binary was built from.
+var version = "2.1.0"
+
+// shutdownDrain is how long open transfers may finish after a stop signal.
+// It stays below Docker's default 10 s grace period, so a stop with a slow
+// download in flight ends in an orderly exit rather than SIGKILL.
+const shutdownDrain = 8 * time.Second
+
 func main() {
 	configPath := flag.String("config", "", "path to config file (optional, can use env vars instead)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Println("birakd", version)
+		return
+	}
 	if err := run(*configPath); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
@@ -58,7 +74,10 @@ func run(configPath string) error {
 	defer logs.Close()
 	logger := slog.New(logs).With("node", cfg.NodeID)
 
+	gateway.SetAccessLog(cfg.AccessLog)
+
 	logger.Info("starting birak daemon",
+		"version", version,
 		"sync_dir", cfg.SyncDir,
 		"listen_addr", cfg.ListenAddr,
 		"peers", cfg.Peers,
@@ -97,9 +116,23 @@ func run(configPath string) error {
 		defer releaseVolume()
 	}
 
-	// Warn about enabled gateways running without credentials.
+	// Warn about allowed settings that expose data.
 	for _, warning := range config.SecurityWarnings(cfg) {
 		logger.Warn("insecure configuration", "detail", warning)
+	}
+
+	// Unreadable TLS material is a configuration error, reported before any
+	// storage is opened rather than as a listener failure later.
+	if cfg.TLSCertFile != "" {
+		if _, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
+			return fmt.Errorf("load peer TLS certificate: %w", err)
+		}
+	}
+	var peerRoots *x509.CertPool
+	if cfg.PeerCAFile != "" {
+		if peerRoots, err = loadPeerRoots(cfg.PeerCAFile); err != nil {
+			return err
+		}
 	}
 
 	// Open store.
@@ -133,6 +166,7 @@ func run(configPath string) error {
 	)
 
 	w.SetScrubRate(cfg.Sync.ScrubBytesPerSecond)
+	w.SetMaxExternalDeletions(cfg.Sync.MaxExternalDeletions)
 
 	// Validate the volume and recover interrupted replacements before cleanup,
 	// indexing, or exposing any gateway.
@@ -163,6 +197,7 @@ func run(configPath string) error {
 			ReconcileInterval:      cfg.Sync.ReconcileInterval,
 			ReconcilePageBudget:    cfg.Sync.ReconcilePageBudget,
 			Secret:                 cfg.ClusterSecret,
+			RootCAs:                peerRoots,
 		},
 	)
 	// The syncer has adopted the partial downloads it can resume by now, so
@@ -172,7 +207,10 @@ func run(configPath string) error {
 	// Set up HTTP server. The syncer is attached afterwards so /status can
 	// report live per-peer replication state.
 	srv := server.New(st, cfg.SyncDir, cfg.NodeID, cfg.Ignore, server.Config{
-		Secret: cfg.ClusterSecret,
+		Secret:       cfg.ClusterSecret,
+		MetricsToken: cfg.MetricsToken,
+		MetaDir:      cfg.MetaDir,
+		Version:      version,
 	}, logger)
 	srv.SetStats(syn)
 	httpServer := &http.Server{
@@ -190,8 +228,14 @@ func run(configPath string) error {
 	}
 	components := []component{
 		{"HTTP server", func(context.Context) error {
-			logger.Info("HTTP server starting", "addr", cfg.ListenAddr)
-			if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+			logger.Info("HTTP server starting", "addr", cfg.ListenAddr, "tls", cfg.TLSCertFile != "")
+			var err error
+			if cfg.TLSCertFile != "" {
+				err = httpServer.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+			} else {
+				err = httpServer.ListenAndServe()
+			}
+			if err != http.ErrServerClosed {
 				return err
 			}
 			return nil
@@ -329,33 +373,36 @@ func run(configPath string) error {
 
 	cancel()
 
-	// Graceful HTTP shutdown.
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Every listener drains at once within one budget. One after another they
+	// could each wait out the whole budget, past the point where the container
+	// runtime kills the process.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownDrain)
 	defer shutdownCancel()
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		logger.Error("HTTP server shutdown error", "error", err)
-	}
-
-	// Graceful S3 gateway shutdown.
+	stops := map[string]func(context.Context) error{"HTTP server": httpServer.Shutdown}
 	if s3Gateway != nil {
-		if err := s3Gateway.Stop(shutdownCtx); err != nil {
-			logger.Error("S3 gateway shutdown error", "error", err)
-		}
+		stops["S3 gateway"] = s3Gateway.Stop
 	}
-
-	// Graceful WebDAV gateway shutdown.
 	if webdavGateway != nil {
-		if err := webdavGateway.Stop(shutdownCtx); err != nil {
-			logger.Error("WebDAV gateway shutdown error", "error", err)
-		}
+		stops["WebDAV gateway"] = webdavGateway.Stop
 	}
-
-	// Graceful HTTP file server shutdown.
 	if httpGateway != nil {
-		if err := httpGateway.Stop(shutdownCtx); err != nil {
-			logger.Error("HTTP file server shutdown error", "error", err)
-		}
+		stops["HTTP file server"] = httpGateway.Stop
 	}
+	var stopping sync.WaitGroup
+	for name, stop := range stops {
+		stopping.Add(1)
+		go func() {
+			defer stopping.Done()
+			if err := stop(shutdownCtx); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					logger.Warn(name+" closed transfers still open after the drain period", "drain", shutdownDrain)
+				} else {
+					logger.Error(name+" shutdown error", "error", err)
+				}
+			}
+		}()
+	}
+	stopping.Wait()
 
 	// Cancellation closes the SFTP accept loop. Join it before Stop reads its
 	// listener and waits for connections, including when another component failed
@@ -379,4 +426,20 @@ func run(configPath string) error {
 	default:
 		return nil
 	}
+}
+
+// loadPeerRoots adds a PEM bundle to the system roots for verifying peers.
+func loadPeerRoots(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read peer_ca_file: %w", err)
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil || roots == nil {
+		roots = x509.NewCertPool()
+	}
+	if !roots.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("peer_ca_file %s contains no PEM certificates", path)
+	}
+	return roots, nil
 }
