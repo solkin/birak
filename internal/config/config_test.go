@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -139,22 +140,64 @@ func TestSecurityWarnings(t *testing.T) {
 
 func TestParseBool(t *testing.T) {
 	tests := []struct {
-		input string
-		want  bool
+		input   string
+		want    bool
+		invalid bool
 	}{
-		{"true", true},
-		{"TRUE", true},
-		{"1", true},
-		{"yes", true},
-		{"false", false},
-		{"0", false},
-		{"", false},
-		{"anything", false},
+		{"true", true, false},
+		{"TRUE", true, false},
+		{"1", true, false},
+		{"yes", true, false},
+		{"false", false, false},
+		{"0", false, false},
+		{"no", false, false},
+		{" true ", true, false},
+		{"", false, true},
+		{"anything", false, true},
 	}
 	for _, tt := range tests {
-		if got := parseBool(tt.input); got != tt.want {
-			t.Errorf("parseBool(%q) = %v, want %v", tt.input, got, tt.want)
+		if got, err := parseBool(tt.input); got != tt.want || (err != nil) != tt.invalid {
+			t.Errorf("parseBool(%q) = %v, %v; want %v, invalid=%v", tt.input, got, err, tt.want, tt.invalid)
 		}
+	}
+}
+
+func TestLoadMissingExplicitFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.yaml")
+	if _, err := Load(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing explicit config must fail: %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidEnvironment(t *testing.T) {
+	for _, key := range []string{
+		"BIRAK_MAX_UPLOAD_BYTES", "BIRAK_SYNC_MAX_REPAIR_QUEUE", "BIRAK_SYNC_SCRUB_BYTES_PER_SECOND",
+		"BIRAK_SYNC_BATCH_LIMIT", "BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS", "BIRAK_SYNC_RECONCILE_PAGE_BUDGET",
+		"BIRAK_SYNC_POLL_INTERVAL", "BIRAK_SYNC_TOMBSTONE_TTL", "BIRAK_SYNC_SCAN_INTERVAL",
+		"BIRAK_SYNC_DEBOUNCE_WINDOW", "BIRAK_SYNC_REPAIR_INTERVAL", "BIRAK_SYNC_RECONCILE_INTERVAL",
+		"BIRAK_MULTIPART_MIN_PART_BYTES", "BIRAK_MULTIPART_MAX_PART_BYTES", "BIRAK_MULTIPART_MAX_PARTS",
+		"BIRAK_MULTIPART_MAX_ACTIVE_UPLOADS", "BIRAK_MULTIPART_MAX_CONCURRENT_PART_UPLOADS",
+		"BIRAK_MULTIPART_UPLOAD_TTL", "BIRAK_MULTIPART_CLEANUP_INTERVAL", "BIRAK_MULTIPART_TEMP_FILE_MAX_AGE",
+		"BIRAK_S3_ENABLED", "BIRAK_WEBDAV_ENABLED", "BIRAK_HTTP_ENABLED", "BIRAK_SFTP_ENABLED",
+	} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "invalid")
+			if _, err := Load(""); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("invalid %s must fail with its name: %v", key, err)
+			}
+		})
+	}
+	for key, value := range map[string]string{
+		"BIRAK_MAX_UPLOAD_BYTES": "-1", "BIRAK_SYNC_MAX_REPAIR_QUEUE": "-1",
+		"BIRAK_SYNC_RECONCILE_PAGE_BUDGET": "-1", "BIRAK_SYNC_DEBOUNCE_WINDOW": "-1s",
+		"BIRAK_MULTIPART_MAX_PARTS": "-1", "BIRAK_MULTIPART_UPLOAD_TTL": "-1s",
+	} {
+		t.Run(key+"/negative", func(t *testing.T) {
+			t.Setenv(key, value)
+			if _, err := Load(""); err == nil {
+				t.Fatal("negative limit accepted")
+			}
+		})
 	}
 }
 

@@ -201,27 +201,24 @@ func DefaultConfig() Config {
 	}
 }
 
-// Load reads a YAML config file (if it exists) and applies environment
-// variable overrides. The config file is optional — Birak can be configured
-// entirely through environment variables.
+// Load applies an optional YAML file and environment overrides. An explicitly
+// supplied file must exist; an invalid override must never fall back silently.
 func Load(path string) (Config, error) {
 	cfg := DefaultConfig()
 
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			if !os.IsNotExist(err) {
-				return cfg, fmt.Errorf("read config %s: %w", path, err)
-			}
-			// Config file not found — continue with defaults + env vars.
-		} else {
-			if err := yaml.Unmarshal(data, &cfg); err != nil {
-				return cfg, fmt.Errorf("parse config %s: %w", path, err)
-			}
+			return cfg, fmt.Errorf("read config %s: %w", path, err)
+		}
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			return cfg, fmt.Errorf("parse config %s: %w", path, err)
 		}
 	}
 
-	applyEnv(&cfg)
+	if err := applyEnv(&cfg); err != nil {
+		return cfg, fmt.Errorf("environment: %w", err)
+	}
 
 	if err := cfg.validate(); err != nil {
 		return cfg, fmt.Errorf("validate config: %w", err)
@@ -232,203 +229,110 @@ func Load(path string) (Config, error) {
 
 // applyEnv overrides config values with environment variables.
 // Env vars take precedence over the config file.
-func applyEnv(c *Config) {
+func applyEnv(c *Config) error {
 	for key, target := range map[string]*string{
-		"BIRAK_STORAGE_MODE": &c.StorageMode, "BIRAK_S3_TLS_CERT_FILE": &c.Gateways.S3.TLSCertFile, "BIRAK_S3_TLS_KEY_FILE": &c.Gateways.S3.TLSKeyFile,
+		"BIRAK_STORAGE_MODE":       &c.StorageMode,
+		"BIRAK_NODE_ID":            &c.NodeID,
+		"BIRAK_SYNC_DIR":           &c.SyncDir,
+		"BIRAK_META_DIR":           &c.MetaDir,
+		"BIRAK_LISTEN_ADDR":        &c.ListenAddr,
+		"BIRAK_CLUSTER_SECRET":     &c.ClusterSecret,
+		"BIRAK_LOG_LEVEL":          &c.LogLevel,
+		"BIRAK_S3_LISTEN_ADDR":     &c.Gateways.S3.ListenAddr,
+		"BIRAK_S3_ACCESS_KEY":      &c.Gateways.S3.AccessKey,
+		"BIRAK_S3_SECRET_KEY":      &c.Gateways.S3.SecretKey,
+		"BIRAK_S3_DOMAIN":          &c.Gateways.S3.Domain,
+		"BIRAK_S3_TLS_CERT_FILE":   &c.Gateways.S3.TLSCertFile,
+		"BIRAK_S3_TLS_KEY_FILE":    &c.Gateways.S3.TLSKeyFile,
+		"BIRAK_WEBDAV_LISTEN_ADDR": &c.Gateways.WebDAV.ListenAddr,
+		"BIRAK_WEBDAV_USERNAME":    &c.Gateways.WebDAV.Username,
+		"BIRAK_WEBDAV_PASSWORD":    &c.Gateways.WebDAV.Password,
+		"BIRAK_HTTP_LISTEN_ADDR":   &c.Gateways.HTTP.ListenAddr,
+		"BIRAK_HTTP_USERNAME":      &c.Gateways.HTTP.Username,
+		"BIRAK_HTTP_PASSWORD":      &c.Gateways.HTTP.Password,
+		"BIRAK_SFTP_LISTEN_ADDR":   &c.Gateways.SFTP.ListenAddr,
+		"BIRAK_SFTP_USERNAME":      &c.Gateways.SFTP.Username,
+		"BIRAK_SFTP_PASSWORD":      &c.Gateways.SFTP.Password,
+		"BIRAK_SFTP_HOST_KEY_PATH": &c.Gateways.SFTP.HostKeyPath,
 	} {
-		if value := os.Getenv(key); value != "" {
+		if raw := os.Getenv(key); raw != "" {
+			*target = raw
+		}
+	}
+	if raw := os.Getenv("BIRAK_PEERS"); raw != "" {
+		c.Peers = strings.Split(raw, ",")
+	}
+	if raw := os.Getenv("BIRAK_IGNORE"); raw != "" {
+		c.Ignore = strings.Split(raw, ",")
+	}
+	if raw := os.Getenv("BIRAK_S3_BUCKETS"); raw != "" {
+		c.Gateways.S3.Buckets = splitList(raw)
+	}
+	for key, target := range map[string]*int64{
+		"BIRAK_MAX_UPLOAD_BYTES":            &c.MaxUploadBytes,
+		"BIRAK_SYNC_MAX_REPAIR_QUEUE":       &c.Sync.MaxRepairQueue,
+		"BIRAK_SYNC_SCRUB_BYTES_PER_SECOND": &c.Sync.ScrubBytesPerSecond,
+		"BIRAK_MULTIPART_MIN_PART_BYTES":    &c.Multipart.MinPartBytes,
+		"BIRAK_MULTIPART_MAX_PART_BYTES":    &c.Multipart.MaxPartBytes,
+	} {
+		if raw := os.Getenv(key); raw != "" {
+			value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+			if err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
 			*target = value
 		}
 	}
-	if v := os.Getenv("BIRAK_NODE_ID"); v != "" {
-		c.NodeID = v
-	}
-	if v := os.Getenv("BIRAK_SYNC_DIR"); v != "" {
-		c.SyncDir = v
-	}
-	if v := os.Getenv("BIRAK_META_DIR"); v != "" {
-		c.MetaDir = v
-	}
-	if v := os.Getenv("BIRAK_LISTEN_ADDR"); v != "" {
-		c.ListenAddr = v
-	}
-	if v := os.Getenv("BIRAK_PEERS"); v != "" {
-		c.Peers = strings.Split(v, ",")
-	}
-	if v := os.Getenv("BIRAK_IGNORE"); v != "" {
-		c.Ignore = strings.Split(v, ",")
-	}
-	if v := os.Getenv("BIRAK_CLUSTER_SECRET"); v != "" {
-		c.ClusterSecret = v
-	}
-	if v := os.Getenv("BIRAK_LOG_LEVEL"); v != "" {
-		c.LogLevel = v
-	}
-	if v := os.Getenv("BIRAK_MAX_UPLOAD_BYTES"); v != "" {
-		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
-			c.MaxUploadBytes = n
-		}
-	}
-
-	// Sync settings.
-	if v := os.Getenv("BIRAK_SYNC_POLL_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			c.Sync.PollInterval = d
-		}
-	}
-	if v := os.Getenv("BIRAK_SYNC_BATCH_LIMIT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Sync.BatchLimit = n
-		}
-	}
-	if v := os.Getenv("BIRAK_SYNC_MAX_REPAIR_QUEUE"); v != "" {
-		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
-			c.Sync.MaxRepairQueue = n
-		}
-	}
-	if v := os.Getenv("BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Sync.MaxConcurrentDownloads = n
-		}
-	}
-	if v := os.Getenv("BIRAK_SYNC_TOMBSTONE_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			c.Sync.TombstoneTTL = d
-		}
-	}
-	if v := os.Getenv("BIRAK_SYNC_SCRUB_BYTES_PER_SECOND"); v != "" {
-		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
-			c.Sync.ScrubBytesPerSecond = n
-		}
-	}
-	if v := os.Getenv("BIRAK_SYNC_SCAN_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			c.Sync.ScanInterval = d
-		}
-	}
-	if v := os.Getenv("BIRAK_SYNC_DEBOUNCE_WINDOW"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			c.Sync.DebounceWindow = d
-		}
-	}
-	if v := os.Getenv("BIRAK_SYNC_REPAIR_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			c.Sync.RepairInterval = d
-		}
-	}
-	if v := os.Getenv("BIRAK_SYNC_RECONCILE_PAGE_BUDGET"); v != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
-			c.Sync.ReconcilePageBudget = n
-		}
-	}
-	if v := os.Getenv("BIRAK_SYNC_RECONCILE_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			c.Sync.ReconcileInterval = d
-		}
-	}
-
-	// S3 gateway.
-	if v := os.Getenv("BIRAK_S3_ENABLED"); v != "" {
-		c.Gateways.S3.Enabled = parseBool(v)
-	}
-	if v := os.Getenv("BIRAK_S3_LISTEN_ADDR"); v != "" {
-		c.Gateways.S3.ListenAddr = v
-	}
-	if v := os.Getenv("BIRAK_S3_ACCESS_KEY"); v != "" {
-		c.Gateways.S3.AccessKey = v
-	}
-	if v := os.Getenv("BIRAK_S3_SECRET_KEY"); v != "" {
-		c.Gateways.S3.SecretKey = v
-	}
-	if v := os.Getenv("BIRAK_S3_DOMAIN"); v != "" {
-		c.Gateways.S3.Domain = v
-	}
-	if v := os.Getenv("BIRAK_S3_BUCKETS"); v != "" {
-		c.Gateways.S3.Buckets = splitList(v)
-	}
-
-	// WebDAV gateway.
-	if v := os.Getenv("BIRAK_WEBDAV_ENABLED"); v != "" {
-		c.Gateways.WebDAV.Enabled = parseBool(v)
-	}
-	if v := os.Getenv("BIRAK_WEBDAV_LISTEN_ADDR"); v != "" {
-		c.Gateways.WebDAV.ListenAddr = v
-	}
-	if v := os.Getenv("BIRAK_WEBDAV_USERNAME"); v != "" {
-		c.Gateways.WebDAV.Username = v
-	}
-	if v := os.Getenv("BIRAK_WEBDAV_PASSWORD"); v != "" {
-		c.Gateways.WebDAV.Password = v
-	}
-
-	// HTTP file browser gateway.
-	if v := os.Getenv("BIRAK_HTTP_ENABLED"); v != "" {
-		c.Gateways.HTTP.Enabled = parseBool(v)
-	}
-	if v := os.Getenv("BIRAK_HTTP_LISTEN_ADDR"); v != "" {
-		c.Gateways.HTTP.ListenAddr = v
-	}
-	if v := os.Getenv("BIRAK_HTTP_USERNAME"); v != "" {
-		c.Gateways.HTTP.Username = v
-	}
-	if v := os.Getenv("BIRAK_HTTP_PASSWORD"); v != "" {
-		c.Gateways.HTTP.Password = v
-	}
-
-	// SFTP gateway.
-	if v := os.Getenv("BIRAK_SFTP_ENABLED"); v != "" {
-		c.Gateways.SFTP.Enabled = parseBool(v)
-	}
-	if v := os.Getenv("BIRAK_SFTP_LISTEN_ADDR"); v != "" {
-		c.Gateways.SFTP.ListenAddr = v
-	}
-	if v := os.Getenv("BIRAK_SFTP_USERNAME"); v != "" {
-		c.Gateways.SFTP.Username = v
-	}
-	if v := os.Getenv("BIRAK_SFTP_PASSWORD"); v != "" {
-		c.Gateways.SFTP.Password = v
-	}
-	if v := os.Getenv("BIRAK_SFTP_HOST_KEY_PATH"); v != "" {
-		c.Gateways.SFTP.HostKeyPath = v
-	}
-
-	envInt64Map := map[string]*int64{
-		"BIRAK_MULTIPART_MIN_PART_BYTES": &c.Multipart.MinPartBytes,
-		"BIRAK_MULTIPART_MAX_PART_BYTES": &c.Multipart.MaxPartBytes,
-	}
-	for env, ptr := range envInt64Map {
-		if v := os.Getenv(env); v != "" {
-			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
-				*ptr = n
-			}
-		}
-	}
-
-	envIntMap := map[string]*int{
+	for key, target := range map[string]*int{
+		"BIRAK_SYNC_BATCH_LIMIT":                      &c.Sync.BatchLimit,
+		"BIRAK_SYNC_MAX_CONCURRENT_DOWNLOADS":         &c.Sync.MaxConcurrentDownloads,
+		"BIRAK_SYNC_RECONCILE_PAGE_BUDGET":            &c.Sync.ReconcilePageBudget,
 		"BIRAK_MULTIPART_MAX_PARTS":                   &c.Multipart.MaxParts,
 		"BIRAK_MULTIPART_MAX_ACTIVE_UPLOADS":          &c.Multipart.MaxActiveUploads,
 		"BIRAK_MULTIPART_MAX_CONCURRENT_PART_UPLOADS": &c.Multipart.MaxConcurrentPartUploads,
-	}
-	for env, ptr := range envIntMap {
-		if v := os.Getenv(env); v != "" {
-			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
-				*ptr = n
+	} {
+		if raw := os.Getenv(key); raw != "" {
+			value, err := strconv.Atoi(strings.TrimSpace(raw))
+			if err != nil {
+				return fmt.Errorf("%s: %w", key, err)
 			}
+			*target = value
 		}
 	}
-
-	envDurationMap := map[string]*time.Duration{
+	for key, target := range map[string]*time.Duration{
+		"BIRAK_SYNC_POLL_INTERVAL":          &c.Sync.PollInterval,
+		"BIRAK_SYNC_TOMBSTONE_TTL":          &c.Sync.TombstoneTTL,
+		"BIRAK_SYNC_SCAN_INTERVAL":          &c.Sync.ScanInterval,
+		"BIRAK_SYNC_DEBOUNCE_WINDOW":        &c.Sync.DebounceWindow,
+		"BIRAK_SYNC_REPAIR_INTERVAL":        &c.Sync.RepairInterval,
+		"BIRAK_SYNC_RECONCILE_INTERVAL":     &c.Sync.ReconcileInterval,
 		"BIRAK_MULTIPART_UPLOAD_TTL":        &c.Multipart.UploadTTL,
 		"BIRAK_MULTIPART_CLEANUP_INTERVAL":  &c.Multipart.CleanupInterval,
 		"BIRAK_MULTIPART_TEMP_FILE_MAX_AGE": &c.Multipart.TempFileMaxAge,
-	}
-	for env, ptr := range envDurationMap {
-		if v := os.Getenv(env); v != "" {
-			if d, err := time.ParseDuration(strings.TrimSpace(v)); err == nil && d > 0 {
-				*ptr = d
+	} {
+		if raw := os.Getenv(key); raw != "" {
+			value, err := time.ParseDuration(strings.TrimSpace(raw))
+			if err != nil {
+				return fmt.Errorf("%s: %w", key, err)
 			}
+			*target = value
 		}
 	}
+	for key, target := range map[string]*bool{
+		"BIRAK_S3_ENABLED":     &c.Gateways.S3.Enabled,
+		"BIRAK_WEBDAV_ENABLED": &c.Gateways.WebDAV.Enabled,
+		"BIRAK_HTTP_ENABLED":   &c.Gateways.HTTP.Enabled,
+		"BIRAK_SFTP_ENABLED":   &c.Gateways.SFTP.Enabled,
+	} {
+		if raw := os.Getenv(key); raw != "" {
+			value, err := parseBool(raw)
+			if err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+			*target = value
+		}
+	}
+	return nil
 }
 
 // splitList reads a comma-separated list, dropping blanks around and between
@@ -443,9 +347,15 @@ func splitList(s string) []string {
 	return items
 }
 
-func parseBool(s string) bool {
-	s = strings.ToLower(strings.TrimSpace(s))
-	return s == "true" || s == "1" || s == "yes"
+func parseBool(s string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "1", "yes":
+		return true, nil
+	case "false", "0", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("must be true/false, yes/no, or 1/0")
+	}
 }
 
 // logLevels are the accepted log_level names, in increasing severity.
@@ -514,6 +424,9 @@ func (c *Config) validate() error {
 	}
 	if c.Sync.ScanInterval <= 0 {
 		return fmt.Errorf("sync.scan_interval must be positive")
+	}
+	if c.Sync.DebounceWindow < 0 {
+		return fmt.Errorf("sync.debounce_window must not be negative")
 	}
 	if c.Sync.ScrubBytesPerSecond < 0 {
 		return fmt.Errorf("sync.scrub_bytes_per_second must not be negative")

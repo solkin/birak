@@ -48,17 +48,14 @@ func run(configPath string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// Set up structured logger with node_id. Records are written synchronously,
-	// and some of them while the store's write mutex is held, so the level is a
-	// production setting rather than a preference: debug logs every indexed file
-	// and every cursor move, and a log consumer that stops reading stops this
-	// node's metadata writes with it.
+	// Set up structured logger with node_id.
 	// Writing is asynchronous and bounded: a log consumer that stops reading
 	// drops records instead of stopping the goroutine that logged them, which
 	// is routinely one holding the volume's commit lock.
 	logs := logging.NewAsync(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: cfg.SlogLevel(),
 	}))
+	defer logs.Close()
 	logger := slog.New(logs).With("node", cfg.NodeID)
 
 	logger.Info("starting birak daemon",
@@ -185,36 +182,23 @@ func run(configPath string) error {
 		IdleTimeout:       90 * time.Second,
 	}
 
-	// Launch all components.
-	var wg sync.WaitGroup
-
-	// HTTP server.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		logger.Info("HTTP server starting", "addr", cfg.ListenAddr)
-		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
-			logger.Error("HTTP server error", "error", err)
-			cancel()
-		}
-	}()
-
-	// Watcher.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := w.Run(ctx); err != nil {
-			logger.Error("watcher error", "error", err)
-			cancel()
-		}
-	}()
-
-	// Syncer.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		syn.Run(ctx)
-	}()
+	// Construct every component before starting any goroutine. A later gateway
+	// initialization error must not close the store under an active watcher.
+	type component struct {
+		name string
+		run  func(context.Context) error
+	}
+	components := []component{
+		{"HTTP server", func(context.Context) error {
+			logger.Info("HTTP server starting", "addr", cfg.ListenAddr)
+			if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+				return err
+			}
+			return nil
+		}},
+		{"watcher", w.Run},
+		{"syncer", func(ctx context.Context) error { syn.Run(ctx); return nil }},
+	}
 
 	// S3 Gateway (if enabled).
 	var s3Gateway *s3gw.Gateway
@@ -254,20 +238,12 @@ func run(configPath string) error {
 		if err := s3Gateway.CreateBuckets(cfg.Gateways.S3.Buckets); err != nil {
 			return fmt.Errorf("create buckets: %w", err)
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := s3Gateway.Start(ctx); err != nil {
-				logger.Error("S3 gateway error", "error", err)
-				cancel()
-			}
-		}()
+		components = append(components, component{"S3 gateway", s3Gateway.Start})
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		components = append(components, component{"multipart janitor", func(ctx context.Context) error {
 			multipart.NewJanitor(multipartStore, logger).Run(ctx)
-		}()
+			return nil
+		}})
 	}
 
 	// WebDAV Gateway (if enabled).
@@ -284,14 +260,7 @@ func run(configPath string) error {
 			},
 			logger,
 		)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := webdavGateway.Start(ctx); err != nil {
-				logger.Error("WebDAV gateway error", "error", err)
-				cancel()
-			}
-		}()
+		components = append(components, component{"WebDAV gateway", webdavGateway.Start})
 	}
 
 	// HTTP file server Gateway (if enabled).
@@ -308,14 +277,7 @@ func run(configPath string) error {
 			},
 			logger,
 		)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := httpGateway.Start(ctx); err != nil {
-				logger.Error("HTTP file server error", "error", err)
-				cancel()
-			}
-		}()
+		components = append(components, component{"HTTP file server", httpGateway.Start})
 	}
 
 	// SFTP Gateway (if enabled).
@@ -337,11 +299,22 @@ func run(configPath string) error {
 		if err != nil {
 			return fmt.Errorf("sftp gateway init: %w", err)
 		}
+		components = append(components, component{"SFTP gateway", sftpGateway.Start})
+	}
+
+	var wg sync.WaitGroup
+	componentErrors := make(chan error, 1)
+	for _, part := range components {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := sftpGateway.Start(ctx); err != nil {
-				logger.Error("SFTP gateway error", "error", err)
+			if err := part.run(ctx); err != nil {
+				err = fmt.Errorf("%s: %w", part.name, err)
+				logger.Error("component failed", "error", err)
+				select {
+				case componentErrors <- err:
+				default:
+				}
 				cancel()
 			}
 		}()
@@ -384,6 +357,11 @@ func run(configPath string) error {
 		}
 	}
 
+	// Cancellation closes the SFTP accept loop. Join it before Stop reads its
+	// listener and waits for connections, including when another component failed
+	// before SFTP finished starting.
+	wg.Wait()
+
 	// Graceful SFTP gateway shutdown.
 	if sftpGateway != nil {
 		if err := sftpGateway.Stop(shutdownCtx); err != nil {
@@ -391,11 +369,14 @@ func run(configPath string) error {
 		}
 	}
 
-	wg.Wait()
 	logger.Info("birak daemon stopped")
 	if dropped := logs.Dropped(); dropped > 0 {
 		fmt.Fprintf(os.Stderr, "warning: %d log records were dropped; the log consumer could not keep up\n", dropped)
 	}
-	logs.Close()
-	return nil
+	select {
+	case err := <-componentErrors:
+		return err
+	default:
+		return nil
+	}
 }

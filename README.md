@@ -45,7 +45,7 @@ Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browse
 
 ## Quick Start
 
-Current release: **v2.0.3**. Read the [release and upgrade notes](docs/releases/v2.0.3.md)
+Current release: **v2.0.4**. Read the [release and upgrade notes](docs/releases/v2.0.4.md)
 before upgrading an existing cluster.
 
 ### Docker
@@ -123,7 +123,12 @@ To stop — send `SIGINT` or `SIGTERM` (Ctrl+C). The daemon will gracefully fini
 
 ## Configuration
 
-Birak can be configured via a YAML file, environment variables, or both. Environment variables take precedence over the config file. The config file itself is optional — you can run Birak entirely with env vars.
+Birak can be configured via a YAML file, environment variables, or both. Environment variables take precedence over the config file. The config file itself is optional — you can run Birak entirely with env vars. When
+`-config` is supplied, that file must exist and parse successfully. Non-empty
+numeric, duration, and boolean environment overrides must be valid; malformed
+values stop startup instead of silently selecting defaults. Boolean values are
+`true`/`false`, `yes`/`no`, or `1`/`0` (case-insensitive). Component failures,
+including occupied listen ports, stop the daemon with a nonzero exit code.
 
 ### YAML config file
 
@@ -580,7 +585,7 @@ A polling cursor acknowledges receipt, not successful application. It cannot saf
 
 Run one daemon per data volume and metadata directory; OS-held leases reject a second process and are released automatically on exit. Assign a unique `node_id` to each node. Replication rejects a peer advertising the same ID as the local node. Each database has a persistent identity, while every daemon start generates a fresh **process incarnation**, returned as `X-Birak-Epoch`. Peers reset their cursors on an incarnation change and replay current metadata. This also covers a restored backup whose version counter has already caught up with an old cursor. For a replayed entry it already holds, the replaying node pays its share of one index query per page: no queue row, no `/meta` request and no download, which `birak_repairs_enqueued_total` lets you confirm.
 
-**Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 4`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds the extended clock, namespace reservations, and admission marker automatically. Release builds pin Go 1.26.9; use a patched supported Go toolchain when building from source. Keep a pre-upgrade metadata backup if a binary rollback is required.
+**Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 4`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds the extended clock, namespace reservations, and admission marker automatically. Release builds pin Go 1.26.10; use a patched supported Go toolchain when building from source. Keep a pre-upgrade metadata backup if a binary rollback is required.
 
 The version high-water mark survives deletion of file records. Both `meta_dir` and `sync_dir`, including `.birak/storage-id`, should use persistent storage and be included in a consistent backup. Losing the metadata also loses deletion history, cursors, and repair work that might have no other surviving copy.
 
