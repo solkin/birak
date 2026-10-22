@@ -3,7 +3,7 @@ services:
     # Image published by the GH Actions "Docker" workflow (Docker Hub). Pin a
     # release: every node of a cluster must run the same replication protocol,
     # and ":latest" moves on every release.
-    image: ${BIRAK_IMAGE:-solkin/birak:2.1.1}
+    image: ${BIRAK_IMAGE:-solkin/birak:2.1.2}
     container_name: birak
     restart: unless-stopped
     # After SIGTERM open transfers get 8 s to finish. Docker's default 10 s

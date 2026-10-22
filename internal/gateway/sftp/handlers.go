@@ -417,7 +417,7 @@ func (s *session) handleOpen(payload []byte) {
 		} else if os.IsPermission(err) {
 			s.sendStatus(id, sshFxPermissionDenied, "permission denied")
 		} else {
-			s.sendStatus(id, sshFxFailure, err.Error())
+			s.sendFailure(id, err)
 		}
 		return
 	}
@@ -533,7 +533,7 @@ func (s *session) handleWrite(payload []byte) {
 	if entry.appendMode {
 		info, err := entry.file.Stat()
 		if err != nil {
-			s.sendStatus(id, sshFxFailure, err.Error())
+			s.sendFailure(id, err)
 			return
 		}
 		offset = uint64(info.Size())
@@ -588,7 +588,7 @@ func (s *session) handleClose(payload []byte) {
 			closeFile = entry.closeWriter
 		}
 		if err := closeFile(); err != nil {
-			s.sendStatus(id, sshFxFailure, err.Error())
+			s.sendFailure(id, err)
 			return
 		}
 	}
@@ -623,7 +623,7 @@ func (s *session) handleRemove(payload []byte) {
 	}
 
 	if err := fileops.Remove(s.g.syncDir, fullPath, false); err != nil {
-		s.sendStatus(id, sshFxFailure, err.Error())
+		s.sendFailure(id, err)
 		return
 	}
 
@@ -653,7 +653,7 @@ func (s *session) handleMkdir(payload []byte) {
 		if os.IsExist(err) {
 			s.sendStatus(id, sshFxFailure, "already exists")
 		} else {
-			s.sendStatus(id, sshFxFailure, err.Error())
+			s.sendFailure(id, err)
 		}
 		return
 	}
@@ -687,7 +687,7 @@ func (s *session) handleRmdir(payload []byte) {
 	}
 
 	if err := fileops.Remove(s.g.syncDir, fullPath, false); err != nil {
-		s.sendStatus(id, sshFxFailure, err.Error())
+		s.sendFailure(id, err)
 		return
 	}
 
@@ -724,7 +724,7 @@ func (s *session) handleRename(payload []byte) {
 	}
 
 	if err := fileops.Rename(s.g.syncDir, oldFull, newFull); err != nil {
-		s.sendStatus(id, sshFxFailure, err.Error())
+		s.sendFailure(id, err)
 		return
 	}
 
@@ -764,7 +764,7 @@ func (s *session) handleSetstat(payload []byte) {
 		}
 		return applyAttrs(attrs, full, nil)
 	}); err != nil {
-		s.sendStatus(id, sshFxFailure, err.Error())
+		s.sendFailure(id, err)
 		return
 	}
 	s.sendStatus(id, sshFxOk, "")
@@ -807,7 +807,7 @@ func (s *session) handleFsetstat(payload []byte) {
 		})
 	}
 	if err != nil {
-		s.sendStatus(id, sshFxFailure, err.Error())
+		s.sendFailure(id, err)
 		return
 	}
 	s.sendStatus(id, sshFxOk, "")
@@ -900,7 +900,7 @@ func (s *session) handlePosixRename(id uint32, rest []byte) {
 	}
 
 	if err := fileops.Rename(s.g.syncDir, oldFull, newFull); err != nil {
-		s.sendStatus(id, sshFxFailure, err.Error())
+		s.sendFailure(id, err)
 		return
 	}
 
@@ -909,6 +909,13 @@ func (s *session) handlePosixRename(id uint32, rest []byte) {
 }
 
 // sendStatus writes an SSH_FXP_STATUS response.
+// sendFailure answers a failed operation without the error text, which names
+// absolute paths on the server; the details go to the log.
+func (s *session) sendFailure(id uint32, err error) {
+	s.g.logger.Debug("sftp operation failed", "error", err)
+	s.sendStatus(id, sshFxFailure, "operation failed")
+}
+
 func (s *session) sendStatus(id uint32, code uint32, msg string) {
 	var resp []byte
 	resp = marshalUint32(resp, id)
