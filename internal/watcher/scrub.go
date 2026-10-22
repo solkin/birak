@@ -105,15 +105,18 @@ func (w *Watcher) scrubLoop(ctx context.Context) {
 			continue
 		}
 		if len(page) == 0 {
+			// The next cycle's start is durable before this one is reported
+			// finished, so whoever sees a finished cycle also finds the position
+			// reset — after a restart included.
+			position = ""
+			if err := w.store.SetNodeValue(scrubPositionKey, position); err != nil {
+				w.logger.Error("persist scrub position failed", "error", err)
+			}
 			// An empty node completes a cycle every time it looks, so announce
 			// only cycles that actually read something. Otherwise a quiet node
 			// writes a log line a minute, forever.
 			w.finishScrubCycle(verified)
 			verified = 0
-			position = ""
-			if err := w.store.SetNodeValue(scrubPositionKey, position); err != nil {
-				w.logger.Error("persist scrub position failed", "error", err)
-			}
 			if !sleepCtx(ctx, time.Minute) {
 				return
 			}
