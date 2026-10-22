@@ -46,9 +46,10 @@ Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browse
 
 ## Quick Start
 
-Current release: **v2.1.0**. Read the [release and upgrade notes](docs/releases/v2.1.0.md)
-before upgrading an existing cluster: v2.1.0 refuses configurations that earlier
-releases accepted with only a warning.
+Current release: **v2.1.1**. Read the [release notes](docs/releases/v2.1.1.md)
+before upgrading an existing cluster. Coming from v2.0.x, read the
+[v2.1.0 upgrade notes](docs/releases/v2.1.0.md) as well: v2.1.0 refuses
+configurations that earlier releases accepted with only a warning.
 
 ### Docker
 
@@ -62,7 +63,7 @@ docker run -d \
   -v ./sync:/data/sync \
   -v ./meta:/data/meta \
   -p 127.0.0.1:9400:9400 \
-  solkin/birak:2.1.0
+  solkin/birak:2.1.1
 ```
 
 Open `http://localhost:9400` and sign in — you'll see the file browser. Upload a file, and it will appear in the `./sync` directory on your host machine.
@@ -90,7 +91,7 @@ x-common: &common
 
 services:
   node1:
-    image: solkin/birak:2.1.0
+    image: solkin/birak:2.1.1
     environment:
       <<: *common
       BIRAK_NODE_ID: "node-1"
@@ -103,7 +104,7 @@ services:
       - "127.0.0.1:9401:9400"
 
   node2:
-    image: solkin/birak:2.1.0
+    image: solkin/birak:2.1.1
     environment:
       <<: *common
       BIRAK_NODE_ID: "node-2"
@@ -836,7 +837,7 @@ curl 'http://localhost:9100/status'
 ```json
 {
   "node_id": "node-1",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "epoch": "5f3c1a9e8b2d4f60a7c1e9d3b5a7f218",
   "max_version": 42,
   "file_count": 1500,
@@ -904,7 +905,7 @@ birak_gateway_requests_total{code="2xx",gateway="s3"} 918263
 birak_peer_duplicate_node_id{peer="http://192.168.1.2:9100"} 0
 birak_external_deletions_held 0
 birak_read_errors_total 0
-birak_build_info{version="2.1.0"} 1
+birak_build_info{version="2.1.1"} 1
 ```
 
 Alert on:
