@@ -1,9 +1,12 @@
 .git
 .gitignore
 .DS_Store
+**/.DS_Store
 .idea
 .vscode
+docs/
 *.md
+*.out
 *.db
 *.db-wal
 *.db-shm

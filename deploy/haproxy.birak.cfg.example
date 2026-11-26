@@ -26,10 +26,12 @@ defaults
 frontend s3
     bind :443 ssl crt /etc/haproxy/certs/s3.example.com.pem alpn h2,http/1.1
     # SigV4 signs the Host header: HAProxy forwards it unchanged.
+    http-request set-header X-Forwarded-Proto https
     default_backend birak_s3
 
 frontend ui
     bind :8443 ssl crt /etc/haproxy/certs/files.example.com.pem alpn h2,http/1.1
+    http-request set-header X-Forwarded-Proto https
     default_backend birak_ui
 
 backend birak_s3

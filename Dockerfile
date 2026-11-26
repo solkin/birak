@@ -1,11 +1,18 @@
-FROM golang:1.26.10-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION
 # Keep symbol tables so govulncheck can distinguish linked code from unused
 # packages in required modules when checking the actual release binary.
-RUN CGO_ENABLED=0 go build -trimpath -o /birakd ./cmd/birakd
+RUN if [ -n "$VERSION" ]; then \
+      CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "-X main.version=${VERSION#v}" -o /birakd ./cmd/birakd; \
+    else \
+      CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -o /birakd ./cmd/birakd; \
+    fi
 
 FROM alpine:3.21
 # Upgrade the base packages at build time, so a release carries the security
