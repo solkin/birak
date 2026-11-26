@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/birak/birak/internal/fileops"
@@ -153,29 +155,22 @@ func (g *Gateway) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info, err := os.Stat(fullPath)
-	if os.IsNotExist(err) {
-		http.Error(w, "Not Found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		g.logger.Error("get stat failed", "path", relName, "error", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-	if info.IsDir() {
-		http.Error(w, "Not a file", http.StatusMethodNotAllowed)
-		return
-	}
-
 	f, err := fileops.OpenReader(g.syncDir, fullPath)
 	if err != nil {
+		switch {
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		case errors.Is(err, syscall.EISDIR):
+			http.Error(w, "Not a file", http.StatusMethodNotAllowed)
+			return
+		}
 		g.logger.Error("get open failed", "path", relName, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
-	info, err = f.Stat()
+	info, err := f.Stat()
 	if err != nil {
 		http.Error(w, "file unavailable", http.StatusInternalServerError)
 		return

@@ -224,16 +224,10 @@ func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info, err := os.Stat(fullPath)
-	if err != nil || info.IsDir() {
-		http.Error(w, "Not Found", http.StatusNotFound)
-		return
-	}
-
 	f, err := fileops.OpenReader(g.syncDir, fullPath)
 	if err != nil {
 		switch {
-		case errors.Is(err, fs.ErrNotExist):
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.EISDIR), invalidName(err):
 			http.Error(w, "Not Found", http.StatusNotFound)
 			return
 		case errors.Is(err, fileops.ErrUnreadable):
@@ -245,7 +239,7 @@ func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	info, err = f.Stat()
+	info, err := f.Stat()
 	if err != nil {
 		g.logger.Error("download failed", "path", rel, "error", err)
 		http.Error(w, "file unavailable", http.StatusInternalServerError)

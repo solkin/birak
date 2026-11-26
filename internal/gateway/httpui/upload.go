@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/birak/birak/internal/fileops"
 	"github.com/birak/birak/internal/watcher"
@@ -29,6 +30,9 @@ const uploadBufferSize = 1 << 20
 
 // errUploadForm marks a form that exceeds the limits above.
 var errUploadForm = errors.New("upload form exceeds its limits")
+
+// publishUpload publishes a staged upload. Tests replace it to inject EXDEV.
+var publishUpload = fileops.Publish
 
 // stagedFile is an uploaded file held in a scratch file inside the volume
 // until the whole form has arrived.
@@ -211,7 +215,13 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 			g.mutationFailed(w, "upload", p.name, err, "failed to create directory")
 			return
 		}
-		if err := fileops.Publish(g.syncDir, p.file.scratch, p.dest); err != nil {
+		err := publishUpload(g.syncDir, p.file.scratch, p.dest)
+		if errors.Is(err, syscall.EXDEV) {
+			// A subdirectory may be a separate mount, and a scratch file staged
+			// outside it cannot be renamed in; copy it next to the destination.
+			err = g.publishAcrossFilesystems(p.file, p.dest)
+		}
+		if err != nil {
 			g.mutationFailed(w, "upload", p.name, err, "failed to save file")
 			return
 		}
@@ -220,6 +230,33 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonOK(w)
+}
+
+// publishAcrossFilesystems copies a staged upload into a scratch file in the
+// destination's directory and publishes that one.
+func (g *Gateway) publishAcrossFilesystems(staged *stagedFile, dest string) error {
+	src, err := os.Open(staged.scratch)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	tmp, err := fileops.CreateTemp(filepath.Dir(dest), ".birak-tmp-upload-*")
+	if err != nil {
+		return err
+	}
+	defer fileops.ReleaseTemp(tmp)
+	_, err = io.Copy(tmp, src)
+	if err = errors.Join(err, tmp.Close()); err == nil {
+		err = fileops.Publish(g.syncDir, tmp.Name(), dest)
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	// The copy is published; the scratch file it came from is now just a
+	// leftover, which the handler's cleanup would keep as "published".
+	os.Remove(staged.scratch)
+	return nil
 }
 
 // uploadStageDir picks where an upload's scratch files go: the target

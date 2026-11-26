@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -1176,38 +1177,6 @@ func sftpSetstat(t *testing.T, ch io.ReadWriter, id uint32, path string, attrs [
 	return code
 }
 
-// TestAuthFailClosedUsernameOnly verifies that a config with only a username set
-// (no password) still requires authentication. The old "&&" logic would flip to
-// NoClientAuth and accept everyone.
-func TestAuthFailClosedUsernameOnly(t *testing.T) {
-	syncDir := t.TempDir()
-	addr := testGateway(t, syncDir, nil, "user", "")
-
-	// Wrong password must be rejected (auth is enabled, not bypassed).
-	bad := &ssh.ClientConfig{
-		User:            "user",
-		Auth:            []ssh.AuthMethod{ssh.Password("not-empty")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         2 * time.Second,
-	}
-	if _, err := ssh.Dial("tcp", addr, bad); err == nil {
-		t.Fatal("expected auth failure for wrong password when only username configured")
-	}
-
-	// Correct credential (username + empty password) is accepted.
-	good := &ssh.ClientConfig{
-		User:            "user",
-		Auth:            []ssh.AuthMethod{ssh.Password("")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         2 * time.Second,
-	}
-	conn, err := ssh.Dial("tcp", addr, good)
-	if err != nil {
-		t.Fatalf("expected success for correct credential: %v", err)
-	}
-	conn.Close()
-}
-
 // TestSetstatChmod verifies SSH_FXP_SETSTAT actually applies a permission change
 // instead of being a silent no-op.
 func TestSetstatChmod(t *testing.T) {
@@ -1378,7 +1347,52 @@ func TestMaxUploadBytesEnforced(t *testing.T) {
 	if code != sshFxFailure {
 		t.Errorf("expected FAILURE for oversized write, got %d", code)
 	}
-	sftpClose(t, ch, 4, handle)
+
+	// Overflow check: offset near math.MaxInt64 must not wrap around the limit.
+	req = nil
+	req = marshalUint32(req, 4)
+	req = marshalString(req, handle)
+	req = marshalUint64(req, math.MaxInt64)
+	req = marshalBytes(req, []byte("x"))
+	writePacket(ch, sshFxpWrite, req)
+	pktType, payload, _ = readPacket(ch)
+	if pktType != sshFxpStatus {
+		t.Fatalf("expected STATUS for overflow offset, got %d", pktType)
+	}
+	_, rest, _ = unmarshalUint32(payload)
+	code, _, _ = unmarshalUint32(rest)
+	if code != sshFxFailure {
+		t.Errorf("expected FAILURE for overflow offset, got %d", code)
+	}
+
+	sftpClose(t, ch, 5, handle)
+}
+
+func TestAuthFailClosedHalfConfigured(t *testing.T) {
+	for _, tc := range []struct {
+		name, cfgUser, cfgPass string
+		tries                  [][2]string
+	}{
+		{"username only", "user", "", [][2]string{{"user", ""}, {"user", "not-empty"}, {"", ""}}},
+		{"password only", "", "pass", [][2]string{{"", "pass"}, {"user", "pass"}, {"", ""}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := testGateway(t, t.TempDir(), nil, tc.cfgUser, tc.cfgPass)
+			for _, try := range tc.tries {
+				cfg := &ssh.ClientConfig{
+					User:            try[0],
+					Auth:            []ssh.AuthMethod{ssh.Password(try[1])},
+					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+					Timeout:         2 * time.Second,
+				}
+				conn, err := ssh.Dial("tcp", addr, cfg)
+				if err == nil {
+					conn.Close()
+					t.Fatalf("user %q with password %q was admitted", try[0], try[1])
+				}
+			}
+		})
+	}
 }
 
 // TestReaddirLargeDirectoryPaged verifies a directory with more entries than one

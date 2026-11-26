@@ -13,8 +13,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/birak/birak/internal/fileops"
 )
 
 // scratchFiles lists the atomic-write scratch files anywhere under dir.
@@ -344,5 +347,35 @@ func TestUpload_InvalidNamePublishesNothing(t *testing.T) {
 		if left := scratchFiles(t, dir); len(left) != 0 {
 			t.Fatalf("%q: scratch files left: %v", bad, left)
 		}
+	}
+}
+
+func TestUpload_PublishesAcrossFilesystems(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	crossed := 0
+	publishUpload = func(root, scratch, dest string) error {
+		if filepath.Dir(scratch) != filepath.Dir(dest) {
+			crossed++
+			return &os.LinkError{Op: "rename", Old: scratch, New: dest, Err: syscall.EXDEV}
+		}
+		return fileops.Publish(root, scratch, dest)
+	}
+	t.Cleanup(func() { publishUpload = fileops.Publish })
+
+	w := uploadForm(t, g, "/_api/upload",
+		formPart{name: "files", filename: "a.apk", value: "A"},
+		formPart{name: "relpaths", value: "mounted/bucket/a.apk"},
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if crossed == 0 {
+		t.Fatal("the test did not stage outside the destination directory")
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, "mounted", "bucket", "a.apk")); err != nil || string(data) != "A" {
+		t.Fatalf("upload across filesystems = %q, %v", data, err)
+	}
+	if left := scratchFiles(t, dir); len(left) != 0 {
+		t.Fatalf("scratch files left: %v", left)
 	}
 }

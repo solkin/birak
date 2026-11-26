@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -530,23 +531,34 @@ func (s *session) handleWrite(payload []byte) {
 		return
 	}
 
-	if entry.appendMode {
-		info, err := entry.file.Stat()
-		if err != nil {
-			s.sendFailure(id, err)
+	var writeErr error
+	exceeded := false
+	err = fileops.Do(s.g.syncDir, func() error {
+		if entry.appendMode {
+			info, statErr := entry.file.Stat()
+			if statErr != nil {
+				return statErr
+			}
+			offset = uint64(info.Size())
+		}
+		if offset > math.MaxInt64 || uint64(len(data)) > math.MaxInt64-offset {
+			exceeded = true
+			return fmt.Errorf("upload exceeds maximum size")
+		}
+		// Enforce the configured per-file upload cap: reject any write whose end offset
+		// would push the file past the limit (the same bound the other gateways apply).
+		if max := s.g.config.MaxUploadBytes; max > 0 && (offset > uint64(max) || uint64(len(data)) > uint64(max)-offset) {
+			exceeded = true
+			return fmt.Errorf("upload exceeds maximum size")
+		}
+		_, writeErr = entry.file.WriteAt([]byte(data), int64(offset))
+		return writeErr
+	})
+	if err != nil {
+		if exceeded {
+			s.sendStatus(id, sshFxFailure, "upload exceeds maximum size")
 			return
 		}
-		offset = uint64(info.Size())
-	}
-	// Enforce the configured per-file upload cap: reject any write whose end offset
-	// would push the file past the limit (the same bound the other gateways apply).
-	if max := s.g.config.MaxUploadBytes; max > 0 && int64(offset)+int64(len(data)) > max {
-		s.sendStatus(id, sshFxFailure, "upload exceeds maximum size")
-		return
-	}
-
-	err = fileops.Do(s.g.syncDir, func() error { _, err := entry.file.WriteAt([]byte(data), int64(offset)); return err })
-	if err != nil {
 		s.sendStatus(id, sshFxFailure, "write error")
 		return
 	}

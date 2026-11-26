@@ -427,7 +427,7 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 			return nil, nil, os.ErrExist
 		}
 		// Check write permission without truncating the published generation.
-		probe, err := os.OpenFile(dest, os.O_WRONLY, 0)
+		probe, err := os.OpenFile(dest, os.O_WRONLY|nonblockFlag, 0)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -522,9 +522,16 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 // seedFromCurrent fills a staged generation with the bytes it replaces, so a
 // write that does not truncate starts from the published content.
 func seedFromCurrent(f *os.File, dest string, info os.FileInfo) error {
-	source, err := os.Open(dest)
+	source, err := os.OpenFile(dest, os.O_RDONLY|nonblockFlag, 0)
 	if err != nil {
 		return err
+	}
+	if srcInfo, statErr := source.Stat(); statErr != nil {
+		source.Close()
+		return statErr
+	} else if !srcInfo.Mode().IsRegular() {
+		source.Close()
+		return fmt.Errorf("not a regular file: %s", dest)
 	}
 	if _, err := io.Copy(f, source); err != nil {
 		return errors.Join(err, source.Close())

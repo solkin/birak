@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 )
 
 var ErrUnreadable = errors.New("file is quarantined")
@@ -65,7 +66,11 @@ func OpenReader(dir, path string) (*Reader, error) {
 	}
 	info, err := f.Stat()
 	if err == nil && !info.Mode().IsRegular() {
-		err = fmt.Errorf("not a regular file: %s", path)
+		if info.IsDir() {
+			err = fmt.Errorf("is a directory: %w", syscall.EISDIR)
+		} else {
+			err = fmt.Errorf("not a regular file: %s", path)
+		}
 	}
 	if err != nil {
 		f.Close()
