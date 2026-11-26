@@ -219,18 +219,6 @@ func New(
 	logger *slog.Logger,
 	opts Options,
 ) *Syncer {
-	transport := &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
-		MaxIdleConns:          20,
-		MaxIdleConnsPerHost:   5,
-		IdleConnTimeout:       90 * time.Second,
-	}
-	if opts.RootCAs != nil {
-		transport.TLSClientConfig = &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12}
-	}
-
 	if opts.MaxConcurrentDownloads <= 0 {
 		opts.MaxConcurrentDownloads = 1
 	}
@@ -253,6 +241,23 @@ func New(
 		}
 	}
 	peers = unique
+
+	// Both small and large lanes plus poll/reconcile/meta share one transport
+	// per peer; size idle pools to match concurrency so keep-alive sockets are
+	// not churned under parallel replication.
+	idlePerHost := 2*opts.MaxConcurrentDownloads + 4
+	maxIdle := max(20, len(peers)*idlePerHost)
+	transport := &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		MaxIdleConns:          maxIdle,
+		MaxIdleConnsPerHost:   idlePerHost,
+		IdleConnTimeout:       90 * time.Second,
+	}
+	if opts.RootCAs != nil {
+		transport.TLSClientConfig = &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12}
+	}
 	w.SetRepairPeers(peers)
 	stats := make(map[string]*peerStat, len(peers))
 	wake := make(map[string]chan struct{}, len(peers))
@@ -1090,6 +1095,11 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) (completed b
 		return false, err
 	}
 	queued, scanned, pages := 0, 0, 0
+	defer func() {
+		if queued > 0 {
+			s.notifyApply(peerURL)
+		}
+	}()
 	// An interrupted pass keeps the pages it finished. A full repair queue
 	// stops every pass of a catching-up replica; restarting each one from the
 	// beginning re-read the same pages over a slow link every second.
@@ -1123,11 +1133,13 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) (completed b
 		if resp.StatusCode == http.StatusNotFound {
 			// A peer running an older build has no /manifest. Reconciliation is
 			// simply unavailable against it; the change stream still works.
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
 			s.logger.Debug("peer does not support reconciliation", "peer", peerURL)
 			return false, s.store.SetNodeValue(reconcilePositionKey(peerURL), "")
 		}
 		if resp.StatusCode != http.StatusOK {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
 			return interrupted(fmt.Errorf("manifest from %s: status %d", peerURL, resp.StatusCode))
 		}
@@ -1161,16 +1173,15 @@ func (s *Syncer) reconcileOnce(ctx context.Context, peerURL string) (completed b
 		}
 
 		n, err := s.reconcilePage(peerURL, page)
+		queued += n
 		if err != nil {
 			return interrupted(err)
 		}
-		queued += n
 		scanned += len(page)
 		after = page[len(page)-1].Name
 	}
 
 	if queued > 0 {
-		s.notifyApply(peerURL)
 		s.logger.Info("reconciliation queued repairs",
 			"peer", peerURL, "queued", queued, "scanned", scanned)
 	} else {
@@ -1215,7 +1226,10 @@ func (s *Syncer) fetchMeta(ctx context.Context, peerURL, name string) (*store.Fi
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+	}()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
@@ -1251,6 +1265,7 @@ func (s *Syncer) doRequest(ctx context.Context, reqURL string) (*http.Response, 
 		return nil, fmt.Errorf("request %s: %w", reqURL, err)
 	}
 	if err := s.checkPeerIdentity(resp); err != nil {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
 		return nil, err
 	}
@@ -1266,8 +1281,14 @@ var errSelfPeer = errors.New("peer is this node itself")
 var errDuplicateNodeID = errors.New("peer has duplicate node_id")
 
 func (s *Syncer) checkPeerIdentity(resp *http.Response) error {
-	if resp.Header.Get(server.HeaderProtocol) != server.ProtocolVersion {
-		return fmt.Errorf("incompatible replication protocol %q; require %s", resp.Header.Get(server.HeaderProtocol), server.ProtocolVersion)
+	proto := resp.Header.Get(server.HeaderProtocol)
+	// A 5xx without a protocol header (e.g. 502/503/504 from an upstream proxy)
+	// is a transient gateway/server fault, not a replication protocol mismatch.
+	if proto == "" && resp.StatusCode >= http.StatusInternalServerError {
+		return nil
+	}
+	if proto != server.ProtocolVersion {
+		return fmt.Errorf("incompatible replication protocol %q; require %s", proto, server.ProtocolVersion)
 	}
 	id := resp.Header.Get(server.HeaderNodeID)
 	if id != "" && id == s.nodeID {
@@ -1401,17 +1422,20 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		s.resumedBytes.Add(st.offset)
 		s.logger.Info("resuming download", "name", meta.Name, "from", st.offset, "size", meta.Size, "peer", peerURL)
 	case http.StatusRequestedRangeNotSatisfiable:
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		if st != nil {
 			st.invalid = true
 		}
 		return fmt.Errorf("%w: %s no longer extends past byte %d", errContentChanged, meta.Name, resumeFrom)
 	case http.StatusNotFound:
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		// The peer announced this file but cannot serve it right now — a
 		// half-finished write, or an ignore rule that differs from ours.
 		// This is retryable: silently skipping it is how a file goes missing
 		// on one node forever.
 		return fmt.Errorf("download %s: peer returned 404", meta.Name)
 	default:
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return fmt.Errorf("download %s: status %d", meta.Name, resp.StatusCode)
 	}
 	// A peer that names its content and names something else has moved on;
@@ -1568,8 +1592,13 @@ func (s *Syncer) downloadAndApply(ctx context.Context, peerURL string, meta stor
 		return fmt.Errorf("update store for %s: %w", meta.Name, err)
 	}
 
-	if err := s.watcher.RefreshPublishedLocked(meta.Name, staged, gotHash); err != nil {
-		return err
+	// PutRemote already recorded the verified metadata; only re-run the watcher
+	// refresh under the lock when integrity fences need clearing or the volume's
+	// stored timestamp diverged from meta.ModTime.
+	if damaged || s.watcher.NeedsRepair(meta.Name) || s.store.HasDamagedObjects() || !fileops.SameModTime(s.syncDir, staged.ModTime(), meta.ModTime) {
+		if err := s.watcher.RefreshPublishedLocked(meta.Name, staged, gotHash); err != nil {
+			return err
+		}
 	}
 	s.logger.Info("file synced", "name", meta.Name, "size", meta.Size, "hash", meta.Hash[:12], "peer", peerURL)
 	return nil

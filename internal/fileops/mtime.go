@@ -10,6 +10,7 @@ package fileops
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"time"
 )
@@ -87,7 +88,7 @@ func ModTimeGranularity(dir string) time.Duration {
 // is the same time.
 func SameModTime(dir string, onDisk time.Time, recorded int64) bool {
 	granularity := ModTimeGranularity(dir)
-	diff := time.Duration(onDisk.UnixNano() - recorded)
+	diff := onDisk.Sub(time.Unix(0, recorded))
 	if granularity <= time.Nanosecond {
 		return diff == 0
 	}
@@ -96,6 +97,9 @@ func SameModTime(dir string, onDisk time.Time, recorded int64) bool {
 
 func absDuration(d time.Duration) time.Duration {
 	if d < 0 {
+		if d == math.MinInt64 {
+			return math.MaxInt64
+		}
 		return -d
 	}
 	return d

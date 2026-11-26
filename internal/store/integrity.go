@@ -43,6 +43,13 @@ func (s *Store) IsDamagedObject(key string) bool {
 	return s.damagedObjects[key]
 }
 
+// HasDamagedObjects reports whether any object generation is currently fenced.
+func (s *Store) HasDamagedObjects() bool {
+	s.integrityMu.RLock()
+	defer s.integrityMu.RUnlock()
+	return len(s.damagedObjects) > 0
+}
+
 func (s *Store) IsQuarantined(name string) bool {
 	s.integrityMu.RLock()
 	defer s.integrityMu.RUnlock()

@@ -12,7 +12,11 @@ package watcher
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -26,6 +30,10 @@ const (
 	// scrubPage is how many names are verified between position checkpoints.
 	// Losing a checkpoint only re-verifies part of one page.
 	scrubPage = 64
+	// scrubChunkBytes bounds each unpaced disk read during streaming scrub so
+	// large files are smoothed to the configured bytes/sec budget instead of
+	// bursting full speed and sleeping afterwards.
+	scrubChunkBytes = 64 << 10
 )
 
 // sweepFile indexes a name, reading its bytes only when its size or timestamp
@@ -127,7 +135,10 @@ func (w *Watcher) scrubLoop(ctx context.Context) {
 				return
 			}
 			started := time.Now()
-			err := w.scanFileWith(meta.Name, ignoreDeletion)
+			err, paced := w.scrubFile(ctx, meta, started)
+			if ctx.Err() != nil {
+				return
+			}
 			switch {
 			case err == nil, errors.Is(err, fileops.ErrBusy), errors.Is(err, ErrIntegrity):
 				// Busy is transient and integrity is already recorded and queued.
@@ -138,7 +149,7 @@ func (w *Watcher) scrubLoop(ctx context.Context) {
 			}
 			position = meta.Name
 			verified++
-			if !w.spendScrubBudget(ctx, meta.Size, started) {
+			if !paced && !w.spendScrubBudget(ctx, meta.Size, started) {
 				return
 			}
 		}
@@ -146,6 +157,79 @@ func (w *Watcher) scrubLoop(ctx context.Context) {
 			w.logger.Error("persist scrub position failed", "error", err)
 		}
 	}
+}
+
+// scrubFile verifies one file, streaming multi-chunk files at the configured
+// scrub rate so large files do not burst disk I/O before sleeping.
+func (w *Watcher) scrubFile(ctx context.Context, meta store.FileMeta, started time.Time) (error, bool) {
+	if meta.Size > scrubChunkBytes && w.scrubRate.Load() > 0 {
+		path := filepath.Join(w.dir, filepath.FromSlash(meta.Name))
+		info, hash, readBytes, snapErr := w.snapshotRateLimited(ctx, path, started)
+		if ctx.Err() != nil {
+			return ctx.Err(), true
+		}
+		if snapErr == nil {
+			return w.indexPrecomputed(meta.Name, &hashed{info: info, hash: hash}, ignoreDeletion), readBytes >= meta.Size
+		}
+		// Any non-context error (missing, replaced, symlink, EIO, busy) falls
+		// through to the locked refresh path, which classifies it identically.
+		return w.indexPrecomputed(meta.Name, nil, ignoreDeletion), readBytes > 0
+	}
+	return w.scanFileWith(meta.Name, ignoreDeletion), false
+}
+
+// snapshotRateLimited hashes path in bounded chunks while pacing reads against
+// w.scrubRate and honouring ctx cancellation between chunks.
+func (w *Watcher) snapshotRateLimited(ctx context.Context, path string, started time.Time) (os.FileInfo, string, int64, error) {
+	before, err := os.Stat(path)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, "", 0, fmt.Errorf("not a regular file: %s", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if !fileops.SameGeneration(before, opened) {
+		return nil, "", 0, fileops.ErrBusy
+	}
+	h := sha256.New()
+	buf := make([]byte, scrubChunkBytes)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, "", total, err
+		}
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			h.Write(buf[:n])
+			total += int64(n)
+			if !w.spendScrubBudget(ctx, total, started) {
+				return nil, "", total, ctx.Err()
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return nil, "", total, rerr
+		}
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		return nil, "", total, err
+	}
+	if total != before.Size() || !fileops.SameGeneration(before, after) {
+		return nil, "", total, fileops.ErrBusy
+	}
+	return after, hex.EncodeToString(h.Sum(nil)), total, nil
 }
 
 // spendScrubBudget waits until the bytes just read fit the configured rate.

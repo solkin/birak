@@ -19,7 +19,11 @@ var ErrSpellingAlias = errors.New("physical namespace alias")
 // The metadata reservation handles indexed names; this also protects existing
 // files that the watcher has not indexed yet. Caller holds the volume lock.
 func CheckSpelling(dir, path string) error {
-	dir, err := filepath.EvalSymlinks(dir)
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	dir, err = filepath.EvalSymlinks(dir)
 	if err != nil {
 		return err
 	}

@@ -70,6 +70,7 @@ type stage struct {
 	dirSynced    bool
 	invalid      bool // the bytes are known to be wrong; never keep them
 	done         bool // published or discarded
+	dropPending  bool // published under fileops.Lock; drop DB record in release()
 }
 
 // loadPartials adopts the partial transfers recorded before a restart, so the
@@ -453,17 +454,13 @@ func (st *stage) discard() {
 	removeScratch(st.path)
 }
 
-// published retires a stage whose file was renamed into place.
+// published retires a stage whose file was renamed into place. The SQLite
+// partial record is dropped in release() after fileops.Lock is released.
 func (st *stage) published() {
 	st.done = true
 	st.closeFile()
 	if st.recorded {
-		if err := st.s.store.DropPartialDownload(st.meta.Name); err != nil {
-			// A leftover record names a file that no longer exists; the next
-			// start drops it.
-			st.s.logger.Warn("drop partial download failed", "name", st.meta.Name, "error", err)
-		}
-		st.s.forgetPartial(st.meta.Name)
+		st.dropPending = true
 	}
 	fileops.ReleaseTempPath(st.path)
 }
@@ -472,6 +469,15 @@ func (st *stage) published() {
 // a durable record of how far it got; anything else is discarded.
 func (st *stage) release() {
 	if st.done {
+		if st.dropPending {
+			st.dropPending = false
+			if err := st.s.store.DropPartialDownload(st.meta.Name); err != nil {
+				// A leftover record names a file that no longer exists; the next
+				// start drops it.
+				st.s.logger.Warn("drop partial download failed", "name", st.meta.Name, "error", err)
+			}
+			st.s.forgetPartial(st.meta.Name)
+		}
 		return
 	}
 	if !st.invalid && st.resumable && st.offset > 0 && st.offset < st.meta.Size {

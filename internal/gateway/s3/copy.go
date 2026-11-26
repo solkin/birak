@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
@@ -235,7 +236,10 @@ func (g *Gateway) checkSourceHash(src *sourceObject, sum hash.Hash) error {
 // sourceCheckTTL is how long a source generation verified in full stays
 // trusted for the parts of a multipart copy. A copy of a large object takes
 // minutes; bytes that rot later are the scrub's to find.
-const sourceCheckTTL = time.Hour
+const (
+	sourceCheckTTL  = time.Hour
+	maxSourceChecks = 4096
+)
 
 // sourceChecks remembers source generations verified against the index, so a
 // multipart copy reads its source in full once rather than once per part, and
@@ -254,8 +258,9 @@ type sourceCheck struct {
 
 // verify runs check once for the generation key and returns its outcome to
 // every caller asking within the TTL. A failure is not remembered: the next
-// part checks again.
-func (c *sourceChecks) verify(key string, check func() error) error {
+// part checks again. Waiters honor ctx cancellation instead of blocking forever
+// behind another request's verification.
+func (c *sourceChecks) verify(ctx context.Context, key string, check func() error) error {
 	now := time.Now()
 	c.mu.Lock()
 	if c.checks == nil {
@@ -272,8 +277,32 @@ func (c *sourceChecks) verify(key string, check func() error) error {
 	}
 	if existing, ok := c.checks[key]; ok {
 		c.mu.Unlock()
-		<-existing.done
-		return existing.err
+		select {
+		case <-existing.done:
+			return existing.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	// Cap cache growth under high-churn workloads by evicting the oldest
+	// completed entry when at capacity.
+	for len(c.checks) >= maxSourceChecks {
+		var oldestKey string
+		var oldestAt time.Time
+		for k, entry := range c.checks {
+			select {
+			case <-entry.done:
+				if oldestKey == "" || entry.at.Before(oldestAt) {
+					oldestKey = k
+					oldestAt = entry.at
+				}
+			default:
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(c.checks, oldestKey)
 	}
 	pending := &sourceCheck{done: make(chan struct{}), at: now}
 	c.checks[key] = pending
@@ -292,7 +321,7 @@ func (c *sourceChecks) verify(key string, check func() error) error {
 // verifySource checks a whole source generation against its recorded
 // checksum, once per generation (see sourceChecks). A part copies only a range,
 // so this is what keeps a multipart copy from re-publishing damaged bytes.
-func (g *Gateway) verifySource(src *sourceObject) error {
+func (g *Gateway) verifySource(ctx context.Context, src *sourceObject) error {
 	if _, ok, err := g.indexedHash(src); err != nil || !ok {
 		return err
 	}
@@ -300,7 +329,7 @@ func (g *Gateway) verifySource(src *sourceObject) error {
 	if err != nil {
 		return err
 	}
-	return g.sourceChecks.verify(key, func() error {
+	return g.sourceChecks.verify(ctx, key, func() error {
 		sum := sha256.New()
 		buf := make([]byte, copyBufferSize)
 		if _, err := io.CopyBuffer(sum, io.NewSectionReader(src.file, 0, src.info.Size()), buf); err != nil {
@@ -482,9 +511,6 @@ func (g *Gateway) stageCopy(src *sourceObject, tmp *os.File) error {
 	if err == nil && n != src.info.Size() {
 		err = errSourceChanged
 	}
-	if err == nil {
-		err = tmp.Sync()
-	}
 	if err = errors.Join(err, tmp.Close()); err != nil {
 		return err
 	}
@@ -634,7 +660,7 @@ func (g *Gateway) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, b
 		writeObjectFailure(w, failure)
 		return
 	}
-	if err := g.verifySource(src); err != nil {
+	if err := g.verifySource(r.Context(), src); err != nil {
 		g.copyFailure(w, err, srcBucket, srcKey, bucket, key)
 		return
 	}

@@ -4,8 +4,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/birak/birak/internal/fileops"
+	"github.com/birak/birak/internal/gateway"
 )
 
 func TestDeleteAndMoveRespectDescendantLocks(t *testing.T) {
@@ -85,5 +90,55 @@ func TestCopyDirSkipsScratchAndGetSetsNoSniff(t *testing.T) {
 	getResp.Body.Close()
 	if got := getResp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+}
+
+func TestCopyCleansStageOnFailureAndSweepRespectsActiveStage(t *testing.T) {
+	g, ts := newTestGateway(t, nil, "", "")
+	g.config.MaxUploadBytes = 8
+	if err := os.WriteFile(filepath.Join(g.syncDir, "big.bin"), make([]byte, 32), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doReq(t, "COPY", ts.URL+"/big.bin", "", map[string]string{"Destination": ts.URL + "/dst.bin"})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("COPY over limit = %d, want 413", resp.StatusCode)
+	}
+
+	entries, err := os.ReadDir(g.syncDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".birak-tmp-replace-") {
+			t.Fatalf("leftover replace stage dir after failed COPY: %s", e.Name())
+		}
+	}
+
+	// Active replace stage dir must survive SweepTempFiles while an unretained stale one is swept.
+	activeStage, err := os.MkdirTemp(g.syncDir, ".birak-tmp-replace-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleStage, err := os.MkdirTemp(g.syncDir, ".birak-tmp-replace-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	for _, p := range []string{activeStage, staleStage} {
+		if err := os.Chtimes(p, past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fileops.RetainTemp(activeStage)
+	defer fileops.ReleaseTempPath(activeStage)
+
+	gateway.SweepTempFiles(g.syncDir, time.Hour, g.logger)
+	if _, err := os.Stat(activeStage); err != nil {
+		t.Fatalf("retained replace stage was swept: %v", err)
+	}
+	if _, err := os.Stat(staleStage); !os.IsNotExist(err) {
+		t.Fatalf("stale replace stage was not swept: %v", err)
 	}
 }

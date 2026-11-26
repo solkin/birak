@@ -214,8 +214,14 @@ func (w *Watcher) validateStorageLocked() error {
 	if err := w.checkStorageLocked(); err != nil {
 		return err
 	}
-	if err := fileops.RecoverLocked(w.dir); err != nil {
-		return err
+	var recoverErr error
+	if w.recovered {
+		recoverErr = fileops.RecoverIfNeededLocked(w.dir)
+	} else {
+		recoverErr = fileops.RecoverLocked(w.dir)
+	}
+	if recoverErr != nil {
+		return recoverErr
 	}
 	if !w.recovered {
 		if err := fileops.CheckOrphanedBackups(w.dir, w.shouldIgnore); err != nil {

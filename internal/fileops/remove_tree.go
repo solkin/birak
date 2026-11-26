@@ -189,11 +189,14 @@ func removeEmptyTreeLocked(dir, path string) error {
 	for i := len(dirs) - 1; i >= 0; i-- {
 		// rmdir is the emptiness check: a directory holding something new
 		// stays, and so does every directory above it.
-		if err := os.Remove(dirs[i]); err != nil && !gone(err) && changed == nil {
+		if err := os.Remove(dirs[i]); err != nil && !gone(err) {
+			if changed != nil && (errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST)) {
+				continue
+			}
 			return err
 		}
 	}
-	return errors.Join(changed, syncRemovedParent(dir, path))
+	return errors.Join(changed, SyncSurvivingParent(path, dir))
 }
 
 // writerInTreeLocked reports an open writer for path or anything below it. It

@@ -45,6 +45,9 @@ type rootState struct {
 	// mtimeGranularity is the timestamp resolution measured for this volume,
 	// in nanoseconds; zero until measured. See SameModTime.
 	mtimeGranularity atomic.Int64
+	// recoveryClean is true once RecoverLocked has confirmed no pending
+	// replacement journals remain on disk, cleared before a new journal is written.
+	recoveryClean atomic.Bool
 }
 
 // LockLoad reports how much time commits have spent holding a volume's lock.
@@ -282,9 +285,13 @@ func ResolvePath(path string) (string, error) {
 
 // BusyLocked checks both names and inode identity (including hard links).
 func BusyLocked(dir, path string) bool {
+	writers := root(dir).writers
+	if len(writers) == 0 {
+		return false
+	}
 	abs := canonical(path)
 	info, _ := os.Stat(path)
-	for _, w := range root(dir).writers {
+	for _, w := range writers {
 		if abs == w.path || path == w.requested || (info != nil && w.original != nil && os.SameFile(info, w.original)) {
 			return true
 		}
@@ -292,11 +299,15 @@ func BusyLocked(dir, path string) bool {
 	return false
 }
 func BusyTreeLocked(dir, path string) bool {
+	writers := root(dir).writers
+	if len(writers) == 0 {
+		return false
+	}
 	abs := canonical(path)
 	if BusyLocked(dir, path) {
 		return true
 	}
-	for _, w := range root(dir).writers {
+	for _, w := range writers {
 		if strings.HasPrefix(w.path, abs+string(filepath.Separator)) || strings.HasPrefix(w.requested, path+string(filepath.Separator)) {
 			return true
 		}
@@ -352,26 +363,8 @@ func Remove(dir, path string, recursive bool) error {
 		if err != nil {
 			return err
 		}
-		return syncRemovedParent(dir, path)
+		return SyncSurvivingParent(path, dir)
 	})
-}
-
-// syncRemovedParent persists the removal of path in its nearest surviving
-// ancestor.
-func syncRemovedParent(dir, path string) error {
-	parent := filepath.Dir(path)
-	for {
-		if _, err := os.Stat(parent); err == nil {
-			break
-		} else if !os.IsNotExist(err) {
-			return err
-		}
-		if parent == filepath.Dir(parent) {
-			return os.ErrNotExist
-		}
-		parent = filepath.Dir(parent)
-	}
-	return SyncParents(parent, dir)
 }
 
 func Mkdir(dir, path string, mode os.FileMode, parents bool) error {
@@ -611,6 +604,10 @@ func SyncParents(dir, boundary string) error {
 	current, err := filepath.Abs(canonical(dir))
 	if err != nil {
 		return err
+	}
+	rel, err := filepath.Rel(base, current)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("directory is outside sync root")
 	}
 	for {
 		if err := SyncDir(current); err != nil {

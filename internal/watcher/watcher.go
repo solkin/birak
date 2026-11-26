@@ -299,14 +299,15 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 			// If a new directory was created, add it to fsnotify and scan for
 			// files that might have been created before we started watching.
+			// Use Lstat so symlinks to directories are never followed and watched.
 			if event.Has(fsnotify.Create) {
-				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+				if info, err := os.Lstat(event.Name); err == nil && info.IsDir() {
 					if _, addErr := w.addDirsRecursive(fsw, event.Name); addErr != nil {
 						w.logger.Error("failed to watch new directory", "path", relPath, "error", addErr)
 					}
 					// Walk the new directory to find files created before we started watching.
 					_ = filepath.WalkDir(event.Name, func(path string, d fs.DirEntry, walkErr error) error {
-						if walkErr != nil || d.IsDir() {
+						if walkErr != nil {
 							return nil
 						}
 						rp, rpErr := filepath.Rel(w.dir, path)
@@ -314,17 +315,24 @@ func (w *Watcher) Run(ctx context.Context) error {
 							return nil
 						}
 						name := filepath.ToSlash(rp)
-						if !w.shouldIgnore(name) {
-							pending[name] = struct{}{}
+						if name != "." && w.shouldIgnore(name) {
+							if d.IsDir() {
+								return fs.SkipDir
+							}
+							return nil
 						}
+						if d.IsDir() {
+							return nil
+						}
+						pending[name] = struct{}{}
 						return nil
 					})
 					// Continue processing — don't add directory itself to pending.
 				}
 			}
 
-			// For regular files, add to pending debounce set.
-			if info, err := os.Stat(event.Name); err != nil || !info.IsDir() {
+			// For regular files (and non-directory symlinks), add to pending debounce set.
+			if info, err := os.Lstat(event.Name); err != nil || !info.IsDir() {
 				pending[relPath] = struct{}{}
 			}
 
@@ -754,13 +762,21 @@ func (w *Watcher) scanFile(name string) error { return w.scanFileWith(name, nil)
 // to validate the volume is returned as a storageFault, so it is never
 // counted against the one name being indexed.
 func (w *Watcher) scanFileWith(name string, deferDeletion func(string)) error {
-	opts := indexOptions{deferDeletion: deferDeletion}
 	path := filepath.Join(w.dir, filepath.FromSlash(name))
 	// A file that is not a stable regular file right now — missing, replaced,
 	// a directory, a symlink, unreadable, or held by a writer — is read again
 	// by the locked path, which classifies all of that.
+	var pre *hashed
 	if info, hash, err := snapshotFile(path); err == nil {
-		opts.published = map[string]*hashed{name: {info: info, hash: hash}}
+		pre = &hashed{info: info, hash: hash}
+	}
+	return w.indexPrecomputed(name, pre, deferDeletion)
+}
+
+func (w *Watcher) indexPrecomputed(name string, pre *hashed, deferDeletion func(string)) error {
+	opts := indexOptions{deferDeletion: deferDeletion}
+	if pre != nil {
+		opts.published = map[string]*hashed{name: pre}
 	}
 	unlock := fileops.Lock(w.dir)
 	defer unlock()

@@ -38,6 +38,7 @@ type openFile interface {
 }
 
 type handleEntry struct {
+	mu          sync.Mutex
 	path        string
 	file        openFile // regular-file handle (SSH_FXP_OPEN)
 	dir         *os.File // directory handle (SSH_FXP_OPENDIR), read incrementally
@@ -539,34 +540,31 @@ func (s *session) handleWrite(payload []byte) {
 		return
 	}
 
-	var writeErr error
-	exceeded := false
-	err = fileops.Do(s.g.syncDir, func() error {
-		if entry.appendMode {
-			info, statErr := entry.file.Stat()
-			if statErr != nil {
-				return statErr
-			}
-			offset = uint64(info.Size())
-		}
-		if offset > math.MaxInt64 || uint64(len(data)) > math.MaxInt64-offset {
-			exceeded = true
-			return fmt.Errorf("upload exceeds maximum size")
-		}
-		// Enforce the configured per-file upload cap: reject any write whose end offset
-		// would push the file past the limit (the same bound the other gateways apply).
-		if max := s.g.config.MaxUploadBytes; max > 0 && (offset > uint64(max) || uint64(len(data)) > uint64(max)-offset) {
-			exceeded = true
-			return fmt.Errorf("upload exceeds maximum size")
-		}
-		_, writeErr = entry.file.WriteAt([]byte(data), int64(offset))
-		return writeErr
-	})
-	if err != nil {
-		if exceeded {
-			s.sendStatus(id, sshFxFailure, "upload exceeds maximum size")
+	// Writable handles write to a private staged temp file that only becomes
+	// visible on CLOSE, so per-handle locking suffices and chunk writes never
+	// contend on the global volume mutex.
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	if entry.appendMode {
+		info, statErr := entry.file.Stat()
+		if statErr != nil {
+			s.sendStatus(id, sshFxFailure, "write error")
 			return
 		}
+		offset = uint64(info.Size())
+	}
+	if offset > math.MaxInt64 || uint64(len(data)) > math.MaxInt64-offset {
+		s.sendStatus(id, sshFxFailure, "upload exceeds maximum size")
+		return
+	}
+	// Enforce the configured per-file upload cap: reject any write whose end offset
+	// would push the file past the limit (the same bound the other gateways apply).
+	if max := s.g.config.MaxUploadBytes; max > 0 && (offset > uint64(max) || uint64(len(data)) > uint64(max)-offset) {
+		s.sendStatus(id, sshFxFailure, "upload exceeds maximum size")
+		return
+	}
+	if _, err := entry.file.WriteAt([]byte(data), int64(offset)); err != nil {
 		s.sendStatus(id, sshFxFailure, "write error")
 		return
 	}
@@ -825,7 +823,9 @@ func (s *session) handleFsetstat(payload []byte) {
 	}
 	apply := func() error { return applyAttrs(attrs, entry.path, entry.file, s.g.config.MaxUploadBytes) }
 	if entry.closeWriter != nil {
-		err = fileops.Do(s.g.syncDir, apply)
+		entry.mu.Lock()
+		err = apply()
+		entry.mu.Unlock()
 	} else {
 		err = fileops.Commit(s.g.syncDir, []string{entry.path}, func() error {
 			if fileops.BusyLocked(s.g.syncDir, entry.path) {

@@ -99,11 +99,17 @@ type Store struct {
 
 	// Queue summaries are read by monitoring, not by replication, and cost a
 	// scan. They are remembered under their own mutex so a scrape never queues
-	// behind a write, and dropped whenever the queue changes.
+	// behind a write, and dropped whenever the queue changes (or after a short
+	// TTL when non-empty so Due and OldestAgeMS stay fresh).
 	statsMu    sync.Mutex
 	statsCache RepairStats
 	statsValid bool
+	statsAt    time.Time
 	statsGen   uint64
+	// lastAck deduplicates identical idle /changes peer ack observations so
+	// repeated polls at the same (epoch, version) do not trigger synchronous
+	// SQLite writes every poll interval. Guarded by s.mu.
+	lastAck map[string]ackRecord
 	// queueSize is the per-peer queue length, kept up to date as rows come and
 	// go. Counting rows to answer "is there room for one more" turned a bulk
 	// sync into O(n²): every new name scanned the whole queue first.
@@ -131,6 +137,17 @@ func (s *Store) SetRepairLimit(limit int64) {
 	s.repairLimit = max(0, limit)
 }
 
+type ackRecord struct {
+	epoch   string
+	version int64
+	at      time.Time
+}
+
+const (
+	repairStatsTTL = time.Second
+	ackDedupeTTL   = 30 * time.Second
+)
+
 // New creates a new Store, initializing the database schema.
 func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	// Pragmas belong in the DSN, not in db.Exec: a pooled Exec applies the
@@ -138,10 +155,12 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	// connection on the defaults. Setting them here makes them per-connection
 	// invariants, which is what lets the pool hold more than one connection.
 	dsn := "file:" + url.PathEscape(dbPath) +
-		"?_pragma=journal_mode(WAL)" +
+		"?_txlock=immediate" +
+		"&_pragma=journal_mode(WAL)" +
 		"&_pragma=synchronous(FULL)" +
 		"&_pragma=busy_timeout(10000)" +
-		"&_pragma=cache_size(-64000)"
+		"&_pragma=cache_size(-8000)" +
+		"&_pragma=journal_size_limit(67108864)"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -156,7 +175,15 @@ func New(dbPath string, logger *slog.Logger) (*Store, error) {
 	db.SetMaxIdleConns(8)
 	db.SetConnMaxLifetime(0)
 
-	s := &Store{db: db, logger: logger, repairLimit: DefaultRepairLimit, queueSize: make(map[string]int64), quarantined: make(map[string]bool), damagedObjects: make(map[string]bool)}
+	s := &Store{
+		db:             db,
+		logger:         logger,
+		repairLimit:    DefaultRepairLimit,
+		queueSize:      make(map[string]int64),
+		quarantined:    make(map[string]bool),
+		damagedObjects: make(map[string]bool),
+		lastAck:        make(map[string]ackRecord),
+	}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -255,7 +282,7 @@ func (s *Store) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_files_version ON files(version);
 	CREATE INDEX IF NOT EXISTS idx_files_deleted_name ON files(deleted, name);
-	CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
+	DROP INDEX IF EXISTS idx_files_name;
 
 	CREATE TABLE IF NOT EXISTS namespace_names (folded TEXT PRIMARY KEY, name TEXT NOT NULL);
 	CREATE TABLE IF NOT EXISTS local_intents (path TEXT PRIMARY KEY);
@@ -288,6 +315,7 @@ func (s *Store) migrate() error {
 		PRIMARY KEY (peer_id, name)
 	);
 	CREATE INDEX IF NOT EXISTS idx_repair_due ON repair_queue(peer_id, next_attempt);
+	CREATE INDEX IF NOT EXISTS idx_repair_name ON repair_queue(name);
 
 	-- Downloads interrupted part-way, kept so the next attempt asks the peer
 	-- only for the rest. One per name: a newer state replaces an older one.
@@ -830,13 +858,20 @@ func (s *Store) RecordAckEpoch(peerID, epoch string, version int64) error {
 	if peerID == "" {
 		return nil
 	}
+	now := time.Now()
+	if prev, ok := s.lastAck[peerID]; ok && prev.epoch == epoch && prev.version == version && now.Sub(prev.at) < ackDedupeTTL {
+		return nil
+	}
 	_, err := s.db.Exec(`
 		INSERT INTO peer_acks (peer_id, acked_version, updated_at, epoch) VALUES (?, ?, ?, ?)
 		ON CONFLICT(peer_id) DO UPDATE SET
 			acked_version = excluded.acked_version,
 			epoch = excluded.epoch,
 			updated_at    = excluded.updated_at
-	`, peerID, version, time.Now().UnixNano(), epoch)
+	`, peerID, version, now.UnixNano(), epoch)
+	if err == nil {
+		s.lastAck[peerID] = ackRecord{epoch: epoch, version: version, at: now}
+	}
 	return err
 }
 
@@ -1244,9 +1279,9 @@ func (s *Store) DeferRepairItem(item RepairItem, retryAfter time.Duration, cause
 // what it just wrote.
 func (s *Store) RepairQueueStats() (RepairStats, error) {
 	s.statsMu.Lock()
-	cached, valid, generation := s.statsCache, s.statsValid, s.statsGen
+	cached, valid, cachedAt, generation := s.statsCache, s.statsValid, s.statsAt, s.statsGen
 	s.statsMu.Unlock()
-	if valid {
+	if valid && (cached.Total == 0 || time.Since(cachedAt) < repairStatsTTL) {
 		return cached, nil
 	}
 
@@ -1258,7 +1293,7 @@ func (s *Store) RepairQueueStats() (RepairStats, error) {
 	}
 	s.statsMu.Lock()
 	if s.statsGen == generation {
-		s.statsCache, s.statsValid = st, true
+		s.statsCache, s.statsValid, s.statsAt = st, true, time.Now()
 	}
 	s.statsMu.Unlock()
 	return st, nil
@@ -1299,32 +1334,35 @@ func (s *Store) GetFilesBatch(names []string) (map[string]*FileMeta, error) {
 		return nil, nil
 	}
 
-	placeholders := make([]string, len(names))
-	args := make([]interface{}, len(names))
-	for i, n := range names {
-		placeholders[i] = "?"
-		args[i] = n
-	}
-
-	query := "SELECT " + fileColumns + " FROM files WHERE name IN (" +
-		strings.Join(placeholders, ",") + ")"
-
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("get files batch: %w", err)
-	}
-	defer rows.Close()
-
 	result := make(map[string]*FileMeta, len(names))
-	for rows.Next() {
-		f, err := scanFile(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan file row: %w", err)
+	for start := 0; start < len(names); start += 500 {
+		chunk := names[start:min(start+500, len(names))]
+		args := make([]any, len(chunk))
+		for i, n := range chunk {
+			args[i] = n
 		}
-		entry := f
-		result[f.Name] = &entry
+
+		query := "SELECT " + fileColumns + " FROM files WHERE name IN (?" +
+			strings.Repeat(",?", len(chunk)-1) + ")"
+
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("get files batch: %w", err)
+		}
+		for rows.Next() {
+			f, err := scanFile(rows)
+			if err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan file row: %w", err)
+			}
+			entry := f
+			result[f.Name] = &entry
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return nil, err
+		}
 	}
-	return result, rows.Err()
+	return result, nil
 }
 
 // ListNonDeleted returns non-deleted file entries in name order, starting

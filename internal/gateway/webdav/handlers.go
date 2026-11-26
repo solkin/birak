@@ -272,7 +272,12 @@ func (g *Gateway) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	tmpFile.Close()
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		g.logger.Error("put close failed", "path", relName, "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 
 	if err := fileops.Publish(g.syncDir, tmpPath, fullPath); err != nil {
 		os.Remove(tmpPath)
@@ -522,7 +527,34 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Build the copy outside the volume lock so large trees do not block
+	// concurrent writes; retain the stage directory against the temp janitor.
+	stage, err := os.MkdirTemp(filepath.Dir(dstFull), ".birak-tmp-replace-*")
+	if err != nil {
+		g.logger.Error("copy stage failed", "from", srcRel, "to", dstRel, "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	fileops.RetainTemp(stage)
+	defer fileops.ReleaseTempPath(stage)
+
 	cp := &copier{limit: g.config.MaxUploadBytes, rootDir: g.syncDir, ignorePatterns: g.ignorePatterns}
+	payload := filepath.Join(stage, "payload")
+	var stageErr error
+	if srcInfo.IsDir() {
+		stageErr = cp.copyDir(srcFull, payload)
+	} else {
+		stageErr = cp.copyFile(srcFull, payload)
+	}
+	if stageErr != nil {
+		_ = os.RemoveAll(stage)
+		g.logger.Error("copy failed", "from", srcRel, "to", dstRel, "error", stageErr)
+		status := replacementErrorStatus(stageErr)
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+
+	handedOff := false
 	copyErr := fileops.CommitFrom(g.syncDir, []string{srcFull}, []string{dstFull}, func() error {
 		exists, err := checkReplacementLocked(srcFull, dstFull, overwrite)
 		if err != nil {
@@ -532,16 +564,15 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 		if fileops.BusyTreeLocked(g.syncDir, dstFull) || fileops.BusyTreeLocked(g.syncDir, srcFull) {
 			return fileops.ErrBusy
 		}
-		if err := fileops.CopyReplaceLocked(g.syncDir, dstFull, func(stage string) error {
-			if srcInfo.IsDir() {
-				return cp.copyDir(srcFull, stage)
-			}
-			return cp.copyFile(srcFull, stage)
-		}); err != nil {
+		handedOff = true
+		if err := fileops.ReplaceStagedLocked(g.syncDir, stage, dstFull); err != nil {
 			return err
 		}
 		return fileops.SyncParents(filepath.Dir(dstFull), g.syncDir)
 	})
+	if !handedOff {
+		_ = os.RemoveAll(stage)
+	}
 	if copyErr != nil {
 		g.logger.Error("copy failed", "from", srcRel, "to", dstRel, "error", copyErr)
 		status := replacementErrorStatus(copyErr)
@@ -760,22 +791,36 @@ type copier struct {
 
 // copyFile copies a single file using a temp file + atomic rename.
 func (c *copier) copyFile(src, dst string) error {
-	si, err := os.Stat(src)
+	var (
+		sf  io.ReadCloser
+		si  os.FileInfo
+		err error
+	)
+	if c.rootDir != "" {
+		r, openErr := fileops.OpenReader(c.rootDir, src)
+		if openErr != nil {
+			return openErr
+		}
+		sf = r
+		si, err = r.Stat()
+	} else {
+		f, openErr := os.Open(src)
+		if openErr != nil {
+			return openErr
+		}
+		sf = f
+		si, err = f.Stat()
+	}
+	defer sf.Close()
 	if err != nil {
 		return err
 	}
 	if !si.Mode().IsRegular() {
 		return fmt.Errorf("COPY source is not a regular file: %s", src)
 	}
-	if c.limit > 0 && c.copied+si.Size() > c.limit {
+	if c.limit > 0 && si.Size() > c.limit-c.copied {
 		return errUploadTooLarge
 	}
-
-	sf, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sf.Close()
 
 	dir := filepath.Dir(dst)
 	tmpFile, err := fileops.CreateTemp(dir, ".birak-tmp-*")
@@ -785,10 +830,20 @@ func (c *copier) copyFile(src, dst string) error {
 	defer fileops.ReleaseTemp(tmpFile)
 	tmpPath := tmpFile.Name()
 
-	if _, err := io.Copy(tmpFile, sf); err != nil {
+	var reader io.Reader = sf
+	if c.limit > 0 {
+		reader = io.LimitReader(sf, c.limit-c.copied+1)
+	}
+	n, err := io.Copy(tmpFile, reader)
+	if err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
 		return err
+	}
+	if c.limit > 0 && n > c.limit-c.copied {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return errUploadTooLarge
 	}
 	if err := os.Chtimes(tmpPath, si.ModTime(), si.ModTime()); err != nil {
 		tmpFile.Close()
@@ -807,7 +862,7 @@ func (c *copier) copyFile(src, dst string) error {
 	if err := fileops.SyncDir(filepath.Dir(dst)); err != nil {
 		return err
 	}
-	c.copied += si.Size()
+	c.copied += n
 	return nil
 }
 

@@ -7,6 +7,9 @@ package watcher
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -128,5 +131,42 @@ func TestScrubHonoursItsByteBudget(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed < 400*time.Millisecond {
 		t.Fatalf("1 MiB at 2 MiB/s waited only %v", elapsed)
+	}
+}
+
+func TestStreamingScrubHonorsCancelAndRate(t *testing.T) {
+	w := auditWatcher(t)
+	blob := make([]byte, 4*scrubChunkBytes) // 256 KiB (> scrubChunkBytes)
+	for i := range blob {
+		blob[i] = byte(i % 251)
+	}
+	path := filepath.Join(w.dir, "chunked.bin")
+	if err := os.WriteFile(path, blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wantSum := sha256.Sum256(blob)
+	wantHash := hex.EncodeToString(wantSum[:])
+
+	// Fast rate: streaming snapshot completes and matches exact SHA-256.
+	w.SetScrubRate(1 << 30)
+	info, gotHash, readBytes, err := w.snapshotRateLimited(context.Background(), path, time.Now())
+	if err != nil {
+		t.Fatalf("snapshotRateLimited fast: %v", err)
+	}
+	if gotHash != wantHash || readBytes != int64(len(blob)) || info.Size() != int64(len(blob)) {
+		t.Fatalf("got hash=%s bytes=%d, want hash=%s bytes=%d", gotHash, readBytes, wantHash, len(blob))
+	}
+
+	// Slow rate + cancel: stops promptly mid-file instead of bursting full file.
+	w.SetScrubRate(scrubChunkBytes) // 64 KiB/s -> 4 chunks would take 4s
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, _, _, err = w.snapshotRateLimited(ctx, path, started)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cancelled snapshotRateLimited err = %v, want DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("cancelled snapshotRateLimited took %v, expected prompt exit", elapsed)
 	}
 }
