@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -251,7 +254,9 @@ func Load(path string) (Config, error) {
 		if err != nil {
 			return cfg, fmt.Errorf("read config %s: %w", path, err)
 		}
-		if err := yaml.Unmarshal(data, &cfg); err != nil {
+		dec := yaml.NewDecoder(bytes.NewReader(data))
+		dec.KnownFields(true)
+		if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 			return cfg, fmt.Errorf("parse config %s: %w", path, err)
 		}
 	}
@@ -527,25 +532,29 @@ func (c *Config) validate() error {
 			return fmt.Errorf("invalid ignore pattern %q: %w", pattern, err)
 		}
 	}
-	if c.Gateways.S3.Enabled && c.Gateways.S3.ListenAddr == "" {
-		return fmt.Errorf("gateways.s3.listen_addr is required when S3 gateway is enabled")
-	}
-	if c.Gateways.WebDAV.Enabled && c.Gateways.WebDAV.ListenAddr == "" {
-		return fmt.Errorf("gateways.webdav.listen_addr is required when WebDAV gateway is enabled")
-	}
-	if c.Gateways.HTTP.Enabled && c.Gateways.HTTP.ListenAddr == "" {
-		return fmt.Errorf("gateways.http.listen_addr is required when HTTP gateway is enabled")
-	}
-	if c.Gateways.SFTP.Enabled && c.Gateways.SFTP.ListenAddr == "" {
-		return fmt.Errorf("gateways.sftp.listen_addr is required when SFTP gateway is enabled")
+	if err := checkListenAddrs([]listenSpec{
+		{"listen_addr", c.ListenAddr, true},
+		{"gateways.s3.listen_addr", c.Gateways.S3.ListenAddr, c.Gateways.S3.Enabled},
+		{"gateways.webdav.listen_addr", c.Gateways.WebDAV.ListenAddr, c.Gateways.WebDAV.Enabled},
+		{"gateways.http.listen_addr", c.Gateways.HTTP.ListenAddr, c.Gateways.HTTP.Enabled},
+		{"gateways.sftp.listen_addr", c.Gateways.SFTP.ListenAddr, c.Gateways.SFTP.Enabled},
+	}); err != nil {
+		return err
 	}
 	m := c.Multipart
 	if m.MinPartBytes < 0 || m.MaxPartBytes < 0 {
 		return fmt.Errorf("multipart part size limits must not be negative")
 	}
-	// A minimum above the maximum would reject every multi-part upload with a
-	// contradictory pair of errors, so refuse it at startup instead.
-	if m.MinPartBytes > 0 && m.MaxPartBytes > 0 && m.MinPartBytes > m.MaxPartBytes {
+	// A minimum above the maximum (including against the default for an unset
+	// bound) would reject every multi-part upload, so refuse it at startup.
+	minEff, maxEff := m.MinPartBytes, m.MaxPartBytes
+	if minEff == 0 {
+		minEff = 5 << 20
+	}
+	if maxEff == 0 {
+		maxEff = 5 << 30
+	}
+	if minEff > maxEff {
 		return fmt.Errorf("multipart.min_part_bytes must not exceed multipart.max_part_bytes")
 	}
 	if m.MaxParts < 0 {
@@ -599,10 +608,14 @@ func (c *Config) checkCredentials() error {
 		if !p.enabled {
 			continue
 		}
+		aBlank := strings.TrimSpace(p.a) == ""
+		bBlank := strings.TrimSpace(p.b) == ""
 		switch {
-		case p.a == "" && p.b == "" && !p.anonymous:
+		case aBlank && bBlank && p.a == "" && p.b == "" && !p.anonymous:
 			return fmt.Errorf("%s is enabled without %s/%s; set both, or set %s.allow_anonymous: true to serve without authentication", p.gateway, p.first, p.second, p.gateway)
-		case (p.a == "") != (p.b == ""):
+		case aBlank && bBlank && (p.a != "" || p.b != ""):
+			return fmt.Errorf("%s %s/%s must not be whitespace", p.gateway, p.first, p.second)
+		case aBlank != bBlank:
 			return fmt.Errorf("%s needs both %s and %s; one alone lets anyone in with an empty value", p.gateway, p.first, p.second)
 		case isPlaceholder(p.a) || isPlaceholder(p.b):
 			return fmt.Errorf("%s credentials still contain an example placeholder (changeme); set real values", p.gateway)
@@ -612,6 +625,37 @@ func (c *Config) checkCredentials() error {
 		if isPlaceholder(value) {
 			return fmt.Errorf("%s still contains an example placeholder (changeme); set a real value", name)
 		}
+	}
+	return nil
+}
+
+type listenSpec struct {
+	name    string
+	addr    string
+	enabled bool
+}
+
+func checkListenAddrs(specs []listenSpec) error {
+	seen := make(map[string]string, len(specs))
+	for _, s := range specs {
+		if !s.enabled {
+			continue
+		}
+		if s.addr == "" {
+			return fmt.Errorf("%s is required", s.name)
+		}
+		host, port, err := net.SplitHostPort(s.addr)
+		if err != nil || port == "" {
+			return fmt.Errorf("%s %q must be host:port", s.name, s.addr)
+		}
+		if port == "0" {
+			continue
+		}
+		key := strings.ToLower(host) + ":" + port
+		if prev, dup := seen[key]; dup {
+			return fmt.Errorf("%s %q conflicts with %s", s.name, s.addr, prev)
+		}
+		seen[key] = s.name
 	}
 	return nil
 }

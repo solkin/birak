@@ -920,11 +920,10 @@ func (s *Syncer) repairPeer(ctx context.Context, peerURL string) {
 			if lane.active == limit {
 				continue
 			}
-			// At most lane.active of these oldest rows are already running.
-			// Fetching limit rows therefore supplies every available slot
-			// without offset pagination, persistent claims, or an unbounded
-			// in-memory work list.
-			items, err := s.store.DueRepairsInLane(peerURL, lane.large, limit)
+			// At most len(active) rows in total are already running (including
+			// names that switched lanes mid-flight). Fetching limit+len(active)
+			// guarantees every free slot in this lane sees an eligible item.
+			items, err := s.store.DueRepairsInLane(peerURL, lane.large, limit+len(active))
 			if err != nil {
 				s.logger.Error("read repair queue failed", "peer", peerURL, "error", err)
 				paused = true
@@ -1657,6 +1656,11 @@ func (s *Syncer) commitDeletionLocked(ctx context.Context, meta store.FileMeta, 
 	if _, err := s.store.PutRemote(meta); err != nil {
 		return fmt.Errorf("mark deleted in store %s: %w", meta.Name, err)
 	}
+	if s.store.IsQuarantined(meta.Name) {
+		if err := s.store.ClearQuarantine(meta.Name, ""); err != nil {
+			return fmt.Errorf("clear quarantine for deleted %s: %w", meta.Name, err)
+		}
+	}
 	if meta.SupersededBy != "" {
 		if err := s.namespaceStep("resolved", meta.Name); err != nil {
 			return err
@@ -1792,10 +1796,10 @@ func watchStall(src *progressReader, total int64, timeout time.Duration, cancel 
 			case <-ticker.C:
 				cur := src.n.Load()
 				need := int64(minProgressBytes)
-				if remaining := total - cur; remaining < need {
+				if remaining := total - last; remaining < need {
 					need = remaining
 				}
-				if cur-last < need {
+				if need <= 0 || cur-last < need {
 					w.tripped.Store(true)
 					cancel()
 					return

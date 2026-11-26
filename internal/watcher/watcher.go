@@ -1393,6 +1393,7 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 	}
 	var rootDevice uint64
 	haveRootDevice := false
+	skippedQueued := false
 	err := filepath.WalkDir(w.dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1445,6 +1446,7 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 		}
 		progress.seen++
 		if queued != nil && queued(name) {
+			skippedQueued = true
 			return nil
 		}
 		batch = append(batch, name)
@@ -1477,7 +1479,11 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 				return err
 			}
 			after = meta.Name
-			if w.shouldIgnore(meta.Name) || queued != nil && queued(meta.Name) {
+			if w.shouldIgnore(meta.Name) {
+				continue
+			}
+			if queued != nil && queued(meta.Name) {
+				skippedQueued = true
 				continue
 			}
 			progress.checked++
@@ -1504,18 +1510,19 @@ func (w *Watcher) sweep(ctx context.Context, queued func(string) bool) (result e
 	if err := w.CheckStorage(); err != nil {
 		return err
 	}
-	// Every indexed name has been looked at, so what is missing now is the
-	// whole of what is missing, including what the event path is waiting on.
+	// Every indexed name was looked at unless the event backlog owns some of
+	// them; only a complete pass without queued skips is authoritative for the
+	// deletion circuit breaker.
 	var heldErr error
 	if deletions != nil {
 		deletions.merge(w.takeEventDeletions())
-		if err := w.settleDeletions(ctx, deletions, true); err != nil {
+		if err := w.settleDeletions(ctx, deletions, !skippedQueued); err != nil {
 			if !errors.Is(err, errHeldDeletions) {
 				return err
 			}
 			held, heldErr = true, err
 		}
-	} else {
+	} else if !skippedQueued {
 		w.setHeldDeletions(0, "")
 	}
 	complete = true

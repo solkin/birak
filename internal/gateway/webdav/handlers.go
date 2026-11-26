@@ -178,6 +178,7 @@ func (g *Gateway) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	g.logger.Debug("serving file", "path", relName, "size", info.Size())
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, filepath.Base(fullPath), info.ModTime(), f)
 }
 
@@ -296,7 +297,7 @@ func (g *Gateway) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if g.lockBlocked(w, r, relName) {
+	if g.lockBlockedTree(w, r, relName) {
 		return
 	}
 
@@ -401,7 +402,7 @@ func (g *Gateway) handleMove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// MOVE mutates both source (removed) and destination (created/overwritten).
-	if g.lockBlocked(w, r, srcRel) || g.lockBlocked(w, r, dstRel) {
+	if g.lockBlockedTree(w, r, srcRel) || g.lockBlockedTree(w, r, dstRel) {
 		return
 	}
 
@@ -486,7 +487,7 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// COPY mutates only the destination.
-	if g.lockBlocked(w, r, dstRel) {
+	if g.lockBlockedTree(w, r, dstRel) {
 		return
 	}
 
@@ -521,7 +522,7 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cp := &copier{limit: g.config.MaxUploadBytes}
+	cp := &copier{limit: g.config.MaxUploadBytes, rootDir: g.syncDir, ignorePatterns: g.ignorePatterns}
 	copyErr := fileops.CommitFrom(g.syncDir, []string{srcFull}, []string{dstFull}, func() error {
 		exists, err := checkReplacementLocked(srcFull, dstFull, overwrite)
 		if err != nil {
@@ -571,7 +572,7 @@ func (g *Gateway) handleLock(w http.ResponseWriter, r *http.Request) {
 	// than creating a new one.
 	if ifH := r.Header.Get("If"); ifH != "" {
 		for token := range parseIfTokens(ifH) {
-			if lk, ok := g.locks.refresh(token, timeout); ok && lk.covers(relName) {
+			if lk, ok := g.locks.refreshForPath(token, relName, timeout); ok {
 				w.Header().Set("Lock-Token", "<"+lk.token+">")
 				writeLockResponse(w, lk, http.StatusOK)
 				return
@@ -615,7 +616,7 @@ func (g *Gateway) handleUnlock(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeLockResponse writes the lockdiscovery body returned by LOCK.
-func writeLockResponse(w http.ResponseWriter, lk *lock, status int) {
+func writeLockResponse(w http.ResponseWriter, lk lock, status int) {
 	secs := int(time.Until(lk.expires).Seconds())
 	if secs < 0 {
 		secs = 0
@@ -740,6 +741,8 @@ func replacementErrorStatus(err error) int {
 		return http.StatusForbidden
 	case errors.Is(err, errUploadTooLarge):
 		return http.StatusRequestEntityTooLarge
+	case errors.Is(err, fileops.ErrBusy):
+		return http.StatusLocked
 	default:
 		return http.StatusInternalServerError
 	}
@@ -749,8 +752,10 @@ func replacementErrorStatus(err error) int {
 // so a COPY of a large tree cannot exceed the configured upload cap (or fill the
 // disk without bound). limit == 0 means unlimited.
 type copier struct {
-	limit  int64
-	copied int64
+	limit          int64
+	copied         int64
+	rootDir        string
+	ignorePatterns []string
 }
 
 // copyFile copies a single file using a temp file + atomic rename.
@@ -825,11 +830,12 @@ func (c *copier) copyDir(src, dst string) error {
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
 
-		// Never follow symlinks discovered during recursion: dereferencing one
-		// could copy the contents of a file outside syncDir into the destination.
-		// The request/Destination paths are symlink-checked by the caller, but
-		// entries found via ReadDir are not, so skip any link here.
+		// Never follow symlinks or copy scratch/reserved/ignored entries during
+		// recursion.
 		if entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		if c.rootDir != "" && !gateway.IsClientVisiblePath(c.rootDir, srcPath, c.ignorePatterns) {
 			continue
 		}
 

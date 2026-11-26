@@ -24,6 +24,7 @@ import (
 
 const defaultPageSize = 100
 const maxPageSize = 1000
+const maxJSONBodyBytes = 64 << 10
 
 // listBatch is how many directory entries one read returns while listing.
 const listBatch = 4096
@@ -311,6 +312,7 @@ func (c *readFailures) failure() error {
 
 // handleMkdir creates a directory.
 func (g *Gateway) handleMkdir(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	var req struct {
 		Path string `json:"path"`
 	}
@@ -340,6 +342,7 @@ func (g *Gateway) handleMkdir(w http.ResponseWriter, r *http.Request) {
 
 // handleRename renames a file or directory.
 func (g *Gateway) handleRename(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	var req struct {
 		From string `json:"from"`
 		To   string `json:"to"`
@@ -404,6 +407,7 @@ func (g *Gateway) handleRename(w http.ResponseWriter, r *http.Request) {
 
 // handleDelete deletes a file or directory.
 func (g *Gateway) handleDelete(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	var req struct {
 		Path string `json:"path"`
 	}

@@ -412,7 +412,7 @@ func (w *Watcher) recoverReplicaLocked(name string) error {
 	missing := os.IsNotExist(statErr) || errors.Is(statErr, syscall.ENOTDIR)
 	// Directories are implicit and are never removed by a file tombstone.
 	matches := meta.Deleted && (missing || statErr == nil && info.IsDir())
-	if !meta.Deleted && statErr == nil {
+	if !meta.Deleted && statErr == nil && info.Mode().IsRegular() {
 		info, hash, err := fileops.Snapshot(path)
 		if err != nil {
 			return err

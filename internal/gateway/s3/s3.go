@@ -88,11 +88,16 @@ func (g *Gateway) Start(ctx context.Context) error {
 	}
 	g.logger.Info("S3 gateway started", "addr", ln.Addr().String())
 
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		// Drain in-flight requests rather than cutting connections abruptly; Stop
-		// bounds the overall drain time.
-		g.server.Shutdown(context.Background())
+		select {
+		case <-ctx.Done():
+			// Drain in-flight requests rather than cutting connections abruptly; Stop
+			// bounds the overall drain time.
+			g.server.Shutdown(context.Background())
+		case <-done:
+		}
 	}()
 
 	var serveErr error

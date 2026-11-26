@@ -185,10 +185,31 @@ func (r *Reader) Seek(off int64, whence int) (int64, error) {
 	}
 	return r.file.Seek(off, whence)
 }
-func (r *Reader) Stat() (os.FileInfo, error)               { return r.file.Stat() }
-func (r *Reader) Name() string                             { return r.file.Name() }
-func (r *Reader) Chmod(mode os.FileMode) error             { return r.file.Chmod(mode) }
-func (r *Reader) Truncate(size int64) error                { return r.file.Truncate(size) }
+func (r *Reader) Stat() (os.FileInfo, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.file.Stat()
+}
+func (r *Reader) Name() string { return r.file.Name() }
+func (r *Reader) Chmod(mode os.FileMode) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return r.err
+	}
+	return r.file.Chmod(mode)
+}
+func (r *Reader) Truncate(size int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return r.err
+	}
+	return r.file.Truncate(size)
+}
 func (r *Reader) WriteAt(p []byte, off int64) (int, error) { return 0, os.ErrPermission }
 func (r *Reader) Close() error {
 	r.root.readersMu.Lock()

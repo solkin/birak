@@ -194,6 +194,11 @@ func (s *Server) metricsGuard(guarded, metrics http.HandlerFunc) http.HandlerFun
 				metrics(w, r)
 				return
 			}
+			if s.secret == "" {
+				w.Header().Set("Cache-Control", "no-store")
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 		}
 		guarded(w, r)
 	}

@@ -84,13 +84,38 @@ func TestGatewayWithoutCredentialsFailsBeforeOpeningStorage(t *testing.T) {
 
 func TestPeerTLSMaterialIsCheckedAtStartup(t *testing.T) {
 	dir := t.TempDir()
+	syncDir, metaDir := filepath.Join(dir, "sync"), filepath.Join(dir, "meta")
 	path := filepath.Join(dir, "config.yaml")
 	data := fmt.Sprintf("sync_dir: %q\nmeta_dir: %q\ntls_cert_file: %q\ntls_key_file: %q\n",
-		filepath.Join(dir, "sync"), filepath.Join(dir, "meta"), filepath.Join(dir, "missing.pem"), filepath.Join(dir, "missing.key"))
+		syncDir, metaDir, filepath.Join(dir, "missing.pem"), filepath.Join(dir, "missing.key"))
 	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := run(path); err == nil || !strings.Contains(err.Error(), "peer TLS certificate") {
 		t.Fatalf("expected unreadable peer certificate to fail startup, got %v", err)
+	}
+	for _, p := range []string{syncDir, metaDir} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("startup touched storage %s before checking TLS: %v", p, err)
+		}
+	}
+}
+
+func TestS3TLSMaterialIsCheckedBeforeOpeningStorage(t *testing.T) {
+	dir := t.TempDir()
+	syncDir, metaDir := filepath.Join(dir, "sync"), filepath.Join(dir, "meta")
+	path := filepath.Join(dir, "config.yaml")
+	data := fmt.Sprintf("sync_dir: %q\nmeta_dir: %q\ngateways:\n  s3:\n    enabled: true\n    allow_anonymous: true\n    tls_cert_file: %q\n    tls_key_file: %q\n",
+		syncDir, metaDir, filepath.Join(dir, "missing.pem"), filepath.Join(dir, "missing.key"))
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(path); err == nil || !strings.Contains(err.Error(), "S3 TLS certificate") {
+		t.Fatalf("expected unreadable S3 certificate to fail startup, got %v", err)
+	}
+	for _, p := range []string{syncDir, metaDir} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("startup touched storage %s before checking S3 TLS: %v", p, err)
+		}
 	}
 }

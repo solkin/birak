@@ -1020,11 +1020,13 @@ func (s *Store) enqueue(peerID, reason string, batch []queuedChange) (int, error
 		INSERT INTO repair_queue (peer_id, name, version, attempts, next_attempt, first_seen, last_error, metadata, revision, large)
 		VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(peer_id, name) DO UPDATE SET
-			version    = MAX(repair_queue.version, excluded.version),
-			metadata   = excluded.metadata,
-			revision   = excluded.revision,
-			last_error = excluded.last_error,
-			large      = excluded.large
+			version      = MAX(repair_queue.version, excluded.version),
+			attempts     = CASE WHEN excluded.metadata != '' THEN 0 ELSE repair_queue.attempts END,
+			next_attempt = CASE WHEN excluded.metadata != '' THEN excluded.next_attempt ELSE repair_queue.next_attempt END,
+			metadata     = excluded.metadata,
+			revision     = excluded.revision,
+			last_error   = excluded.last_error,
+			large        = excluded.large
 	`)
 	if err != nil {
 		return 0, err

@@ -83,6 +83,25 @@ func run(configPath string) error {
 		"peers", cfg.Peers,
 	)
 
+	// Unreadable TLS material is a configuration error, reported before any
+	// storage is opened rather than as a listener failure later.
+	if cfg.TLSCertFile != "" {
+		if _, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
+			return fmt.Errorf("load peer TLS certificate: %w", err)
+		}
+	}
+	var peerRoots *x509.CertPool
+	if cfg.PeerCAFile != "" {
+		if peerRoots, err = loadPeerRoots(cfg.PeerCAFile); err != nil {
+			return err
+		}
+	}
+	if cfg.Gateways.S3.Enabled && cfg.Gateways.S3.TLSCertFile != "" {
+		if _, err := tls.LoadX509KeyPair(cfg.Gateways.S3.TLSCertFile, cfg.Gateways.S3.TLSKeyFile); err != nil {
+			return fmt.Errorf("load S3 TLS certificate: %w", err)
+		}
+	}
+
 	// Ensure meta directory exists.
 	if err := os.MkdirAll(cfg.MetaDir, 0o755); err != nil {
 		return fmt.Errorf("create meta dir: %w", err)
@@ -119,20 +138,6 @@ func run(configPath string) error {
 	// Warn about allowed settings that expose data.
 	for _, warning := range config.SecurityWarnings(cfg) {
 		logger.Warn("insecure configuration", "detail", warning)
-	}
-
-	// Unreadable TLS material is a configuration error, reported before any
-	// storage is opened rather than as a listener failure later.
-	if cfg.TLSCertFile != "" {
-		if _, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
-			return fmt.Errorf("load peer TLS certificate: %w", err)
-		}
-	}
-	var peerRoots *x509.CertPool
-	if cfg.PeerCAFile != "" {
-		if peerRoots, err = loadPeerRoots(cfg.PeerCAFile); err != nil {
-			return err
-		}
 	}
 
 	// Open store.
@@ -346,6 +351,23 @@ func run(configPath string) error {
 		components = append(components, component{"SFTP gateway", sftpGateway.Start})
 	}
 
+	// When S3 is disabled, the multipart janitor does not run; sweep orphaned
+	// scratch files written by WebDAV/HTTP/SFTP gateways periodically anyway.
+	if !cfg.Gateways.S3.Enabled && (cfg.Gateways.WebDAV.Enabled || cfg.Gateways.HTTP.Enabled || cfg.Gateways.SFTP.Enabled) {
+		interval := cfg.Multipart.CleanupInterval
+		if interval <= 0 {
+			interval = multipart.DefaultCleanupInterval
+		}
+		maxAge := cfg.Multipart.TempFileMaxAge
+		if maxAge <= 0 {
+			maxAge = multipart.DefaultTempFileMaxAge
+		}
+		components = append(components, component{"temp-file janitor", func(ctx context.Context) error {
+			runTempFileJanitor(ctx, cfg.SyncDir, interval, maxAge, logger)
+			return nil
+		}})
+	}
+
 	var wg sync.WaitGroup
 	componentErrors := make(chan error, 1)
 	for _, part := range components {
@@ -373,12 +395,20 @@ func run(configPath string) error {
 
 	cancel()
 
-	// Every listener drains at once within one budget. One after another they
-	// could each wait out the whole budget, past the point where the container
-	// runtime kills the process.
+	// Every listener (including SFTP) drains at once within one budget. When
+	// the drain expires, Stop forcibly closes lingering transfers so shutdown
+	// finishes before the container runtime sends SIGKILL.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownDrain)
 	defer shutdownCancel()
-	stops := map[string]func(context.Context) error{"HTTP server": httpServer.Shutdown}
+	stops := map[string]func(context.Context) error{
+		"HTTP server": func(ctx context.Context) error {
+			err := httpServer.Shutdown(ctx)
+			if err != nil {
+				httpServer.Close()
+			}
+			return err
+		},
+	}
 	if s3Gateway != nil {
 		stops["S3 gateway"] = s3Gateway.Stop
 	}
@@ -387,6 +417,9 @@ func run(configPath string) error {
 	}
 	if httpGateway != nil {
 		stops["HTTP file server"] = httpGateway.Stop
+	}
+	if sftpGateway != nil {
+		stops["SFTP gateway"] = sftpGateway.Stop
 	}
 	var stopping sync.WaitGroup
 	for name, stop := range stops {
@@ -404,16 +437,17 @@ func run(configPath string) error {
 	}
 	stopping.Wait()
 
-	// Cancellation closes the SFTP accept loop. Join it before Stop reads its
-	// listener and waits for connections, including when another component failed
-	// before SFTP finished starting.
-	wg.Wait()
-
-	// Graceful SFTP gateway shutdown.
-	if sftpGateway != nil {
-		if err := sftpGateway.Stop(shutdownCtx); err != nil {
-			logger.Error("SFTP gateway shutdown error", "error", err)
-		}
+	// Wait for background components (watcher, syncer, accept loops) with a
+	// short guard timeout so a stuck worker cannot hang past Docker's SIGKILL.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		logger.Warn("background components did not stop within grace period")
 	}
 
 	logger.Info("birak daemon stopped")
@@ -425,6 +459,21 @@ func run(configPath string) error {
 		return err
 	default:
 		return nil
+	}
+}
+
+// runTempFileJanitor periodically sweeps stale atomic-write scratch files when
+// the S3 multipart janitor is not running.
+func runTempFileJanitor(ctx context.Context, rootDir string, interval, maxAge time.Duration, logger *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			gateway.SweepTempFiles(rootDir, maxAge, logger)
+		}
 	}
 }
 

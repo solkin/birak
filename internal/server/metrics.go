@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,20 +78,35 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	// A full disk keeps the node ready and fails every write, so free space
 	// must be visible here and not only in a host agent somebody forgot.
-	for volume, path := range map[string]string{"sync": s.syncDir, "meta": s.metaDir} {
-		if path == "" {
+	for _, vol := range []struct{ volume, path string }{
+		{"meta", s.metaDir},
+		{"sync", s.syncDir},
+	} {
+		if vol.path == "" {
 			continue
 		}
-		if free, total, err := diskSpace(path); err == nil {
-			labels := map[string]string{"volume": volume}
+		if free, total, err := diskSpace(vol.path); err == nil {
+			labels := map[string]string{"volume": vol.volume}
 			out.gauge("birak_disk_free_bytes", "Bytes available to the daemon on a volume.", labels, float64(free))
 			out.gauge("birak_disk_total_bytes", "Size of a volume.", labels, float64(total))
 		}
 	}
-	for name, classes := range gateway.RequestCounts() {
-		for class, count := range classes {
+	reqCounts := gateway.RequestCounts()
+	gwNames := make([]string, 0, len(reqCounts))
+	for name := range reqCounts {
+		gwNames = append(gwNames, name)
+	}
+	sort.Strings(gwNames)
+	for _, name := range gwNames {
+		classes := reqCounts[name]
+		classNames := make([]string, 0, len(classes))
+		for class := range classes {
+			classNames = append(classNames, class)
+		}
+		sort.Strings(classNames)
+		for _, class := range classNames {
 			out.labeledCounter("birak_gateway_requests_total", "Gateway requests by status class.",
-				map[string]string{"gateway": name, "code": class}, float64(count))
+				map[string]string{"gateway": name, "code": class}, float64(classes[class]))
 		}
 	}
 	if counter, ok := s.stats.(skipCounter); ok {
@@ -194,7 +210,7 @@ func (e *exposition) write(name, kind, help string, labels map[string]string, va
 		e.families[name] = f
 		e.order = append(e.order, name)
 	}
-	fmt.Fprintf(&f.samples, "%s%s %g\n", name, formatLabels(labels), value)
+	fmt.Fprintf(&f.samples, "%s%s %s\n", name, formatLabels(labels), strconv.FormatFloat(value, 'g', -1, 64))
 }
 
 func formatLabels(labels map[string]string) string {
