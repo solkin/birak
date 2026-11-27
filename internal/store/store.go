@@ -520,6 +520,27 @@ func (s *Store) PutFile(name string, modTime int64, size int64, hash string, del
 // client preserves or rolls back filesystem timestamps.
 func (s *Store) PutLocal(meta FileMeta) (int64, error) { return s.put(meta, true) }
 
+// PutLocalBatch commits multiple local file states in a single transaction,
+// assigning contiguous versions with one fsync instead of one per file.
+func (s *Store) PutLocalBatch(metas []FileMeta) error {
+	if len(metas) == 0 {
+		return nil
+	}
+	if len(metas) == 1 {
+		_, err := s.PutLocal(metas[0])
+		return err
+	}
+	vers, err := s.commitPutBatch(metas, true)
+	if err != nil {
+		return err
+	}
+	for i, meta := range metas {
+		s.logger.Debug("store: file updated", "name", meta.Name, "version", vers[i],
+			"hash", meta.Hash[:min(12, len(meta.Hash))], "deleted", meta.Deleted)
+	}
+	return nil
+}
+
 // PutRemote preserves the source conflict clock; Version remains node-local.
 func (s *Store) PutRemote(meta FileMeta) (int64, error) { return s.put(meta, false) }
 
@@ -539,12 +560,49 @@ func (s *Store) put(meta FileMeta, local bool) (int64, error) {
 func (s *Store) commitPut(meta FileMeta, local bool) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	name, modTime, size, hash, deleted := meta.Name, meta.ModTime, meta.Size, meta.Hash, meta.Deleted
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	ver, err := s.putInTx(tx, meta, local)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit file %q: %w", meta.Name, err)
+	}
+	s.cachedNextVer = ver + 1
+	return ver, nil
+}
+
+func (s *Store) commitPutBatch(metas []FileMeta, local bool) ([]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	vers := make([]int64, len(metas))
+	var lastVer int64
+	for i, meta := range metas {
+		ver, err := s.putInTx(tx, meta, local)
+		if err != nil {
+			return nil, err
+		}
+		vers[i] = ver
+		lastVer = ver
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit file batch (%d): %w", len(metas), err)
+	}
+	s.cachedNextVer = lastVer + 1
+	return vers, nil
+}
+
+func (s *Store) putInTx(tx *sql.Tx, meta FileMeta, local bool) (int64, error) {
+	name, modTime, size, hash, deleted := meta.Name, meta.ModTime, meta.Size, meta.Hash, meta.Deleted
 	if err := bindName(tx, name); err != nil {
 		return 0, err
 	}
@@ -586,10 +644,10 @@ func (s *Store) commitPut(meta FileMeta, local bool) (int64, error) {
 			deleted    = excluded.deleted,
 			version    = excluded.version,
 			deleted_at = excluded.deleted_at,
- clock = excluded.clock,
- superseded_by = excluded.superseded_by,
- conflict_of = excluded.conflict_of,
- big_clock = excluded.big_clock
+			clock      = excluded.clock,
+			superseded_by = excluded.superseded_by,
+			conflict_of   = excluded.conflict_of,
+			big_clock     = excluded.big_clock
 	`, name, modTime, size, hash, deletedInt, ver, deletedAt, meta.Clock, meta.SupersededBy, meta.ConflictOf, meta.BigClock)
 	if execErr != nil {
 		// Roll back the version counter on failure so versions stay gapless.
@@ -598,10 +656,6 @@ func (s *Store) commitPut(meta FileMeta, local bool) (int64, error) {
 	if _, err := tx.Exec("DELETE FROM replica_intents WHERE name=?", name); err != nil {
 		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit file %q: %w", name, err)
-	}
-	s.cachedNextVer = ver + 1
 	return ver, nil
 }
 

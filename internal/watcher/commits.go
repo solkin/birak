@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -74,7 +75,43 @@ type indexOptions struct {
 	deferDeletion func(string)
 }
 
-func (w *Watcher) checkSourcesLocked(paths []string) error {
+func (w *Watcher) mapPublished(published map[string]fileops.Published) map[string]*hashed {
+	if len(published) == 0 {
+		return nil
+	}
+	realRoot, err := filepath.EvalSymlinks(w.dir)
+	if err != nil {
+		return nil
+	}
+	mapped := make(map[string]*hashed, len(published))
+	for full, entry := range published {
+		// Converted one at a time: a shortcut that cannot be attributed to a
+		// name is simply dropped, and that name is read the ordinary way.
+		abs, err := filepath.Abs(full)
+		if err != nil {
+			continue
+		}
+		parent, err := fileops.ResolvePath(filepath.Dir(abs))
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(realRoot, filepath.Join(parent, filepath.Base(abs)))
+		if err != nil {
+			continue
+		}
+		name := filepath.ToSlash(rel)
+		if name == "." || isOutsideSyncDir(name) {
+			continue
+		}
+		mapped[name] = &hashed{info: entry.Info, hash: entry.Hash}
+	}
+	if len(mapped) == 0 {
+		return nil
+	}
+	return mapped
+}
+
+func (w *Watcher) checkSourcesLocked(paths []string, published map[string]fileops.Published) error {
 	// Walk directory symlink targets too; ordinary scans do not follow them.
 	resolved := make([]string, 0, 2*len(paths))
 	for _, path := range paths {
@@ -88,7 +125,7 @@ func (w *Watcher) checkSourcesLocked(paths []string) error {
 	if err != nil {
 		return err
 	}
-	return w.indexPathsLocked(names, indexOptions{})
+	return w.indexPathsLocked(names, indexOptions{published: w.mapPublished(published)})
 }
 
 func (w *Watcher) beginCommitLocked(paths []string) error {
@@ -120,19 +157,7 @@ func (w *Watcher) finishCommitLocked(paths []string, published map[string]fileop
 	if err != nil {
 		return err
 	}
-	opts := indexOptions{durable: true}
-	for full, entry := range published {
-		// Converted one at a time: a shortcut that cannot be attributed to a
-		// name is simply dropped, and that name is read the ordinary way.
-		mapped, err := w.relativePaths([]string{full})
-		if err != nil || len(mapped) != 1 {
-			continue
-		}
-		if opts.published == nil {
-			opts.published = make(map[string]*hashed, len(published))
-		}
-		opts.published[mapped[0]] = &hashed{info: entry.Info, hash: entry.Hash}
-	}
+	opts := indexOptions{durable: true, published: w.mapPublished(published)}
 	if err = w.indexPathsLocked(names, opts); err != nil {
 		return err
 	}
@@ -189,16 +214,40 @@ func (w *Watcher) indexPathsLocked(paths []string, opts indexOptions) error {
 			return err
 		}
 	}
+	if len(names) == 0 {
+		return nil
+	}
+	if len(names) == 1 {
+		for name := range names {
+			err := w.refreshFileLocked(name, opts)
+			if opts.allowIntegrity && errors.Is(err, ErrIntegrity) {
+				return nil
+			}
+			return err
+		}
+	}
+	ordered := make([]string, 0, len(names))
 	for name := range names {
-		err := w.refreshFileLocked(name, opts)
+		ordered = append(ordered, name)
+	}
+	slices.Sort(ordered)
+	batch := make([]store.FileMeta, 0, len(ordered))
+	for _, name := range ordered {
+		meta, err := w.prepareRefreshLocked(name, opts)
 		if opts.allowIntegrity && errors.Is(err, ErrIntegrity) {
 			continue
 		}
 		if err != nil {
+			if len(batch) > 0 {
+				return errors.Join(err, w.store.PutLocalBatch(batch))
+			}
 			return err
 		}
+		if meta != nil {
+			batch = append(batch, *meta)
+		}
 	}
-	return nil
+	return w.store.PutLocalBatch(batch)
 }
 
 // prepareStorageLocked is the full storage validation. Its outcome is kept so

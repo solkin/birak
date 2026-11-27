@@ -787,24 +787,33 @@ func (w *Watcher) indexPrecomputed(name string, pre *hashed, deferDeletion func(
 }
 
 func (w *Watcher) refreshFileLocked(name string, opts indexOptions) error {
-	if err := w.store.CheckName(name); err != nil {
+	meta, err := w.prepareRefreshLocked(name, opts)
+	if err != nil || meta == nil {
 		return err
+	}
+	_, err = w.store.PutLocal(*meta)
+	return err
+}
+
+func (w *Watcher) prepareRefreshLocked(name string, opts indexOptions) (*store.FileMeta, error) {
+	if err := w.store.CheckName(name); err != nil {
+		return nil, err
 	}
 	if err := fileops.CheckSpelling(w.dir, filepath.Join(w.dir, filepath.FromSlash(name))); err != nil {
-		return err
+		return nil, err
 	}
 	if fileops.BusyLocked(w.dir, filepath.Join(w.dir, filepath.FromSlash(name))) {
-		return fileops.ErrBusy
+		return nil, fileops.ErrBusy
 	}
 	if err := w.recoverReplicaLocked(name); err != nil {
-		return err
+		return nil, err
 	}
 	if opts.trustStat && w.unchangedByStat(name) {
-		return nil
+		return nil, nil
 	}
 	ev, err := w.inspectFile(name, opts)
 	if err != nil || ev == nil {
-		return err
+		return nil, err
 	}
 	// A recovered rename or a direct filesystem write must be durable before
 	// peers can consume its metadata, even if its original writer never fsynced.
@@ -814,10 +823,10 @@ func (w *Watcher) refreshFileLocked(name string, opts indexOptions) error {
 	if !ev.Deleted && !opts.durable {
 		f, err := os.Open(path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := errors.Join(f.Sync(), f.Close()); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	// The directory entry needs the same treatment as the bytes: a commit has
@@ -825,11 +834,10 @@ func (w *Watcher) refreshFileLocked(name string, opts indexOptions) error {
 	// the second of two fsyncs held under the volume's one lock.
 	if !opts.durable {
 		if err := fileops.SyncSurvivingParent(path, w.dir); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	_, err = w.store.PutLocal(store.FileMeta{Name: ev.Name, ModTime: ev.ModTime, Size: ev.Size, Hash: ev.Hash, Deleted: ev.Deleted})
-	return err
+	return &store.FileMeta{Name: ev.Name, ModTime: ev.ModTime, Size: ev.Size, Hash: ev.Hash, Deleted: ev.Deleted}, nil
 }
 
 func (w *Watcher) inspectFile(name string, opts indexOptions) (*FileEvent, error) {

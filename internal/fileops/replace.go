@@ -28,13 +28,13 @@ type replacement struct {
 // ReplaceLocked moves src over dst. Both this function and CopyReplaceLocked
 // require the namespace lock. Only fully built objects enter the rename journal.
 func ReplaceLocked(rootDir, src, dst string) error {
-	return replaceWithStageLocked(rootDir, src, dst, "", nil, func(string) {})
+	return replaceWithStageLocked(rootDir, src, dst, "", nil, nil, nil, func(string) {})
 }
 
 // CopyReplaceLocked builds an unpublished copy before touching the destination.
 // copy must write and sync the supplied staging path, which does not yet exist.
 func CopyReplaceLocked(rootDir, dst string, copy func(string) error) error {
-	return replaceWithStageLocked(rootDir, "", dst, "", copy, func(string) {})
+	return replaceWithStageLocked(rootDir, "", dst, "", nil, nil, copy, func(string) {})
 }
 
 // ReplaceStagedLocked publishes a pre-built COPY staging directory (whose
@@ -42,14 +42,21 @@ func CopyReplaceLocked(rootDir, dst string, copy func(string) error) error {
 // Building the copy outside the volume lock keeps large copies from blocking
 // concurrent mutations while preserving the exact same recovery journal.
 func ReplaceStagedLocked(rootDir, stage, dst string) error {
-	return replaceWithStageLocked(rootDir, filepath.Join(stage, "payload"), dst, stage, nil, func(string) {})
+	return ReplaceStagedPublishedLocked(rootDir, stage, dst, nil, nil)
+}
+
+// ReplaceStagedPublishedLocked is ReplaceStagedLocked with optional precomputed
+// hashes for the staged payload and existing destination tree, avoiding full
+// file re-reads under the commit lock while recording the exact same journal.
+func ReplaceStagedPublishedLocked(rootDir, stage, dst string, stagePublished, oldPublished map[string]Published) error {
+	return replaceWithStageLocked(rootDir, filepath.Join(stage, "payload"), dst, stage, stagePublished, oldPublished, nil, func(string) {})
 }
 
 func replaceLocked(rootDir, src, dst string, copy func(string) error, checkpoint func(string)) error {
-	return replaceWithStageLocked(rootDir, src, dst, "", copy, checkpoint)
+	return replaceWithStageLocked(rootDir, src, dst, "", nil, nil, copy, checkpoint)
 }
 
-func replaceWithStageLocked(rootDir, src, dst, stagedDir string, copy func(string) error, checkpoint func(string)) error {
+func replaceWithStageLocked(rootDir, src, dst, stagedDir string, stagePublished, oldPublished map[string]Published, copy func(string) error, checkpoint func(string)) error {
 	var err error
 	state := replacement{Format: 1}
 	// Until the journal is durable, the COPY stage contains only disposable copies.
@@ -118,13 +125,13 @@ func replaceWithStageLocked(rootDir, src, dst, stagedDir string, copy func(strin
 	if err = safeReplacementParents(r, dst); err != nil {
 		return err
 	}
-	if state.New, err = replacementTree(r, state.Source); err != nil {
+	if state.New, err = replacementTreeWith(r, state.Source, lookupPublished(absRoot, stagePublished)); err != nil {
 		return err
 	}
 	if len(state.New) == 0 {
 		return fmt.Errorf("missing replacement source %s", state.Source)
 	}
-	if state.Old, err = replacementTree(r, dst); err != nil {
+	if state.Old, err = replacementTreeWith(r, dst, lookupPublished(absRoot, oldPublished)); err != nil {
 		return err
 	}
 	id := rand.Text()
@@ -147,7 +154,7 @@ func replaceWithStageLocked(rootDir, src, dst, stagedDir string, copy func(strin
 		return err
 	}
 	checkpoint("prepared")
-	rollback := func(cause error) error { return errors.Join(cause, recoverReplacement(r, journal, state, checkpoint)) }
+	rollback := func(cause error) error { return errors.Join(cause, recoverReplacement(r, journal, state, nil, checkpoint)) }
 	if len(state.Old) != 0 {
 		if err = r.Rename(dst, state.Backup); err != nil {
 			return rollback(err)
@@ -169,11 +176,62 @@ func replaceWithStageLocked(rootDir, src, dst, stagedDir string, copy func(strin
 		return err
 	}
 	checkpoint("committed")
-	if err = recoverReplacement(r, journal, state, checkpoint); err != nil {
+	if err = recoverReplacement(r, journal, state, lookupEntries(state.Old), checkpoint); err != nil {
 		return err
 	}
 	checkpoint("cleaned")
 	return nil
+}
+
+func lookupPublished(absRoot string, m map[string]Published) prehashLookup {
+	if len(m) == 0 {
+		return nil
+	}
+	byRel := make(map[string]Published, len(m))
+	for full, pub := range m {
+		if pub.Hash == "" || pub.Info == nil {
+			continue
+		}
+		rel, err := replacementName(absRoot, full)
+		if err != nil {
+			continue
+		}
+		byRel[rel] = pub
+	}
+	if len(byRel) == 0 {
+		return nil
+	}
+	return func(path, _ string, info os.FileInfo, _, _ uint64) (string, bool) {
+		if pub, ok := byRel[path]; ok && SameGeneration(pub.Info, info) {
+			return pub.Hash, true
+		}
+		return "", false
+	}
+}
+
+// lookupEntries reuses hashes just computed in the same locked replacement call
+// when cleaning up the backup tree. Crash recovery always passes nil so offline
+// edits are checked against disk bytes.
+func lookupEntries(entries []replacementEntry) prehashLookup {
+	if len(entries) == 0 {
+		return nil
+	}
+	byRel := make(map[string]replacementEntry, len(entries))
+	for _, e := range entries {
+		if e.Mode.IsRegular() && e.Hash != "" {
+			byRel[e.Name] = e
+		}
+	}
+	if len(byRel) == 0 {
+		return nil
+	}
+	return func(_, rel string, info os.FileInfo, device, inode uint64) (string, bool) {
+		e, ok := byRel[rel]
+		if ok && e.Device == device && e.Inode == inode && e.Mode == info.Mode() && e.Size == info.Size() && e.Mtime == info.ModTime().UnixNano() {
+			return e.Hash, true
+		}
+		return "", false
+	}
 }
 
 func writeReplacement(path string, state replacement) error {
@@ -203,7 +261,7 @@ func syncReplacementParents(root string, state replacement) error {
 	return errors.Join(SyncSurvivingParent(filepath.Join(root, state.Destination), root), SyncSurvivingParent(filepath.Join(root, state.Source), root))
 }
 
-func recoverReplacement(r *os.Root, journal string, state replacement, checkpoint func(string)) error {
+func recoverReplacement(r *os.Root, journal string, state replacement, backupLookup prehashLookup, checkpoint func(string)) error {
 	if err := validateReplacement(state); err != nil {
 		return err
 	}
@@ -214,7 +272,7 @@ func recoverReplacement(r *os.Root, journal string, state replacement, checkpoin
 			return err
 		}
 	}
-	backup, err := replacementTree(r, state.Backup)
+	backup, err := replacementTreeWith(r, state.Backup, backupLookup)
 	if err != nil {
 		return err
 	}
@@ -474,7 +532,7 @@ func recoverLocked(root string, checkpoint func(string)) error {
 		if err = json.Unmarshal(data, &state); err != nil {
 			return fmt.Errorf("read replacement journal %s: %w", name, err)
 		}
-		if err = recoverReplacement(r, filepath.Join(root, name), state, checkpoint); err != nil {
+		if err = recoverReplacement(r, filepath.Join(root, name), state, nil, checkpoint); err != nil {
 			return fmt.Errorf("recover replacement %s: %w", name, err)
 		}
 	}

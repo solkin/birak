@@ -1,9 +1,12 @@
 package webdav
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"net/http"
@@ -538,8 +541,17 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 	fileops.RetainTemp(stage)
 	defer fileops.ReleaseTempPath(stage)
 
-	cp := &copier{limit: g.config.MaxUploadBytes, rootDir: g.syncDir, ignorePatterns: g.ignorePatterns}
 	payload := filepath.Join(stage, "payload")
+	cp := &copier{
+		limit:          g.config.MaxUploadBytes,
+		rootDir:        g.syncDir,
+		ignorePatterns: g.ignorePatterns,
+		stageRoot:      payload,
+		destRoot:       dstFull,
+		srcPublished:   make(map[string]fileops.Published),
+		stagePublished: make(map[string]fileops.Published),
+		dstPublished:   make(map[string]fileops.Published),
+	}
 	var stageErr error
 	if srcInfo.IsDir() {
 		stageErr = cp.copyDir(srcFull, payload)
@@ -554,8 +566,13 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var oldPublished map[string]fileops.Published
+	if dstExists && overwrite {
+		oldPublished = fileops.SnapshotTree(dstFull)
+	}
+
 	handedOff := false
-	copyErr := fileops.CommitFrom(g.syncDir, []string{srcFull}, []string{dstFull}, func() error {
+	copyErr := fileops.CommitPublishedFrom(g.syncDir, []string{srcFull}, []string{dstFull}, cp.srcPublished, cp.dstPublished, func() error {
 		exists, err := checkReplacementLocked(srcFull, dstFull, overwrite)
 		if err != nil {
 			return err
@@ -565,7 +582,7 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 			return fileops.ErrBusy
 		}
 		handedOff = true
-		if err := fileops.ReplaceStagedLocked(g.syncDir, stage, dstFull); err != nil {
+		if err := fileops.ReplaceStagedPublishedLocked(g.syncDir, stage, dstFull, cp.stagePublished, oldPublished); err != nil {
 			return err
 		}
 		return fileops.SyncParents(filepath.Dir(dstFull), g.syncDir)
@@ -787,6 +804,22 @@ type copier struct {
 	copied         int64
 	rootDir        string
 	ignorePatterns []string
+	stageRoot      string
+	destRoot       string
+	srcPublished   map[string]fileops.Published
+	stagePublished map[string]fileops.Published
+	dstPublished   map[string]fileops.Published
+}
+
+func mapStagedPath(stageRoot, destRoot, dst string) (string, bool) {
+	if dst == stageRoot {
+		return destRoot, true
+	}
+	rel, err := filepath.Rel(stageRoot, dst)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return filepath.Join(destRoot, rel), true
 }
 
 // copyFile copies a single file using a temp file + atomic rename.
@@ -834,7 +867,15 @@ func (c *copier) copyFile(src, dst string) error {
 	if c.limit > 0 {
 		reader = io.LimitReader(sf, c.limit-c.copied+1)
 	}
-	n, err := io.Copy(tmpFile, reader)
+	var (
+		sum       hash.Hash
+		dstWriter io.Writer = tmpFile
+	)
+	if c.stagePublished != nil || c.dstPublished != nil || c.srcPublished != nil {
+		sum = sha256.New()
+		dstWriter = io.MultiWriter(tmpFile, sum)
+	}
+	n, err := io.Copy(dstWriter, reader)
 	if err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
@@ -861,6 +902,25 @@ func (c *copier) copyFile(src, dst string) error {
 	}
 	if err := fileops.SyncDir(filepath.Dir(dst)); err != nil {
 		return err
+	}
+	if sum != nil {
+		digest := hex.EncodeToString(sum.Sum(nil))
+		if dstInfo, statErr := os.Stat(dst); statErr == nil && dstInfo.Size() == n {
+			pub := fileops.Published{Info: dstInfo, Hash: digest}
+			if c.stagePublished != nil {
+				c.stagePublished[dst] = pub
+			}
+			if c.dstPublished != nil && c.stageRoot != "" && c.destRoot != "" {
+				if finalDst, ok := mapStagedPath(c.stageRoot, c.destRoot, dst); ok {
+					c.dstPublished[finalDst] = pub
+				}
+			}
+		}
+		if c.srcPublished != nil && n == si.Size() {
+			if srcAfter, statErr := os.Stat(src); statErr == nil && fileops.SameGeneration(si, srcAfter) {
+				c.srcPublished[src] = fileops.Published{Info: srcAfter, Hash: digest}
+			}
+		}
 	}
 	c.copied += n
 	return nil

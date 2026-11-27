@@ -159,7 +159,7 @@ type Hooks struct {
 	// so a GET does not wait for a commit. Without it a read falls back to
 	// Validate under the lock.
 	ValidateRead func() error
-	CheckSources func([]string) error
+	CheckSources func([]string, map[string]Published) error
 	// CheckRead runs without the root lock, after the reader is registered. A
 	// quarantine fences a generation before it revokes that generation's
 	// readers, so either this check sees the fence or the revocation sees the
@@ -208,22 +208,35 @@ func CommitFrom(dir string, sources, paths []string, fn func() error) error {
 	defer unlock()
 	return commitLocked(dir, sources, paths, fn)
 }
-func checkSourcesLocked(dir string, paths []string) error {
+
+// CommitPublishedFrom is CommitFrom for callers that already read and hashed
+// their source and/or staged destination bytes outside the commit lock.
+func CommitPublishedFrom(dir string, sources, paths []string, sourcePublished, destPublished map[string]Published, fn func() error) error {
+	unlock := Lock(dir)
+	defer unlock()
+	return commitPublishedFromLocked(dir, sources, paths, sourcePublished, destPublished, fn)
+}
+
+func checkSourcesLocked(dir string, paths []string, published map[string]Published) error {
 	if fn := root(dir).hook().CheckSources; fn != nil && len(paths) != 0 {
-		return fn(paths)
+		return fn(paths, published)
 	}
 	return nil
 }
 
 func commitLocked(dir string, sources, paths []string, fn func() error) error {
-	return commitPublishedLocked(dir, sources, paths, nil, fn)
+	return commitPublishedFromLocked(dir, sources, paths, nil, nil, fn)
 }
 
 func commitPublishedLocked(dir string, sources, paths []string, published map[string]Published, fn func() error) error {
+	return commitPublishedFromLocked(dir, sources, paths, nil, published, fn)
+}
+
+func commitPublishedFromLocked(dir string, sources, paths []string, sourcePublished, destPublished map[string]Published, fn func() error) error {
 	if err := validateLocked(dir); err != nil {
 		return err
 	}
-	if err := checkSourcesLocked(dir, sources); err != nil {
+	if err := checkSourcesLocked(dir, sources, sourcePublished); err != nil {
 		return err
 	}
 	h := root(dir).hook()
@@ -241,7 +254,7 @@ func commitPublishedLocked(dir string, sources, paths []string, published map[st
 	// Even a failed operation may have modified the namespace. Keep the intent
 	// until its actual result has been indexed; never acknowledge stale metadata.
 	if h.Finish != nil {
-		err = errors.Join(err, h.Finish(paths, published))
+		err = errors.Join(err, h.Finish(paths, destPublished))
 	}
 	if root(dir).notify != nil {
 		root(dir).notify()
@@ -426,7 +439,7 @@ func OpenWriter(dir, path string, flag int, mode os.FileMode) (*os.File, func() 
 		}
 		probe.Close()
 		if flag&os.O_TRUNC == 0 {
-			if err := checkSourcesLocked(dir, []string{dest, path}); err != nil {
+			if err := checkSourcesLocked(dir, []string{dest, path}, nil); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -583,6 +596,31 @@ func Snapshot(path string) (os.FileInfo, string, error) {
 		return nil, "", ErrBusy
 	}
 	return after, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// SnapshotTree snapshots regular files at or below path without following
+// symlinks or taking the commit lock. Transient errors are skipped so callers
+// under the lock simply fall back to hashing any entry that moved or changed.
+func SnapshotTree(path string) map[string]Published {
+	var out map[string]Published
+	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 || !d.Type().IsRegular() {
+			return nil
+		}
+		info, hash, snapErr := Snapshot(p)
+		if snapErr != nil {
+			return nil
+		}
+		if out == nil {
+			out = make(map[string]Published)
+		}
+		out[p] = Published{Info: info, Hash: hash}
+		return nil
+	})
+	return out
 }
 
 // SameGeneration reports whether two stat results name the same unchanged file.

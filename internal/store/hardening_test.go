@@ -123,3 +123,66 @@ func TestRecordAckEpochDeduplicatesAndSchemaIndexes(t *testing.T) {
 		t.Fatalf("idx_repair_name count = %d, err = %v", count, err)
 	}
 }
+
+func TestPutLocalBatchAtomicAndGaplessVersions(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := New(filepath.Join(t.TempDir(), "node.db"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.PutLocalBatch(nil); err != nil {
+		t.Fatalf("PutLocalBatch(nil): %v", err)
+	}
+
+	const n = 10
+	batch := make([]FileMeta, n)
+	for i := range n {
+		batch[i] = FileMeta{
+			Name:    fmt.Sprintf("dir/file-%02d.bin", i),
+			ModTime: int64(1000 + i),
+			Size:    int64(64 + i),
+			Hash:    fmt.Sprintf("%064x", i+1),
+		}
+	}
+	if err := st.PutLocalBatch(batch); err != nil {
+		t.Fatalf("PutLocalBatch: %v", err)
+	}
+	maxVer, err := st.MaxVersion()
+	if err != nil || maxVer != n {
+		t.Fatalf("MaxVersion = %d (%v), want %d", maxVer, err, n)
+	}
+	count, err := st.FileCount()
+	if err != nil || count != n {
+		t.Fatalf("FileCount = %d (%v), want %d", count, err, n)
+	}
+	for i, want := range batch {
+		got, err := st.GetFile(want.Name)
+		if err != nil || got == nil {
+			t.Fatalf("GetFile(%s) = %v, %v", want.Name, got, err)
+		}
+		if got.Version != int64(i+1) || got.Hash != want.Hash {
+			t.Fatalf("entry %s = %+v, want version=%d hash=%s", want.Name, got, i+1, want.Hash)
+		}
+	}
+
+	// A failing entry mid-batch must roll back the whole transaction and keep versions gapless.
+	bad := []FileMeta{
+		{Name: "dir/ok-before-fail.bin", ModTime: 2000, Size: 1, Hash: fmt.Sprintf("%064x", 99)},
+		{Name: "dir/bad-clock.bin", ModTime: 2001, Size: 1, Hash: fmt.Sprintf("%064x", 100), BigClock: "not-a-clock"},
+	}
+	if err := st.PutLocalBatch(bad); err == nil {
+		t.Fatal("PutLocalBatch with invalid clock succeeded")
+	}
+	if got, err := st.GetFile("dir/ok-before-fail.bin"); err != nil || got != nil {
+		t.Fatalf("partial batch leaked entry: %+v (%v)", got, err)
+	}
+	if maxVer, err := st.MaxVersion(); err != nil || maxVer != n {
+		t.Fatalf("MaxVersion after rollback = %d (%v), want %d", maxVer, err, n)
+	}
+	nextVer, err := st.PutLocal(FileMeta{Name: "dir/after.bin", ModTime: 3000, Size: 1, Hash: fmt.Sprintf("%064x", 101)})
+	if err != nil || nextVer != n+1 {
+		t.Fatalf("next version after rollback = %d (%v), want %d", nextVer, err, n+1)
+	}
+}

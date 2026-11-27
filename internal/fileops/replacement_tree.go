@@ -24,7 +24,13 @@ type replacementEntry struct {
 	Link   string      `json:"link,omitempty"`
 }
 
+type prehashLookup func(path, rel string, info os.FileInfo, device, inode uint64) (string, bool)
+
 func replacementTree(r *os.Root, name string) ([]replacementEntry, error) {
+	return replacementTreeWith(r, name, nil)
+}
+
+func replacementTreeWith(r *os.Root, name string, lookup prehashLookup) ([]replacementEntry, error) {
 	var entries []replacementEntry
 	var walk func(string, string) error
 	walk = func(path, rel string) error {
@@ -55,6 +61,13 @@ func replacementTree(r *os.Root, name string) ([]replacementEntry, error) {
 				}
 			}
 		case info.Mode().IsRegular():
+			if lookup != nil {
+				if hash, ok := lookup(path, rel, info, device, inode); ok {
+					entry.Size, entry.Mtime, entry.Hash = info.Size(), info.ModTime().UnixNano(), hash
+					entries = append(entries, entry)
+					break
+				}
+			}
 			f, err := r.Open(path)
 			if err != nil {
 				return err
