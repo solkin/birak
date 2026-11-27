@@ -1,12 +1,12 @@
 module github.com/birak/birak
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/fsnotify/fsnotify v1.9.0
-	golang.org/x/crypto v0.56.0
-	golang.org/x/sys v0.47.0
-	golang.org/x/text v0.41.0
+	golang.org/x/crypto v0.59.0
+	golang.org/x/sys v0.50.0
+	golang.org/x/text v0.44.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.44.3
 )

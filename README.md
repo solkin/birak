@@ -46,7 +46,7 @@ Files can arrive through `cp`, `rsync`, an application, or S3/WebDAV/SFTP/browse
 
 ## Quick Start
 
-Current release: **v2.2.0**. Read the [release notes](docs/releases/v2.2.0.md)
+Current release: **v2.2.1**. Read the [release notes](docs/releases/v2.2.1.md)
 before upgrading an existing cluster. Coming from v2.0.x, read the
 [v2.1.0 upgrade notes](docs/releases/v2.1.0.md) as well: v2.1.0 refuses
 configurations that earlier releases accepted with only a warning.
@@ -63,7 +63,7 @@ docker run -d \
   -v ./sync:/data/sync \
   -v ./meta:/data/meta \
   -p 127.0.0.1:9400:9400 \
-  solkin/birak:2.2.0
+  solkin/birak:2.2.1
 ```
 
 Open `http://localhost:9400` and sign in — you'll see the file browser. Upload a file, and it will appear in the `./sync` directory on your host machine.
@@ -91,7 +91,7 @@ x-common: &common
 
 services:
   node1:
-    image: solkin/birak:2.2.0
+    image: solkin/birak:2.2.1
     environment:
       <<: *common
       BIRAK_NODE_ID: "node-1"
@@ -104,7 +104,7 @@ services:
       - "127.0.0.1:9401:9400"
 
   node2:
-    image: solkin/birak:2.2.0
+    image: solkin/birak:2.2.1
     environment:
       <<: *common
       BIRAK_NODE_ID: "node-2"
@@ -735,7 +735,7 @@ A polling cursor acknowledges receipt, not successful application. It cannot saf
 
 Run one daemon per data volume and metadata directory; OS-held leases reject a second process and are released automatically on exit. Assign a unique `node_id` to each node; a node with peers must set one explicitly. Replication rejects another node advertising the same ID: it is logged as an error and shown as `peers[].duplicate_node_id` and `birak_peer_duplicate_node_id`, because the two nodes keep accepting writes without exchanging them until one is renamed (they then converge). A configured peer URL that reaches the node itself — the same ID and the same incarnation — is skipped and left out of `/status`. A node that polls this one without being in its peer list appears in `/status.unconfigured_pollers` and `birak_unconfigured_pollers`: the two peer lists disagree, and changes flow in one direction only. Each database has a persistent identity, while every daemon start generates a fresh **process incarnation**, returned as `X-Birak-Epoch`. Peers reset their cursors on an incarnation change and replay current metadata. This also covers a restored backup whose version counter has already caught up with an old cursor. For a replayed entry it already holds, the replaying node pays its share of one index query per page: no queue row, no `/meta` request and no download, which `birak_repairs_enqueued_total` lets you confirm.
 
-**Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 4`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds the extended clock, namespace reservations, and admission marker automatically. Release builds pin Go 1.26.10; use a patched supported Go toolchain when building from source. Keep a pre-upgrade metadata backup if a binary rollback is required.
+**Upgrade all nodes together:** this revision uses `X-Birak-Protocol: 4`. Replication refuses older or unknown protocol versions, so a mixed cluster reports an explicit incompatibility instead of comparing different conflict models. The SQLite migration adds the extended clock, namespace reservations, and admission marker automatically. Release builds pin Go 1.26.11; use a patched supported Go toolchain when building from source. Keep a pre-upgrade metadata backup if a binary rollback is required.
 
 An upgrade, node by node:
 
@@ -837,7 +837,7 @@ curl 'http://localhost:9100/status'
 ```json
 {
   "node_id": "node-1",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "epoch": "5f3c1a9e8b2d4f60a7c1e9d3b5a7f218",
   "max_version": 42,
   "file_count": 1500,
@@ -905,7 +905,7 @@ birak_gateway_requests_total{code="2xx",gateway="s3"} 918263
 birak_peer_duplicate_node_id{peer="http://192.168.1.2:9100"} 0
 birak_external_deletions_held 0
 birak_read_errors_total 0
-birak_build_info{version="2.2.0"} 1
+birak_build_info{version="2.2.1"} 1
 ```
 
 Alert on:
